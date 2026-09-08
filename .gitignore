@@ -1,0 +1,13 @@
+.state/
+artifacts/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.devenv/
+.direnv/
+*.local.json
+*.local.nix
+.env
+secrets/
+target/

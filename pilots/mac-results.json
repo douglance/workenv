@@ -1,0 +1,213 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-08T19:54:00Z",
+  "host": {
+    "platform": "macos",
+    "workenv_root": "/Users/operator/Developer/src/workenv",
+    "disk_pressure": {
+      "observed": true,
+      "df_after_cleanup": "/dev/disk3s5 1.8Ti 1.7Ti 572Mi 100%",
+      "apoc_error": "DAEMON_REQUEST_FAILED: Runtime store failed: database or disk is full",
+      "cleanup": [
+        {
+          "path": ".state/benchmarks/mac/incurs/node_modules",
+          "reason": "rebuildable benchmark clone dependency directory; removed after measured Incurs runs"
+        },
+        {
+          "path": ".state/benchmarks/mac/groktris/node_modules",
+          "reason": "rebuildable benchmark clone dependency directory; removed after measured Groktris install/check/browser runs"
+        },
+        {
+          "path": ".state/benchmarks/mac/groktris",
+          "reason": "rebuildable benchmark clone removed after results were recorded to recover disk space"
+        },
+        {
+          "path": ".state/benchmarks/mac/incurs",
+          "reason": "rebuildable benchmark clone removed after results were recorded to recover disk space"
+        }
+      ]
+    }
+  },
+  "comparison_constraints": {
+    "linux_rust_version_reported_by_root": "1.97.0",
+    "mac_rust_version": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "mac_cargo_version": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "mac_node_version": "v26.6.0",
+    "mac_pnpm_version": "10.33.0",
+    "cpu_equivalence_claim": false
+  },
+  "sources": {
+    "incurs": {
+      "path": ".state/benchmarks/mac/incurs",
+      "revision": "bee3d9a6ca0a574ac8eab1f8bedbb43b46cd4846",
+      "status_before_runs": "clean",
+      "bundle": ".state/pilots/incurs/incurs-bee3d9a6ca0a574ac8eab1f8bedbb43b46cd4846.bundle"
+    },
+    "groktris": {
+      "path": ".state/benchmarks/mac/groktris",
+      "revision": "59f222c50ffedfb139bbdfe9fa395a0a19d72ec7",
+      "status_before_runs": "clean",
+      "bundle": ".state/pilots/groktris/groktris-59f222c50ffedfb139bbdfe9fa395a0a19d72ec7.bundle",
+      "mac_browser_config": ".state/benchmarks/mac/groktris/tests/browser/mac.config.json"
+    }
+  },
+  "setup_failures": [
+    {
+      "project": "incurs",
+      "execution_id": "01a08280-1786-7a71-b32f-28e6aaea28ad",
+      "outcome": "failed",
+      "summary": "/usr/bin/time was invoked against bundle bytes and failed before running project commands"
+    },
+    {
+      "project": "groktris",
+      "execution_id": "01a08280-1803-79a0-8f4f-88ee75bc1f90",
+      "outcome": "failed",
+      "summary": "/usr/bin/time was invoked against bundle bytes and failed before running project commands"
+    }
+  ],
+  "runs": [
+    {
+      "project": "incurs",
+      "command": "cargo test --workspace",
+      "execution_id": "01a08283-8f6d-7541-bcfd-43548680d7e0",
+      "outcome": "passed",
+      "elapsed_seconds": 318.39,
+      "max_rss_bytes": 882753536,
+      "cache": "mbx cache: 105 hits, 40 misses, 911 not looked up, 99 bypassed; 0 B downloaded, 0 B uploaded, 1.6 GiB stored locally",
+      "notes": "249 unit tests passed; trybuild pass completed in 140.69s; doc tests completed"
+    },
+    {
+      "project": "incurs",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "execution_id": "01a08288-b625-7b63-a8dd-9178ca7a0e86",
+      "outcome": "passed",
+      "elapsed_seconds": 97.35,
+      "max_rss_bytes": 648347648,
+      "cache": "mbx cache: 69 hits, 0 misses, 228 not looked up, 3 bypassed; 0 B downloaded, 0 B uploaded, 242.5 MiB stored locally"
+    },
+    {
+      "project": "incurs",
+      "command": "cargo fmt --all -- --check",
+      "execution_id": "01a0828a-9e4d-7371-b2de-45a49ebe639d",
+      "outcome": "failed",
+      "elapsed_seconds": 1.26,
+      "max_rss_bytes": 54722560,
+      "failure_summary": "rustfmt diffs in crates/incurs/src/cli.rs and crates/incurs/src/mcp.rs"
+    },
+    {
+      "project": "incurs",
+      "command": "cargo xtask parity",
+      "execution_id": "01a0828b-37a9-7d42-963c-a6a0e8d40f68",
+      "outcome": "failed",
+      "elapsed_seconds": 96.33,
+      "max_rss_bytes": 941080576,
+      "cache": "mbx cache: 8 hits, 3 misses, 126 not looked up, 1 bypassed; 0 B downloaded, 0 B uploaded, 675.5 MiB stored locally",
+      "failure_summary": "initial parity run failed because the TypeScript oracle could not resolve package tsx"
+    },
+    {
+      "project": "incurs",
+      "command": "pnpm install --frozen-lockfile",
+      "execution_id": "01a0828d-b708-7340-8875-1b0af2f6e71c",
+      "outcome": "passed",
+      "elapsed_seconds": 7.52,
+      "max_rss_bytes": 1416527872,
+      "cache": "pnpm: 190 packages; reused 82, downloaded 108; warnings for missing dist/bin.js bin links"
+    },
+    {
+      "project": "incurs",
+      "command": "cargo xtask parity",
+      "execution_id": "01a0828e-5c5d-7382-86de-36bc78b9d2c7",
+      "outcome": "failed",
+      "elapsed_seconds": 19.51,
+      "max_rss_bytes": 120422400,
+      "failure_summary": "after installing JS dependencies, parity classified 1062 TypeScript oracle tests, then reported 1 passed and 15 mismatched cases; TypeScript emitted Node 26 DEP0205 warnings on stderr while Rust stderr was empty"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm install --frozen-lockfile",
+      "execution_id": "01a08283-9008-7bc3-abe5-1ef89361b0a7",
+      "outcome": "passed",
+      "elapsed_seconds": 4.68,
+      "max_rss_bytes": 1460338688,
+      "cache": "pnpm: 226 packages; reused 226, downloaded 0"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm --dir tools/melint install --frozen-lockfile",
+      "execution_id": "01a08288-b69a-7582-a753-bb10ecf6993d",
+      "outcome": "passed",
+      "elapsed_seconds": 7.46,
+      "max_rss_bytes": 1049067520,
+      "cache": "pnpm: 159 packages; reused 115, downloaded 44"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm --dir tools/melint build",
+      "execution_id": "01a0828b-3867-7393-ac27-6d394570dc79",
+      "outcome": "passed",
+      "elapsed_seconds": 3.67,
+      "max_rss_bytes": 341819392,
+      "cache": "mbx cache: 100 hits, 0 misses; 0 B downloaded, 0 B uploaded, 0 B stored locally"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm check",
+      "execution_id": "01a0828d-b791-7153-9d68-a258ad4baa2b",
+      "outcome": "failed",
+      "elapsed_seconds": 5.88,
+      "max_rss_bytes": 234799104,
+      "failure_summary": "lint failed before typecheck/tests/build on 16 existing melint/eslint policy violations in apps/web/src/labs and packages/rendering"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm exec playwright --version",
+      "execution_id": "01a0828e-5ba6-7d93-bca6-388c449a393f",
+      "outcome": "passed",
+      "elapsed_seconds": 1.07,
+      "max_rss_bytes": 171114496,
+      "stdout": "Version 1.62.1"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm test:browser",
+      "execution_id": "01a08291-0b71-7880-a9b2-8cb82581f2b3",
+      "outcome": "failed",
+      "elapsed_seconds": 77.78,
+      "max_rss_bytes": 645120000,
+      "environment": {
+        "GAUNTLET_TEST_ORIGIN": "http://127.0.0.1:9323",
+        "GAUNTLET_ARTIFACT_DIR": "artifacts/browser-mac"
+      },
+      "failure_summary": "first suite catalog-glyphs timed out after 15000ms waiting for [data-gauntlet-victory], [data-gauntlet=\"fight\"], .combat-run-screen"
+    },
+    {
+      "project": "groktris",
+      "command": "pnpm test:browser:pwa",
+      "execution_id": "01a08292-c2da-7b13-b2f2-95257cb8acd4",
+      "outcome": "failed",
+      "elapsed_seconds": 69.29,
+      "max_rss_bytes": 757792768,
+      "environment": {
+        "GAUNTLET_TEST_ORIGIN": "http://127.0.0.1:9323",
+        "GAUNTLET_ARTIFACT_DIR": "artifacts/browser-mac"
+      },
+      "failure_summary": "timed out after 20000ms waiting for an active service worker"
+    }
+  ],
+  "long_lived_executions": [
+    {
+      "name": "groktris-mac-benchmark-vite-9323",
+      "execution_id": "01a08290-b8d1-7a12-8cd3-d509b8f66a90",
+      "final_status": "canceled",
+      "final_outcome": "error",
+      "port_after_cleanup": "free",
+      "notes": "server stderr showed Vite proxy ECONNREFUSED errors to 127.0.0.1:8788 during browser/PWA runs"
+    }
+  ],
+  "deviations": [
+    "Did not broaden Incurs to the full .github/workflows/rust.yml matrix; this Mac baseline follows pilots/manifest.json plus a parity setup rerun.",
+    "Removed rebuildable benchmark clone node_modules directories after measured runs because APoC could not persist cancellation/log reads while the filesystem had roughly 314 MiB free.",
+    "Removed both rebuildable benchmark clone directories after recording results because filesystem free space remained below 350 MiB.",
+    "Browser and PWA runs used an isolated origin on port 9323 through environment overrides because the default 5173 port was occupied by unrelated processes."
+  ]
+}

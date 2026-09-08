@@ -1,0 +1,21 @@
+{
+  "merge_only": true,
+  "tagOwners": {
+    "tag:workenv": ["group:operator"]
+  },
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["group:operator"],
+      "dst": ["tag:workenv"],
+      "users": ["exedev"]
+    }
+  ],
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:operator"],
+      "dst": ["tag:workenv:22", "tag:workenv:8000"]
+    }
+  ]
+}

@@ -1,0 +1,142 @@
+{
+  "apoc_build": {
+    "package_version": "0.6.0",
+    "rust_channel_sha256": "821ff14e4c4a1cbe1e8915f35aff0a3fbbdf8d293ad48ab8f31e3b0440c581f9",
+    "rust_channel_url": "https://static.rust-lang.org/dist/channel-rust-1.95.0.toml",
+    "rust_git_commit_hash": "59807616e1fa2540724bfbac14d7976d7e4a3860",
+    "rust_toolchain": "1.95.0",
+    "rust_version_requirement": "1.95",
+    "rustup_init_sha256": "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71",
+    "rustup_init_url": "https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init",
+    "source_archive_default": "incoming/apoc-913b1e9.tar.gz",
+    "source_archive_prefix": "apoc-source",
+    "source_revision": "913b1e9a855fdf771a0688eab26b3ad03f271465",
+    "source_short_revision": "913b1e9",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "devenv": {
+    "flake_ref": "github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2",
+    "release_url": "https://github.com/cachix/devenv/releases/tag/v2.3",
+    "source_revision": "e0781f7bee573eefcab4a7d2788fd9b455560ca2",
+    "tag": "v2.3",
+    "version": "2.3"
+  },
+  "local_artifacts": {
+    "apoc": {
+      "archive": "apoc-linux-x86_64.tar.gz",
+      "archive_env": "WORKENV_APOC_ARCHIVE",
+      "archive_hash": "sha256-ns2zEVtzk7SQ3D0JzBWojNJPkLOyeAdc/kjOVGmMz8Q=",
+      "archive_path": "/home/exedev/workenv/tool-builds/apoc-linux-x86_64.tar.gz",
+      "archive_sha256": "9ecdb3115b7393b490dc3d09cc15a88cd24f90b3b278075cfe48ce54698ccfc4",
+      "binary": "apoc",
+      "binary_sha256": "0cc82b04e5ba62b1eebc3c03e1d2eac72c8e04561ff84fb817869fcf04fe957c",
+      "sha256_sidecar": "apoc-linux-x86_64.tar.gz.sha256",
+      "source_revision": "913b1e9a855fdf771a0688eab26b3ad03f271465",
+      "version": "0.6.0",
+      "version_command": "apoc version --purpose 'Check worker APoC version for bootstrap health.' --format json"
+    }
+  },
+  "metadata_verified_at": "2026-09-08T19:50:09Z",
+  "native_tools": {
+    "devsql": {
+      "hash": "sha256-LWgOuEG0zfzCf1GQ1wyQG/GbFK6jpCIf5hoCCsSHQn0=",
+      "kind": "tar-xz-member",
+      "member": "devsql-x86_64-unknown-linux-gnu/devsql",
+      "sha256": "2d680eb841b4cdfcc27f5190d70c901bf19b14aea3a4221fe61a020ac487427d",
+      "url": "https://github.com/douglance/devsql/releases/download/v0.5.0/devsql-x86_64-unknown-linux-gnu.tar.xz",
+      "version": "0.5.0"
+    },
+    "grok": {
+      "aliases": [
+        "agent"
+      ],
+      "build": "5e9a585",
+      "hash": "sha256-7feVIVgbtea5Wr74SEkaanQuhg2j4jfr6GooDTDc5ME=",
+      "installer_url": "https://x.ai/cli/install.sh",
+      "kind": "direct-binary",
+      "sha256": "edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1",
+      "url": "https://x.ai/cli/grok-1.0.13-linux-x86_64",
+      "version": "1.0.13"
+    },
+    "herdr": {
+      "hash": "sha256-T6GgEVjdgEPaktMbJweAsNzBBgMDjZthysTYGrY/tx8=",
+      "kind": "direct-binary",
+      "sha256": "4fa1a01158dd8043da92d31b270780b0dcc10603038d9b61cac4d81ab63fb71f",
+      "url": "https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-linux-x86_64",
+      "version": "0.9.0"
+    },
+    "nib": {
+      "archive_env": "WORKENV_NIB_ARCHIVE",
+      "archive_path": ".state/tool-builds/nib/nib-linux-x86_64-3482894.tar.gz",
+      "archive_sha256": "73a3bf1b4e002d9870a5fb2c038ecedbe89fd92b8350277d2daacd5e4f6bba60",
+      "auth_wrapper_env": "WORKENV_NIB_WRAPPER",
+      "binary_sha256": "1eb34889310b04a7bf214bed04affa23f58f96c5976c5a1ba4eb5d2ac8226e7b",
+      "cargo_lock_sha256": "551f72bc514126a2a6f116c372b4fc6e691d035899a598c3458b71aab03bc685",
+      "default_auth_wrapper": "remote/nib.py",
+      "hash": "sha256-c6O/G04ALZhwpfssA47O2+if2SuDUCd9LarNXk9rumA=",
+      "kind": "tar-gz-member",
+      "member": "nib",
+      "repository": "https://github.com/douglance/nib",
+      "sha256": "73a3bf1b4e002d9870a5fb2c038ecedbe89fd92b8350277d2daacd5e4f6bba60",
+      "source_revision": "34828947e3106f7d3784c1e8f5d3d2330c46953a",
+      "source_sha256": "39877d66d71525303d25eed4121efd175761143260a0a45f7212a5ea7737fd90",
+      "version": "0.3.0"
+    },
+    "pi": {
+      "hash": "sha256-kG++eH/SJcSsYk/n69Wx1Vpg4PXH71F5XSMVZPnuHBM=",
+      "kind": "tar-gz-member",
+      "member": "pi/pi",
+      "package": "@earendil-works/pi-coding-agent",
+      "repository": "https://github.com/earendil-works/pi/tree/main/packages/coding-agent",
+      "sha256": "906fbe787fd225c4ac624fe7ebd5b1d55a60e0f5c7ef51795d231564f9ee1c13",
+      "url": "https://github.com/earendil-works/pi/releases/download/v0.84.2/pi-linux-x64.tar.gz",
+      "version": "0.84.2"
+    }
+  },
+  "nix": {
+    "docs_url": "https://nixos.org/download/",
+    "install_sha256": "9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c",
+    "install_url": "https://releases.nixos.org/nix/nix-2.35.2/install",
+    "version": "2.35.2"
+  },
+  "npm_tools": {
+    "claude": {
+      "hash": "sha512-0IrvpLd/0FP0acQw59T4Cvx/r4nwAXKBrW0WyhIXymzYWurPCLztB+Icu9MkeewAUI+p3PTXsSfmilv/n6XlAQ==",
+      "kind": "npm-native-member",
+      "member": "package/claude",
+      "package": "@anthropic-ai/claude-code-linux-x64",
+      "shasum": "203a38b6ee9184f13957353f3e259f033288546a",
+      "url": "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.263.tgz",
+      "version": "2.1.263"
+    },
+    "codex": {
+      "hash": "sha512-x1EcwBlY3AObM1VTUHNM2AzAJQsyreGdagpF+qFiYi/Oa30VBktvvG0C6tLtCzqW6hjZNWkGZQWmeVk7MuJKWg==",
+      "kind": "npm-native-member",
+      "member": "package/vendor/x86_64-unknown-linux-musl/bin/codex",
+      "package": "@openai/codex",
+      "shasum": "8e0c754e77a6af68cf261e12bdab017206e282f6",
+      "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.153.4-linux-x64.tgz",
+      "version": "0.153.4"
+    },
+    "ssh-clipboard": {
+      "bin": "bin/ssh-clipboard.js",
+      "docs_url": "https://ssh-clipboard.standardagents.ai/",
+      "hash": "sha512-BO0hahRDa/eQJEqUlzxdQn4QEGz6A792czZWtOivb8/oKF8dQvHzkEU9bRXNWoaIZPSDFtIK7cgCXs8kqy3tew==",
+      "headless_docs_url": "https://github.com/standardagents/ssh-clipboard/blob/main/docs/headless-linux.md",
+      "headless_service_command": "ssh-clipboard service install --headless-x11",
+      "kind": "npm-native-member",
+      "member": "package/vendor/linux-amd64/ssh-clipboard",
+      "package": "ssh-clipboard",
+      "shasum": "e02152e9c6d839ecc3b6e591374fd6f3b3049687",
+      "url": "https://registry.npmjs.org/ssh-clipboard/-/ssh-clipboard-0.2.11.tgz",
+      "version": "0.2.11"
+    }
+  },
+  "schema": 1,
+  "target": {
+    "architecture": "x86_64",
+    "os_id": "ubuntu",
+    "sudo": "passwordless",
+    "version_id": "24.04"
+  }
+}

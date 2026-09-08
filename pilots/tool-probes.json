@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "worker": "workenv-01.exe.xyz",
+  "generated_at": "2026-09-08T18:58:50Z",
+  "base": {
+    "execution": "01a0825e-c393-7bc3-8994-97d880cd1cba",
+    "nix": "nix (Nix) 2.35.2",
+    "devenv": "devenv 2.3.0+e0781f7 (x86_64-linux)"
+  },
+  "incurs": {
+    "execution": "01a08260-334f-7dd1-81b5-dafea4568e3a",
+    "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)"
+  },
+  "groktris": {
+    "execution": "01a08261-054f-7283-9f55-c56d79719170",
+    "node": "v26.6.0",
+    "pnpm": "10.33.0",
+    "melint": "0.1.0",
+    "playwright": "Version 1.62.1",
+    "install": "pnpm install --frozen-lockfile --ignore-scripts completed under CI=true",
+    "melint_build": "CARGO_BUILD_JOBS=1 pnpm --dir tools/melint build completed on Linux"
+  }
+}

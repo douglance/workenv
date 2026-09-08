@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "worker": "workenv-01",
+  "transport": "exe.dev recovery SSH; Tailscale acceptance pending",
+  "environment": {
+    "os": "Ubuntu 24.04.5",
+    "architecture": "x86_64",
+    "cpus": 2,
+    "memory_gb": 8,
+    "disk_gb": 50,
+    "rust": "1.97.0",
+    "devenv": "2.3.0+e0781f7"
+  },
+  "incurs": {
+    "revision": "bee3d9a6ca0a574ac8eab1f8bedbb43b46cd4846",
+    "task_id": "pilot-incurs-20260908",
+    "results": [
+      {
+        "command": "devenv shell -- cargo test --workspace --locked --jobs 2",
+        "cache": "cold",
+        "status": "passed",
+        "elapsed_seconds": 352.738,
+        "execution_id": "01a08280-669c-75a2-8efe-861a9ebfab6c"
+      },
+      {
+        "command": "/usr/bin/time -v devenv shell -- cargo test --workspace --locked --jobs 2",
+        "cache": "warm",
+        "status": "passed",
+        "elapsed_seconds": 20.83,
+        "max_rss_kib": 658736,
+        "execution_id": "01a08287-47da-7313-95fd-047805538e37"
+      },
+      {
+        "command": "devenv shell -- cargo fmt --all -- --check",
+        "status": "failed",
+        "reason": "Source formatting differences also occur in the Mac baseline.",
+        "execution_id": "01a08288-b823-7463-9f44-ec6f8b281edc"
+      },
+      {
+        "command": "devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --jobs 2 -- -D warnings",
+        "status": "passed",
+        "elapsed_seconds": 81.328,
+        "execution_id": "01a08288-b875-7b63-81ca-9ca40f45759f"
+      }
+    ],
+    "parity": "not_run",
+    "collection_digest": "a92ca378bd59d459570564a36481e79b7cd81b96535944d9bcae205cc3c8114f",
+    "collection": ".state/recovery-controller/collections/workenv-01/pilot-incurs-20260908/a92ca378bd59d459570564a36481e79b7cd81b96535944d9bcae205cc3c8114f",
+    "release_status": "released",
+    "acceptance": "incomplete"
+  },
+  "groktris": {
+    "revision": "59f222c50ffedfb139bbdfe9fa395a0a19d72ec7",
+    "tool_preparation": "passed; see tool-probes.json",
+    "acceptance": "not_run"
+  },
+  "comparison_limits": [
+    "Mac baseline used Rust 1.95.0; Linux used Rust 1.97.0.",
+    "Mac Clippy did not include --all-features.",
+    "Mac and cloud cache state and machine load differ.",
+    "Six-worker throughput has not been measured."
+  ]
+}

@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-08T18:38:00Z",
+  "pilots": {
+    "incurs": {
+      "source": {
+        "type": "canonical_git_commit",
+        "project_root": "/Users/operator/Developer/src/incurs",
+        "remote": "git@github.com:douglance/incurs.git",
+        "branch": "main",
+        "source_revision": "40d88b60aade47f844bcdcb56c5f507b7123bc6c",
+        "revision": "bee3d9a6ca0a574ac8eab1f8bedbb43b46cd4846",
+        "bundle": ".state/pilots/incurs/incurs-bee3d9a6ca0a574ac8eab1f8bedbb43b46cd4846.bundle",
+        "snapshot_repo": ".state/pilots/incurs/source",
+        "remote_snapshot_path": "/home/exedev/workenv/pilots/sources/incurs",
+        "primary_status": [
+          " M crates/incurs/src/cli.rs",
+          " M crates/incurs/src/mcp.rs"
+        ]
+      },
+      "devenv": {
+        "files": [
+          "pilots/incurs/devenv.nix",
+          "pilots/incurs/devenv.yaml",
+          "pilots/incurs/devenv.lock"
+        ],
+        "lock": "pilots/incurs/devenv.lock"
+      },
+      "acceptance_commands": [
+        "cargo test --workspace",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo fmt --all -- --check",
+        "cargo xtask parity"
+      ],
+      "linux_lock_commands": [
+        "cd /home/exedev/workenv/pilots/sources/incurs",
+        "devenv shell -- cargo --version"
+      ]
+    },
+    "groktris": {
+      "source": {
+        "type": "working_tree_snapshot_git_commit",
+        "project_root": "/Users/operator/Developer/src/games/groktris",
+        "remote": null,
+        "branch": "pilot",
+        "base_revision": "fafa4feccba990ddc06f015b555e0e241d7ff222",
+        "source_snapshot_revision": "f249f1aad9029373c6c7a8f9de9d2ba3ea0592e3",
+        "revision": "59f222c50ffedfb139bbdfe9fa395a0a19d72ec7",
+        "bundle": ".state/pilots/groktris/groktris-59f222c50ffedfb139bbdfe9fa395a0a19d72ec7.bundle",
+        "snapshot_repo": ".state/pilots/groktris/source",
+        "remote_snapshot_path": "/home/exedev/workenv/pilots/sources/groktris",
+        "excluded": [
+          ".git/",
+          ".dev.vars",
+          ".env*",
+          "node_modules/",
+          "dist/",
+          ".wrangler/",
+          ".cache/",
+          ".vite/",
+          "artifacts/",
+          "renders/",
+          "videos/groktris-hype/renders/",
+          "videos/groktris-hype/snapshots/",
+          "*.pem",
+          "*.key"
+        ]
+      },
+      "devenv": {
+        "files": [
+          "pilots/groktris/devenv.nix",
+          "pilots/groktris/devenv.yaml",
+          "pilots/groktris/devenv.lock"
+        ],
+        "lock": "pilots/groktris/devenv.lock",
+        "toolchain": {
+          "node": {
+            "version": "26.6.0"
+          },
+          "pnpm": {
+            "version": "10.33.0"
+          },
+          "playwright": {
+            "version": "1.62.1"
+          },
+          "melint": {
+            "required": true
+          }
+        }
+      },
+      "acceptance_commands": [
+        "pnpm install --frozen-lockfile",
+        "pnpm --dir tools/melint install --frozen-lockfile",
+        "pnpm --dir tools/melint build",
+        "pnpm check",
+        "pnpm exec playwright --version",
+        "pnpm test:browser",
+        "pnpm test:browser:pwa"
+      ],
+      "linux_lock_commands": [
+        "cd /home/exedev/workenv/pilots/sources/groktris",
+        "devenv shell -- node --version",
+        "devenv shell -- pnpm --version",
+        "devenv shell -- pnpm install --frozen-lockfile",
+        "devenv shell -- pnpm --dir tools/melint install --frozen-lockfile",
+        "devenv shell -- pnpm --dir tools/melint build",
+        "devenv shell -- melint --version",
+        "devenv shell -- pnpm exec playwright --version"
+      ]
+    }
+  }
+}

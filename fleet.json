@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "controller": "desk-01",
+  "tailnet_suffix": "example.ts.net",
+  "tailscale_tag": "tag:workenv",
+  "remote_user": "exedev",
+  "herdr_version": "0.9.0",
+  "herdr_session": "workenv",
+  "region": "dal",
+  "capacity": {"cpus": 16, "memory_gb": 64, "included_disk_gb": 800, "monthly_price_cents": 16000},
+  "workers": [
+    {"name": "workenv-01", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-02", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-03", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-04", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-05", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100},
+    {"name": "workenv-06", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100}
+  ],
+  "projects": {
+    "workenv": {"repository": "operator/workenv", "class": "general", "profile": "rust", "integration": "main"},
+    "incurs": {"repository": "operator/incurs", "class": "general", "profile": "rust", "integration": "workenv-incurs"},
+    "groktris": {"repository": "operator/groktris", "class": "general", "profile": "web", "integration": "workenv-groktris", "preview_port": 8000},
+    "apoc": {"repository": "operator/apoc", "class": "build", "profile": "rust", "integration": "workenv-apoc"},
+    "devsql": {"repository": "operator/devsql", "class": "build", "profile": "rust", "integration": "workenv-devsql"}
+  }
+}
