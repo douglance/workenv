@@ -102,13 +102,23 @@ DevSQL, Git, lazygit, Nib, and ssh-clipboard. Versions and local binary artifact
 are pinned in `tools.json`. Authentication remains outside the Nix store,
 Git, command arguments, and collected source.
 
-Provider SSH keeps workers accessible while Tailscale enrollment is pending.
+The fleet uses Tailscale SSH for task commands and Herdr connections. Each
+worker's `ssh_host` selects its tailnet DNS name. Provider SSH remains the
+explicit bootstrap and enrollment transport; task mutations do not silently
+retry through a different host.
+
+All six workers are registered in the main Herdr sidebar. Expand a worker and
+select its workspace to use its remote agent terminals. The bundled Space
+Attention plugin supplies workspace labels and agent state colors, including
+an initial refresh when `workenv up` links it into an existing session.
+
 Tailscale, Nib, and coding subscription readiness are reported separately.
 No API billing fallback is enabled automatically. Personal projects only;
 Work repositories, customer data, and production credentials stay outside this
 fleet.
 
 See [native CLI validation](docs/native-validation.md),
+[Tailscale and Herdr validation](docs/tailscale-herdr-validation.md),
 [rollout acceptance](docs/acceptance.md) and the recorded
 [Mac](pilots/mac-results.json) and [Linux](pilots/linux-results.json) pilot
 results. Tool installation does not establish coding subscription authentication

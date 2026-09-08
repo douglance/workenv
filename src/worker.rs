@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use base64::Engine;
@@ -12,10 +14,11 @@ use sha2::{Digest, Sha256};
 use tar::Builder;
 use uuid::Uuid;
 
-use crate::process::{read_json, shell_quote, write_json};
+use crate::process::{read_json, shell_quote, worker_ssh_target, write_json};
 use crate::{CommandSpec, Context};
 
 const REMOTE_ROOT: &str = "/home/exedev/workenv";
+const SPACE_ATTENTION_PLUGIN: &str = "operator.space-attention";
 const HERDR_VERSION: &str = "0.9.0";
 const HERDR_PROTOCOL_VERSION: i64 = 22;
 const TERMINAL_TASK_STATUSES: &[&str] = &["released"];
@@ -77,7 +80,7 @@ pub fn up(ctx: &Context, selector: Option<&str>, key: &str) -> Result<Value> {
 pub fn connection(ctx: &Context, selector: &str) -> Result<Value> {
     let worker = ctx.worker_name(selector)?;
     let session = herdr_session(ctx);
-    let target = connection_target(ctx, &worker);
+    let target = connection_target(ctx, &worker)?;
     let machines = herdr_machine_list(ctx)
         .unwrap_or_else(|error| json!({"status":"unknown","ok":false,"error":error.to_string()}));
     let machine = find_herdr_machine(&machines, &worker, &target, &session);
@@ -606,10 +609,199 @@ pub fn start_worker_herdr(ctx: &Context, worker: &str, key: &str) -> Result<Valu
     if herdr.get("ok") != Some(&json!(true)) {
         return Ok(merge(json!({"boot": boot}), herdr));
     }
+    let sidebar = setup_worker_herdr_sidebar(ctx, worker, key)?;
+    if sidebar.get("ok") != Some(&json!(true)) {
+        return Ok(merge(
+            json!({"worker": worker, "boot": boot, "herdr_status": herdr}),
+            sidebar,
+        ));
+    }
     Ok(ok(
         "herdr_ready",
-        json!({"worker": worker, "boot": boot, "herdr_status": herdr, "herdr_ready": true}),
+        json!({"worker": worker, "boot": boot, "herdr_status": herdr, "sidebar": sidebar, "herdr_ready": true}),
     ))
+}
+
+fn setup_worker_herdr_sidebar(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+    let relative = Path::new("herdr/space-attention");
+    let local_manifest = ctx.root.join(relative).join("herdr-plugin.toml");
+    if !local_manifest.is_file() {
+        return Ok(ok(
+            "herdr_sidebar_skipped",
+            json!({"worker": worker, "plugin": "space-attention", "reason": "local plugin manifest is absent"}),
+        ));
+    }
+    let session = herdr_session(ctx);
+    let remote_plugin = format!("{}/{}", remote_root(ctx), relative.display());
+    let command = format!(
+        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} plugin link {}",
+        shell_quote(&remote_root(ctx)),
+        shell_quote(&session),
+        shell_quote(&remote_plugin),
+    );
+    let linked = remote_shell(
+        ctx,
+        worker,
+        &command,
+        &format!("{key}:herdr-plugin:space-attention:{worker}"),
+        &format!("Link Space Attention Herdr plugin on {worker}."),
+        60_000,
+    )?;
+    if linked.get("ok") != Some(&json!(true)) {
+        return Ok(failed(
+            "herdr_sidebar_failed",
+            "configured Herdr sidebar plugin could not be linked",
+            json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "herdr_ready": false}),
+        ));
+    }
+    refresh_worker_herdr_sidebar(ctx, worker, key, remote_plugin, linked)
+}
+
+fn refresh_worker_herdr_sidebar(
+    ctx: &Context,
+    worker: &str,
+    key: &str,
+    remote_plugin: String,
+    linked: Value,
+) -> Result<Value> {
+    let session = herdr_session(ctx);
+    let invoke_command = format!(
+        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} plugin action invoke refresh --plugin {}",
+        shell_quote(&remote_root(ctx)),
+        shell_quote(&session),
+        shell_quote(SPACE_ATTENTION_PLUGIN),
+    );
+    let invoked = match remote_json_shell(
+        ctx,
+        worker,
+        &invoke_command,
+        &format!("{key}:herdr-plugin:space-attention:refresh:{worker}"),
+        &format!("Invoke Space Attention Herdr plugin refresh on {worker}."),
+        60_000,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(failed(
+                "herdr_sidebar_refresh_failed",
+                "configured Herdr sidebar plugin refresh action could not be invoked",
+                json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "error": error.to_string(), "herdr_ready": false}),
+            ));
+        }
+    };
+    let Some(log_id) = plugin_log_id(&invoked) else {
+        return Ok(failed(
+            "herdr_sidebar_refresh_failed",
+            "configured Herdr sidebar plugin refresh returned no log ID",
+            json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "refresh": invoked, "herdr_ready": false}),
+        ));
+    };
+    for attempt in 0..10 {
+        let logs = match worker_herdr_plugin_logs(ctx, worker, &session, attempt) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(failed(
+                    "herdr_sidebar_refresh_failed",
+                    "configured Herdr sidebar plugin refresh log could not be inspected",
+                    json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "refresh": invoked, "log_id": log_id, "error": error.to_string(), "herdr_ready": false}),
+                ));
+            }
+        };
+        if let Some(log) = matching_plugin_log(&logs, &log_id) {
+            if plugin_log_succeeded(&log) {
+                return Ok(ok(
+                    "herdr_sidebar_ready",
+                    json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "refresh": invoked, "log": log}),
+                ));
+            }
+            if plugin_log_failed(&log) {
+                return Ok(failed(
+                    "herdr_sidebar_refresh_failed",
+                    "configured Herdr sidebar plugin refresh action failed",
+                    json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "refresh": invoked, "log": log, "herdr_ready": false}),
+                ));
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Ok(failed(
+        "herdr_sidebar_refresh_pending",
+        "configured Herdr sidebar plugin refresh action did not complete",
+        json!({"worker": worker, "plugin": "space-attention", "path": remote_plugin, "link": linked, "refresh": invoked, "log_id": log_id, "herdr_ready": false}),
+    ))
+}
+
+fn worker_herdr_plugin_logs(
+    ctx: &Context,
+    worker: &str,
+    session: &str,
+    attempt: usize,
+) -> Result<Value> {
+    let command = format!(
+        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} plugin log list --plugin {} --limit 10",
+        shell_quote(&remote_root(ctx)),
+        shell_quote(session),
+        shell_quote(SPACE_ATTENTION_PLUGIN),
+    );
+    remote_json_shell(
+        ctx,
+        worker,
+        &command,
+        &observation_key(&format!("herdr-plugin-refresh-log:{worker}:{attempt}")),
+        &format!("Inspect Space Attention Herdr plugin refresh log on {worker}."),
+        60_000,
+    )
+}
+
+fn plugin_log_id(value: &Value) -> Option<String> {
+    value
+        .get("log_id")
+        .or_else(|| value.pointer("/log/log_id"))
+        .or_else(|| value.pointer("/result/log_id"))
+        .or_else(|| value.pointer("/result/log/log_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn matching_plugin_log(logs: &Value, log_id: &str) -> Option<Value> {
+    let rows = json_items(logs)?;
+    rows.into_iter().find(|row| {
+        row.get("log_id")
+            .or_else(|| row.pointer("/log/log_id"))
+            .or_else(|| row.pointer("/result/log_id"))
+            .or_else(|| row.pointer("/result/log/log_id"))
+            .and_then(Value::as_str)
+            == Some(log_id)
+    })
+}
+
+fn plugin_log_status(log: &Value) -> Option<&str> {
+    log.get("status")
+        .or_else(|| log.pointer("/log/status"))
+        .or_else(|| log.pointer("/result/status"))
+        .or_else(|| log.pointer("/result/log/status"))
+        .and_then(Value::as_str)
+}
+
+fn plugin_log_exit_code(log: &Value) -> Option<i64> {
+    log.get("exit_code")
+        .or_else(|| log.pointer("/log/exit_code"))
+        .or_else(|| log.pointer("/result/exit_code"))
+        .or_else(|| log.pointer("/result/log/exit_code"))
+        .and_then(Value::as_i64)
+}
+
+fn plugin_log_succeeded(log: &Value) -> bool {
+    matches!(
+        plugin_log_status(log),
+        Some("completed" | "succeeded" | "success" | "passed")
+    ) && plugin_log_exit_code(log) == Some(0)
+}
+
+fn plugin_log_failed(log: &Value) -> bool {
+    matches!(
+        plugin_log_status(log),
+        Some("failed" | "error" | "cancelled" | "canceled")
+    ) || plugin_log_exit_code(log).is_some_and(|code| code != 0)
 }
 
 pub fn worker_herdr_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
@@ -795,7 +987,7 @@ fn enroll_worker_if_credentials_available(ctx: &Context, worker: &str, key: &str
 
 fn register_herdr_machine(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
     let session = herdr_session(ctx);
-    let target = provider_worker_host(ctx, worker);
+    let target = worker_ssh_target(&ctx.fleet, worker)?;
     let machines = herdr_machine_list(ctx)?;
     if let Some(machine) = find_herdr_machine(&machines, worker, &target, &session) {
         if machine.get("target") == Some(&json!(target))
@@ -1355,7 +1547,7 @@ fn source_archive(root: &Path) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut tar = Builder::new(&mut encoder);
-        for dir in ["bootstrap", "remote", "devenv"] {
+        for dir in ["bootstrap", "remote", "devenv", "herdr"] {
             add_dir(&mut tar, root, &root.join(dir))?;
         }
         for name in [
@@ -1486,11 +1678,6 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn recovery_ssh_args(ctx: &Context, worker: &str, remote_argv: Vec<String>) -> Result<Vec<String>> {
-    let remote_user = ctx
-        .fleet
-        .get("remote_user")
-        .and_then(Value::as_str)
-        .unwrap_or("exedev");
     let command = remote_argv
         .iter()
         .map(|part| shell_quote(part))
@@ -1503,7 +1690,7 @@ fn recovery_ssh_args(ctx: &Context, worker: &str, remote_argv: Vec<String>) -> R
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
         "ConnectTimeout=15".into(),
-        format!("{remote_user}@{worker}.exe.xyz"),
+        provider_worker_host(ctx, worker),
         command,
     ])
 }
@@ -1662,8 +1849,8 @@ fn provider_worker_host(ctx: &Context, worker: &str) -> String {
     format!("{remote_user}@{worker}.exe.xyz")
 }
 
-fn connection_target(ctx: &Context, worker: &str) -> String {
-    provider_worker_host(ctx, worker)
+fn connection_target(ctx: &Context, worker: &str) -> Result<String> {
+    worker_ssh_target(&ctx.fleet, worker)
 }
 
 fn remote_root(ctx: &Context) -> String {
@@ -1719,7 +1906,7 @@ fn json_items(value: &Value) -> Option<Vec<Value>> {
     if let Some(items) = value.as_array() {
         return Some(items.clone());
     }
-    for key in ["items", "panes", "agents", "machines", "executions"] {
+    for key in ["items", "panes", "agents", "machines", "executions", "logs"] {
         if let Some(items) = value.get(key).and_then(Value::as_array) {
             return Some(items.clone());
         }

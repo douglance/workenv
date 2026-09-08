@@ -11,8 +11,9 @@ adds the workenv tag and controller access; it cannot restrict worker access
 already granted by a broader existing rule. Validate the resulting policy and
 its worker isolation tests before enrollment.
 
-Create a tailnet OAuth client with permission to create auth keys, limited to
-`tag:workenv`. Store its client ID and secret on `desk-01` in the ignored file
+In Settings > Trust credentials, create a credential with Auth Keys read/write
+permission limited to `tag:workenv`. Store its client ID and secret on
+`desk-01` in the ignored file
 `.state/tailscale-oauth.local.json`, with owner-only mode `0600`:
 
 ```json

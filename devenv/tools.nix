@@ -59,7 +59,12 @@ let
     '';
     installPhase = ''
       runHook preInstall
+      ${if spec ? runtime_root then ''
+      mkdir -p "$out"
+      cp -R "source/${spec.runtime_root}/." "$out/"
+      '' else ''
       install -D -m 0755 "source/${spec.member}" "$out/bin/${name}"
+      ''}
       runHook postInstall
     '';
     meta.platforms = [ "x86_64-linux" ];

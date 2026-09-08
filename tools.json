@@ -113,6 +113,7 @@
       "hash": "sha512-x1EcwBlY3AObM1VTUHNM2AzAJQsyreGdagpF+qFiYi/Oa30VBktvvG0C6tLtCzqW6hjZNWkGZQWmeVk7MuJKWg==",
       "kind": "npm-native-member",
       "member": "package/vendor/x86_64-unknown-linux-musl/bin/codex",
+      "runtime_root": "package/vendor/x86_64-unknown-linux-musl",
       "package": "@openai/codex",
       "shasum": "8e0c754e77a6af68cf261e12bdab017206e282f6",
       "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.153.4-linux-x64.tgz",

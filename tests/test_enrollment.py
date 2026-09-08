@@ -452,10 +452,10 @@ def test_policy_fragment_is_merge_only_and_workenv_scoped():
     fragment = json.loads((Path(__file__).resolve().parents[1] / "enrollment/policy_fragment.json").read_text())
 
     assert fragment["merge_only"] is True
-    assert fragment["tagOwners"]["tag:workenv"] == ["group:operator"]
+    assert fragment["tagOwners"]["tag:workenv"] == ["operator@example.invalid"]
     assert fragment["ssh"] == [
-        {"action": "accept", "src": ["group:operator"], "dst": ["tag:workenv"], "users": ["exedev"]}
+        {"action": "accept", "src": ["operator@example.invalid"], "dst": ["tag:workenv"], "users": ["exedev"]}
     ]
     assert fragment["acls"] == [
-        {"action": "accept", "src": ["group:operator"], "dst": ["tag:workenv:22", "tag:workenv:8000"]}
+        {"action": "accept", "src": ["operator@example.invalid"], "dst": ["tag:workenv:22", "tag:workenv:8000"]}
     ]

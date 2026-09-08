@@ -144,10 +144,10 @@ impl Context {
         timeout_ms: u64,
     ) -> Result<CommandOutput> {
         let name = self.worker_name(worker)?;
-        let user = self.fleet["remote_user"].as_str().unwrap_or("exedev");
         let root = self.fleet["remote_root"]
             .as_str()
             .unwrap_or("/home/exedev/workenv");
+        let target = worker_ssh_target(&self.fleet, &name)?;
         if matches!(argv.first().map(String::as_str), Some("apoc" | "herdr")) {
             let invocation = if argv.first().map(String::as_str) == Some("apoc")
                 && argv.get(1).map(String::as_str) == Some("execution")
@@ -184,7 +184,7 @@ impl Context {
                 "ConnectTimeout=15".into(),
                 "-o".into(),
                 "StrictHostKeyChecking=yes".into(),
-                format!("{user}@{name}.exe.xyz"),
+                target,
                 shell_join(&argv),
             ],
             key,
@@ -247,6 +247,12 @@ fn validate_fleet(fleet: &Value) -> Result<()> {
                 bail!("{name}.{field} must be a positive integer");
             }
         }
+        if let Some(host) = worker.get("ssh_host") {
+            let host = host
+                .as_str()
+                .with_context(|| format!("{name}.ssh_host must be a string"))?;
+            validate_ssh_host(host).with_context(|| format!("{name}.ssh_host is invalid"))?;
+        }
     }
     let user = fleet["remote_user"].as_str().unwrap_or("exedev");
     if user.is_empty()
@@ -255,6 +261,61 @@ fn validate_fleet(fleet: &Value) -> Result<()> {
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
     {
         bail!("Invalid remote_user");
+    }
+    Ok(())
+}
+
+pub(crate) fn worker_ssh_target(fleet: &Value, worker: &str) -> Result<String> {
+    let user = fleet["remote_user"].as_str().unwrap_or("exedev");
+    let host = worker_ssh_host(fleet, worker)?;
+    Ok(format!("{user}@{host}"))
+}
+
+fn worker_ssh_host(fleet: &Value, worker: &str) -> Result<String> {
+    let host = fleet["workers"]
+        .as_array()
+        .and_then(|workers| {
+            workers
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(worker))
+        })
+        .and_then(|worker| worker.get("ssh_host"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{worker}.exe.xyz"));
+    validate_ssh_host(&host).with_context(|| format!("{worker}.ssh_host is invalid"))?;
+    Ok(host)
+}
+
+fn validate_ssh_host(host: &str) -> Result<()> {
+    if host.is_empty()
+        || host.trim() != host
+        || host.bytes().any(|c| c.is_ascii_whitespace())
+        || host.starts_with('-')
+        || host.contains('@')
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains("://")
+    {
+        bail!("ssh_host must be a DNS name or IP address");
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if host.len() > 253 || host.ends_with('.') {
+        bail!("ssh_host must be a DNS name or IP address");
+    }
+    for label in host.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            || label.starts_with('-')
+            || label.ends_with('-')
+        {
+            bail!("ssh_host must be a DNS name or IP address");
+        }
     }
     Ok(())
 }
@@ -550,6 +611,39 @@ mod tests {
         let worker = json!({"name":"workenv-01","cpus":2,"memory_gb":8,"disk_gb":50});
         assert!(validate_fleet(&json!({"workers":[worker.clone(),worker]})).is_err());
         assert!(validate_fleet(&json!({"workers":[{"name":"workenv-01","cpus":0}]})).is_err());
+    }
+    #[test]
+    fn validates_optional_worker_ssh_host() {
+        let base = |host: Value| {
+            json!({
+                "workers": [{
+                    "name":"workenv-01",
+                    "cpus":2,
+                    "memory_gb":8,
+                    "disk_gb":50,
+                    "ssh_host": host
+                }]
+            })
+        };
+        assert!(validate_fleet(&base(json!("workenv-01.tail.example.ts.net"))).is_ok());
+        assert!(validate_fleet(&base(json!("100.64.0.12"))).is_ok());
+        assert!(validate_fleet(&base(json!("fd7a:115c:a1e0::12"))).is_ok());
+        for host in [
+            "",
+            " workenv-01.tail.example.ts.net",
+            "workenv-01.tail.example.ts.net ",
+            "workenv-01.tail.example.ts.net -o ProxyCommand=sh",
+            "exedev@workenv-01.tail.example.ts.net",
+            "ssh://workenv-01.tail.example.ts.net",
+            "workenv-01.tail.example.ts.net/path",
+            "-oProxyCommand=sh",
+            "bad..host",
+            "bad_host",
+            "bad-.host",
+        ] {
+            assert!(validate_fleet(&base(json!(host))).is_err(), "{host}");
+        }
+        assert!(validate_fleet(&base(json!(["workenv-01.tail.example.ts.net"]))).is_err());
     }
     #[test]
     fn state_write_is_complete_and_private() {

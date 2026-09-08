@@ -22,6 +22,15 @@ these instructions; it does not terminate the remote session.
 `workenv in 2 --print` returns connection details without opening a TUI.
 MCP always returns connection details.
 
+The main Herdr sidebar also connects to all six registered machines through
+Tailscale. Expand `workenv-01` through `workenv-06`, then select a workspace
+under that machine. Remote agent states feed the same sidebar used for local
+agents. `workenv in` opens a separate client onto the same persistent session.
+
+`fleet.json` sets each worker's `ssh_host` to its tailnet DNS name. Omitting
+that field selects provider SSH. Bootstrap and enrollment always use provider
+SSH so they can prepare a machine before Tailscale is ready.
+
 ## Claim and run work
 
 ```sh

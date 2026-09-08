@@ -9,12 +9,12 @@
   "region": "dal",
   "capacity": {"cpus": 16, "memory_gb": 64, "included_disk_gb": 800, "monthly_price_cents": 16000},
   "workers": [
-    {"name": "workenv-01", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-02", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-03", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-04", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-05", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100},
-    {"name": "workenv-06", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100}
+    {"name": "workenv-01", "ssh_host": "workenv-01.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-02", "ssh_host": "workenv-02.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-03", "ssh_host": "workenv-03.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-04", "ssh_host": "workenv-04.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
+    {"name": "workenv-05", "ssh_host": "workenv-05.example.ts.net", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100},
+    {"name": "workenv-06", "ssh_host": "workenv-06.example.ts.net", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100}
   ],
   "projects": {
     "workenv": {"repository": "operator/workenv", "class": "general", "profile": "rust", "integration": "main"},

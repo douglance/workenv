@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use flate2::read::GzDecoder;
 use serde_json::{json, Value};
+use tar::Archive;
 use tempfile::TempDir;
 use workenv::{worker, CommandOutput, CommandSpec, Context, Runtime};
 
@@ -78,6 +80,31 @@ fn ctx(runtime: Arc<FakeRuntime>, state: PathBuf) -> Context {
         }),
         runtime,
     }
+}
+
+fn ctx_with_ssh_host(runtime: Arc<FakeRuntime>, state: PathBuf, host: &str) -> Context {
+    let mut ctx = ctx(runtime, state);
+    ctx.fleet["workers"][0]["ssh_host"] = json!(host);
+    ctx
+}
+
+fn use_temp_source_root(ctx: &mut Context, root: &Path) {
+    std::fs::create_dir_all(root.join("bootstrap")).unwrap();
+    std::fs::create_dir_all(root.join("remote")).unwrap();
+    std::fs::create_dir_all(root.join("devenv")).unwrap();
+    std::fs::write(root.join("tools.json"), "{}").unwrap();
+    std::fs::write(root.join("devenv.nix"), "").unwrap();
+    std::fs::write(root.join("remote/tool_health.py"), "").unwrap();
+    ctx.root = root.to_path_buf();
+}
+
+fn add_space_attention_plugin(root: &Path) {
+    std::fs::create_dir_all(root.join("herdr/space-attention")).unwrap();
+    std::fs::write(
+        root.join("herdr/space-attention/herdr-plugin.toml"),
+        "id = \"operator.space-attention\"\n[[actions]]\nid = \"refresh\"\ntitle = \"Refresh workspace states\"\ncontexts = [\"workspace\"]\ncommand = [\"python3\", \"scripts/reconcile.py\"]\n",
+    )
+    .unwrap();
 }
 
 fn provider_present() -> Value {
@@ -167,7 +194,8 @@ fn up_initializes_a_verified_empty_worker_without_an_existing_workspace_helper()
     runtime.push(json!([]));
     runtime.push_text("registered\n");
     runtime.push(tailscale_not_ready());
-    let ctx = ctx(runtime.clone(), temp.path().join("state"));
+    let mut ctx = ctx(runtime.clone(), temp.path().join("state"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
     let result = worker::up(&ctx, Some("1"), "initial-up").unwrap();
     assert_eq!(result["workers"][0]["status"], "auth_required");
     let specs = runtime.specs();
@@ -180,6 +208,130 @@ fn up_initializes_a_verified_empty_worker_without_an_existing_workspace_helper()
     assert!(specs
         .iter()
         .any(|spec| spec.key == "initial-up:sync:workenv-01"));
+}
+
+#[test]
+fn up_uses_configured_ssh_host_for_managed_transport_but_not_provider_recovery() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(provider_present());
+    runtime.outputs.lock().unwrap().push(CommandOutput {
+        stdout: Vec::new(),
+        stderr: b"workspace helper does not exist".to_vec(),
+        exit_code: Some(1),
+        execution_id: "missing-helper".into(),
+    });
+    runtime.push(json!({"ok":true,"status":"uninitialized"}));
+    runtime.push_text("workenv-source-sync-v1\n");
+    runtime.push_text("installed\n");
+    runtime.push(bootstrap_health());
+    runtime.push(tool_health());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.push(json!([]));
+    runtime.push_text("registered\n");
+    runtime.push(tailscale_not_ready());
+    let mut ctx = ctx_with_ssh_host(
+        runtime.clone(),
+        temp.path().join("state"),
+        "workenv-01.tail.example.ts.net",
+    );
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+
+    let result = worker::up(&ctx, Some("1"), "tailnet-up").unwrap();
+
+    assert_eq!(result["workers"][0]["status"], "auth_required");
+    let specs = runtime.specs();
+    let provider_probe = specs
+        .iter()
+        .find(|spec| spec.purpose.contains("before first installation"))
+        .unwrap();
+    assert!(provider_probe
+        .args
+        .contains(&"exedev@workenv-01.exe.xyz".to_owned()));
+
+    let source_sync = specs
+        .iter()
+        .find(|spec| spec.key == "tailnet-up:sync:workenv-01")
+        .unwrap();
+    assert!(source_sync
+        .args
+        .contains(&"exedev@workenv-01.exe.xyz".to_owned()));
+
+    let bootstrap = specs
+        .iter()
+        .find(|spec| spec.key == "tailnet-up:bootstrap:workenv-01")
+        .unwrap();
+    assert!(bootstrap
+        .args
+        .contains(&"exedev@workenv-01.tail.example.ts.net".to_owned()));
+
+    let registration = specs
+        .iter()
+        .find(|spec| spec.key == "tailnet-up:herdr-register:workenv-01")
+        .unwrap();
+    assert_eq!(registration.executable, "herdr");
+    assert_eq!(
+        registration.args,
+        vec![
+            "machine",
+            "add",
+            "exedev@workenv-01.tail.example.ts.net",
+            "--label",
+            "workenv-01",
+            "--remote-session",
+            "workenv"
+        ]
+    );
+}
+
+#[test]
+fn sync_archive_includes_herdr_sources_when_plugin_exists() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(provider_present());
+    runtime.outputs.lock().unwrap().push(CommandOutput {
+        stdout: Vec::new(),
+        stderr: b"workspace helper does not exist".to_vec(),
+        exit_code: Some(1),
+        execution_id: "missing-helper".into(),
+    });
+    runtime.push(json!({"ok":true,"status":"uninitialized"}));
+    runtime.push_text("workenv-source-sync-v1\n");
+    runtime.push_text("installed\n");
+    runtime.push(bootstrap_health());
+    runtime.push(tool_health());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.push_text("linked\n");
+    runtime.push(json!({"id":"cli:plugin", "result":{"type":"plugin_action_invoked", "log":{"log_id":"plugin-log-1", "status":"running"}}}));
+    runtime.push(json!({"id":"cli:plugin", "result":{"type":"plugin_log_list", "logs":[{"log_id":"plugin-log-1", "status":"succeeded", "exit_code":0}]}}));
+    runtime.push(json!([]));
+    runtime.push_text("registered\n");
+    runtime.push(tailscale_not_ready());
+    let mut ctx = ctx(runtime.clone(), temp.path().join("state"));
+    let root = temp.path().join("root");
+    use_temp_source_root(&mut ctx, &root);
+    add_space_attention_plugin(&root);
+
+    let result = worker::up(&ctx, Some("1"), "archive-up").unwrap();
+
+    assert_eq!(result["workers"][0]["status"], "auth_required");
+    let sync = runtime
+        .specs()
+        .into_iter()
+        .find(|spec| spec.key == "archive-up:sync:workenv-01")
+        .unwrap();
+    let stdin = sync.stdin.unwrap();
+    let mut archive = Archive::new(GzDecoder::new(&stdin[..]));
+    let names = archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(names
+        .iter()
+        .any(|name| name == "herdr/space-attention/herdr-plugin.toml"));
 }
 
 #[test]
@@ -247,7 +399,8 @@ fn up_syncs_bootstraps_tools_and_herdr_before_returning_partial_auth_state() {
     runtime.push(json!([]));
     runtime.push_text("registered\n");
     runtime.push(tailscale_not_ready());
-    let ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
 
     let result = worker::up(&ctx, Some("workenv-01"), "up-key").unwrap();
 
@@ -318,6 +471,141 @@ fn up_syncs_bootstraps_tools_and_herdr_before_returning_partial_auth_state() {
                 .position(|purpose| purpose.contains("Inspect Tailscale status"))
                 .unwrap()
     );
+}
+
+#[test]
+fn start_worker_herdr_skips_sidebar_setup_when_plugin_manifest_is_absent() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+
+    let result = worker::start_worker_herdr(&ctx, "workenv-01", "herdr-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_ready");
+    assert_eq!(result["herdr_ready"], true);
+    assert_eq!(result["sidebar"]["status"], "herdr_sidebar_skipped");
+    assert!(!runtime
+        .specs()
+        .iter()
+        .any(|spec| spec.key.contains("herdr-plugin")));
+}
+
+#[test]
+fn start_worker_herdr_links_configured_sidebar_plugin_after_server_readiness() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.push_text("linked\n");
+    runtime.push(json!({"id":"cli:plugin", "result":{"type":"plugin_action_invoked", "log":{"log_id":"plugin-log-1", "status":"running"}}}));
+    runtime.push(json!({"id":"cli:plugin", "result":{"type":"plugin_log_list", "logs":[{"log_id":"plugin-log-1", "status":"succeeded", "exit_code":0}]}}));
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    let root = temp.path().join("root");
+    use_temp_source_root(&mut ctx, &root);
+    add_space_attention_plugin(&root);
+
+    let result = worker::start_worker_herdr(&ctx, "workenv-01", "herdr-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_ready");
+    assert_eq!(result["sidebar"]["status"], "herdr_sidebar_ready");
+    assert_eq!(
+        result["sidebar"]["path"],
+        "/home/exedev/workenv/herdr/space-attention"
+    );
+    assert_eq!(result["sidebar"]["log"]["status"], "succeeded");
+    assert_eq!(result["sidebar"]["log"]["exit_code"], 0);
+    let specs = runtime.specs();
+    let status_index = specs
+        .iter()
+        .position(|spec| spec.key.starts_with("read:herdr-status"))
+        .unwrap();
+    let link_index = specs
+        .iter()
+        .position(|spec| spec.key == "herdr-key:herdr-plugin:space-attention:workenv-01")
+        .unwrap();
+    let refresh_index = specs
+        .iter()
+        .position(|spec| spec.key == "herdr-key:herdr-plugin:space-attention:refresh:workenv-01")
+        .unwrap();
+    let log_index = specs
+        .iter()
+        .position(|spec| spec.key.starts_with("read:herdr-plugin-refresh-log"))
+        .unwrap();
+    assert!(status_index < link_index);
+    assert!(link_index < refresh_index);
+    assert!(refresh_index < log_index);
+    let link = &specs[link_index];
+    assert!(link
+        .args
+        .iter()
+        .any(|arg| arg.contains("plugin") && arg.contains("link")));
+    assert!(link
+        .args
+        .iter()
+        .any(|arg| arg.contains("/home/exedev/workenv/herdr/space-attention")));
+    let refresh = &specs[refresh_index];
+    assert!(refresh
+        .args
+        .iter()
+        .any(|arg| arg.contains("plugin action invoke refresh")));
+    assert!(refresh
+        .args
+        .iter()
+        .any(|arg| arg.contains("--plugin") && arg.contains("operator.space-attention")));
+    let log = &specs[log_index];
+    assert!(log.args.iter().any(|arg| arg.contains("plugin log list")));
+}
+
+#[test]
+fn start_worker_herdr_fails_when_configured_sidebar_plugin_link_fails() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.outputs.lock().unwrap().push(CommandOutput {
+        stdout: Vec::new(),
+        stderr: b"plugin link failed".to_vec(),
+        exit_code: Some(1),
+        execution_id: "link-failed".into(),
+    });
+    let mut ctx = ctx(runtime, temp.path().join(".state/controller"));
+    let root = temp.path().join("root");
+    use_temp_source_root(&mut ctx, &root);
+    add_space_attention_plugin(&root);
+
+    let result = worker::start_worker_herdr(&ctx, "workenv-01", "herdr-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_sidebar_failed");
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["herdr_ready"], false);
+    assert_eq!(result["link"]["status"], "remote_failed");
+}
+
+#[test]
+fn start_worker_herdr_fails_when_sidebar_refresh_log_fails() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.push_text("linked\n");
+    runtime.push(json!({"id":"cli:plugin", "result":{"type":"plugin_action_invoked", "log":{"log_id":"plugin-log-1", "status":"running"}}}));
+    runtime.push(json!({"id":"cli:plugin", "result":{"type":"plugin_log_list", "logs":[{"log_id":"plugin-log-1", "status":"succeeded", "exit_code":1}]}}));
+    let mut ctx = ctx(runtime, temp.path().join(".state/controller"));
+    let root = temp.path().join("root");
+    use_temp_source_root(&mut ctx, &root);
+    add_space_attention_plugin(&root);
+
+    let result = worker::start_worker_herdr(&ctx, "workenv-01", "herdr-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_sidebar_refresh_failed");
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["herdr_ready"], false);
+    assert_eq!(result["refresh"]["result"]["log"]["log_id"], "plugin-log-1");
+    assert_eq!(result["log"]["status"], "succeeded");
+    assert_eq!(result["log"]["exit_code"], 1);
 }
 
 #[test]
@@ -425,6 +713,44 @@ fn connection_returns_scoped_herdr_and_ssh_attach_commands() {
         ])
     );
     assert_eq!(result["ssh_argv"][1], "exedev@workenv-01.exe.xyz");
+}
+
+#[test]
+fn connection_uses_configured_ssh_host_for_herdr_and_ssh_attach_commands() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(json!([{
+        "id":"machine-1",
+        "label":"workenv-01",
+        "target":"exedev@workenv-01.tail.example.ts.net",
+        "session":"workenv",
+        "enabled": true
+    }]));
+    let ctx = ctx_with_ssh_host(
+        runtime,
+        temp.path().join(".state/controller"),
+        "workenv-01.tail.example.ts.net",
+    );
+
+    let result = worker::connection(&ctx, "workenv-01").unwrap();
+
+    assert_eq!(result["status"], "connection");
+    assert_eq!(result["target"], "exedev@workenv-01.tail.example.ts.net");
+    assert_eq!(result["machine"]["id"], "machine-1");
+    assert_eq!(
+        result["attach_argv"],
+        json!([
+            "herdr",
+            "--remote",
+            "exedev@workenv-01.tail.example.ts.net",
+            "--session",
+            "workenv"
+        ])
+    );
+    assert_eq!(
+        result["ssh_argv"],
+        json!(["ssh", "exedev@workenv-01.tail.example.ts.net"])
+    );
 }
 
 #[test]

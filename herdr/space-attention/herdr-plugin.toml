@@ -1,0 +1,59 @@
+id = "operator.space-attention"
+name = "Space Attention"
+version = "0.8.2"
+min_herdr_version = "0.7.5"
+description = "Infer state-colored project icons from live repository contents"
+platforms = ["macos", "linux"]
+
+[[startup]]
+command = ["python3", "scripts/reconcile.py"]
+
+[[actions]]
+id = "refresh"
+title = "Refresh workspace states"
+contexts = ["workspace"]
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "workspace.created"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "workspace.closed"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "tab.created"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "worktree.created"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "pane.created"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "scripts/reconcile.py"]
+
+[[events]]
+on = "pane.moved"
+command = ["python3", "scripts/reconcile.py"]
