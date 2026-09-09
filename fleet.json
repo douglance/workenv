@@ -7,20 +7,146 @@
   "herdr_version": "0.9.0",
   "herdr_session": "workenv",
   "region": "dal",
-  "capacity": {"cpus": 16, "memory_gb": 64, "included_disk_gb": 800, "monthly_price_cents": 16000},
+  "capacity": {
+    "cpus": 16,
+    "memory_gb": 64,
+    "included_disk_gb": 800,
+    "monthly_price_cents": 16000
+  },
   "workers": [
-    {"name": "workenv-01", "ssh_host": "workenv-01.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-02", "ssh_host": "workenv-02.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-03", "ssh_host": "workenv-03.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-04", "ssh_host": "workenv-04.example.ts.net", "class": "general", "cpus": 2, "memory_gb": 8, "disk_gb": 50},
-    {"name": "workenv-05", "ssh_host": "workenv-05.example.ts.net", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100},
-    {"name": "workenv-06", "ssh_host": "workenv-06.example.ts.net", "class": "build", "cpus": 4, "memory_gb": 16, "disk_gb": 100}
+    {
+      "name": "workenv-01",
+      "ssh_host": "workenv-01.example.ts.net",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50
+    },
+    {
+      "name": "workenv-02",
+      "ssh_host": "workenv-02.example.ts.net",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50
+    },
+    {
+      "name": "workenv-03",
+      "ssh_host": "workenv-03.example.ts.net",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50
+    },
+    {
+      "name": "workenv-04",
+      "ssh_host": "workenv-04.example.ts.net",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50
+    },
+    {
+      "name": "workenv-05",
+      "ssh_host": "workenv-05.example.ts.net",
+      "class": "build",
+      "cpus": 4,
+      "memory_gb": 16,
+      "disk_gb": 100
+    },
+    {
+      "name": "workenv-06",
+      "ssh_host": "workenv-06.example.ts.net",
+      "class": "build",
+      "cpus": 4,
+      "memory_gb": 16,
+      "disk_gb": 100
+    },
+    {
+      "name": "mac-static",
+      "host": "mac",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50,
+      "lifetime": "static"
+    },
+    {
+      "name": "mac-ephemeral",
+      "host": "mac",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50,
+      "lifetime": "ephemeral"
+    },
+    {
+      "name": "linux-static",
+      "host": "linux-ssh",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50,
+      "lifetime": "static",
+      "root": "/home/exedev/workenv-portable-workers/linux-static"
+    },
+    {
+      "name": "linux-ephemeral",
+      "host": "linux-ssh",
+      "class": "general",
+      "cpus": 2,
+      "memory_gb": 8,
+      "disk_gb": 50,
+      "lifetime": "ephemeral",
+      "root": "/home/exedev/workenv-portable-workers/linux-ephemeral"
+    }
   ],
   "projects": {
-    "workenv": {"repository": "operator/workenv", "class": "general", "profile": "rust", "integration": "main"},
-    "incurs": {"repository": "operator/incurs", "class": "general", "profile": "rust", "integration": "workenv-incurs"},
-    "groktris": {"repository": "operator/groktris", "class": "general", "profile": "web", "integration": "workenv-groktris", "preview_port": 8000},
-    "apoc": {"repository": "operator/apoc", "class": "build", "profile": "rust", "integration": "workenv-apoc"},
-    "devsql": {"repository": "operator/devsql", "class": "build", "profile": "rust", "integration": "workenv-devsql"}
+    "workenv": {
+      "repository": "operator/workenv",
+      "class": "general",
+      "profile": "rust",
+      "integration": "main"
+    },
+    "incurs": {
+      "repository": "operator/incurs",
+      "class": "general",
+      "profile": "rust",
+      "integration": "workenv-incurs"
+    },
+    "groktris": {
+      "repository": "operator/groktris",
+      "class": "general",
+      "profile": "web",
+      "integration": "workenv-groktris",
+      "preview_port": 8000
+    },
+    "apoc": {
+      "repository": "operator/apoc",
+      "class": "build",
+      "profile": "rust",
+      "integration": "workenv-apoc"
+    },
+    "devsql": {
+      "repository": "operator/devsql",
+      "class": "build",
+      "profile": "rust",
+      "integration": "workenv-devsql"
+    }
+  },
+  "hosts": {
+    "mac": {
+      "transport": "local",
+      "root": "/Users/operator/Developer/src/workenv/.state/native-host-runtime",
+      "tools": "native",
+      "platform": "macos"
+    },
+    "linux-ssh": {
+      "transport": "ssh",
+      "root": "/home/exedev/workenv",
+      "tools": "devenv",
+      "target": "exedev@workenv-06.example.ts.net",
+      "platform": "linux"
+    }
   }
 }

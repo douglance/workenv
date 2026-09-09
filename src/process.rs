@@ -11,6 +11,8 @@ use std::{
 };
 use uuid::Uuid;
 
+use crate::hosts::{self, Provider, RemoteCommandSpec, ResolvedTools, ResolvedTransport};
+
 static SERVER_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 pub fn set_server_root(path: PathBuf) -> Result<()> {
@@ -117,6 +119,15 @@ impl Context {
             .and_then(|ws| ws.iter().find(|w| w["name"] == name))
             .context("Worker disappeared from fleet")
     }
+    pub fn worker_root(&self, selector: &str) -> Result<PathBuf> {
+        Ok(hosts::resolve(self, selector)?.root)
+    }
+    pub fn worker_environment_root(&self, selector: &str) -> Result<PathBuf> {
+        Ok(hosts::resolve(self, selector)?.environment_root)
+    }
+    pub fn worker_session(&self, selector: &str) -> Result<String> {
+        Ok(hosts::resolve(self, selector)?.session)
+    }
     pub fn run(
         &self,
         executable: &str,
@@ -135,6 +146,38 @@ impl Context {
             purpose: purpose.into(),
         })
     }
+    pub fn remote(&self, worker: &str, spec: RemoteCommandSpec) -> Result<CommandOutput> {
+        let resolved = hosts::resolve(self, worker)?;
+        if spec.argv.is_empty() {
+            bail!("remote command argv must not be empty");
+        }
+        let cwd = spec.cwd.unwrap_or_else(|| resolved.root.clone());
+        let (executable, args, command_cwd) = match &resolved.transport {
+            ResolvedTransport::Local => local_command(&resolved, spec.argv, cwd, spec.tools_env)?,
+            ResolvedTransport::Ssh { target } => {
+                let ssh_cwd = if !spec.tools_env && cwd == resolved.root {
+                    None
+                } else {
+                    Some(cwd)
+                };
+                let argv = ssh_remote_argv(&resolved, spec.argv, ssh_cwd, spec.tools_env)?;
+                (
+                    "ssh".to_string(),
+                    ssh_args(target.clone(), argv),
+                    Some(self.root.clone()),
+                )
+            }
+        };
+        self.runtime.run(CommandSpec {
+            executable,
+            args,
+            cwd: command_cwd,
+            stdin: spec.stdin,
+            timeout_ms: spec.timeout_ms,
+            key: spec.key,
+            purpose: spec.purpose,
+        })
+    }
     pub fn ssh(
         &self,
         worker: &str,
@@ -143,58 +186,170 @@ impl Context {
         purpose: &str,
         timeout_ms: u64,
     ) -> Result<CommandOutput> {
-        let name = self.worker_name(worker)?;
-        let root = self.fleet["remote_root"]
-            .as_str()
-            .unwrap_or("/home/exedev/workenv");
-        let target = worker_ssh_target(&self.fleet, &name)?;
-        if matches!(argv.first().map(String::as_str), Some("apoc" | "herdr")) {
-            let invocation = if argv.first().map(String::as_str) == Some("apoc")
-                && argv.get(1).map(String::as_str) == Some("execution")
-                && argv.get(2).map(String::as_str) == Some("start")
-            {
-                let delimiter = argv
-                    .iter()
-                    .position(|s| s == "--")
-                    .context("APoC execution start requires an argv delimiter")?;
-                format!(
-                    "{} --env \"PATH=$PATH\" -- {}",
-                    shell_join(&argv[..delimiter]),
-                    shell_join(&argv[delimiter + 1..])
+        let resolved = hosts::resolve(self, worker)?;
+        let target = match &resolved.transport {
+            ResolvedTransport::Ssh { target } => target.clone(),
+            ResolvedTransport::Local => {
+                bail!(
+                    "worker {} uses local transport and has no SSH target",
+                    resolved.name
                 )
-            } else {
-                shell_join(&argv)
-            };
-            argv = vec![
-                "bash".into(),
-                "-lc".into(),
-                format!(
-                    "cd {} && /usr/local/bin/devenv shell -- bash -c {}",
-                    shell_quote(root),
-                    shell_quote(&format!("exec {invocation}"))
-                ),
-            ];
+            }
+        };
+        if matches!(argv.first().map(String::as_str), Some("apoc" | "herdr")) {
+            argv = ssh_remote_argv(&resolved, argv, None, true)?;
         }
-        self.run(
-            "ssh",
-            vec![
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=15".into(),
-                "-o".into(),
-                "StrictHostKeyChecking=yes".into(),
-                target,
-                shell_join(&argv),
-            ],
-            key,
-            purpose,
-            timeout_ms,
-        )
+        self.run("ssh", ssh_args(target, argv), key, purpose, timeout_ms)
     }
     pub fn apoc(&self, method: &str, args: Value) -> Result<Value> {
         self.runtime.apoc(method, args)
     }
+}
+
+fn local_command(
+    resolved: &hosts::ResolvedWorker,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    tools_env: bool,
+) -> Result<(String, Vec<String>, Option<PathBuf>)> {
+    if !tools_env {
+        let mut iter = argv.into_iter();
+        let executable = iter
+            .next()
+            .context("remote command argv must not be empty")?;
+        return Ok((executable, iter.collect(), Some(cwd)));
+    }
+    match &resolved.tools {
+        ResolvedTools::Native => {
+            let command = native_tools_command(resolved, &argv, Some(&cwd))?;
+            Ok(("bash".into(), vec!["-lc".into(), command], Some(cwd)))
+        }
+        ResolvedTools::Devenv { executable } => {
+            let invocation = devenv_child_invocation(&argv)?;
+            Ok((
+                "bash".into(),
+                vec![
+                    "-lc".into(),
+                    format!(
+                        "cd {} && exec {} shell -- bash -c {}",
+                        shell_quote(&resolved.environment_root.to_string_lossy()),
+                        shell_quote(executable),
+                        shell_quote(&format!(
+                            "cd {} && exec {invocation}",
+                            shell_quote(&cwd.to_string_lossy())
+                        ))
+                    ),
+                ],
+                Some(resolved.environment_root.clone()),
+            ))
+        }
+    }
+}
+
+fn ssh_remote_argv(
+    resolved: &hosts::ResolvedWorker,
+    argv: Vec<String>,
+    cwd: Option<PathBuf>,
+    tools_env: bool,
+) -> Result<Vec<String>> {
+    if !tools_env {
+        return Ok(match cwd {
+            Some(cwd) => vec![
+                "bash".into(),
+                "-lc".into(),
+                format!(
+                    "cd {} && exec {}",
+                    shell_quote(&cwd.to_string_lossy()),
+                    shell_join(&argv)
+                ),
+            ],
+            None => argv,
+        });
+    }
+    if matches!(resolved.tools, ResolvedTools::Native) {
+        return Ok(vec![
+            "bash".into(),
+            "-lc".into(),
+            native_tools_command(resolved, &argv, cwd.as_ref())?,
+        ]);
+    }
+    let ResolvedTools::Devenv { executable } = &resolved.tools else {
+        unreachable!();
+    };
+    let invocation = devenv_child_invocation(&argv)?;
+    let inner = match cwd {
+        Some(cwd) => format!(
+            "cd {} && exec {invocation}",
+            shell_quote(&cwd.to_string_lossy())
+        ),
+        None => format!("exec {invocation}"),
+    };
+    Ok(vec![
+        "bash".into(),
+        "-lc".into(),
+        format!(
+            "cd {} && {} shell -- bash -c {}",
+            shell_quote(&resolved.environment_root.to_string_lossy()),
+            if resolved.provider == Provider::ExeDev {
+                executable.clone()
+            } else {
+                shell_quote(executable)
+            },
+            shell_quote(&inner)
+        ),
+    ])
+}
+
+fn devenv_child_invocation(argv: &[String]) -> Result<String> {
+    if argv.first().map(String::as_str) == Some("apoc")
+        && argv.get(1).map(String::as_str) == Some("execution")
+        && argv.get(2).map(String::as_str) == Some("start")
+    {
+        let delimiter = argv
+            .iter()
+            .position(|s| s == "--")
+            .context("APoC execution start requires an argv delimiter")?;
+        return Ok(format!(
+            "{} --env \"PATH=$PATH\" -- {}",
+            shell_join(&argv[..delimiter]),
+            shell_join(&argv[delimiter + 1..])
+        ));
+    }
+    Ok(shell_join(argv))
+}
+
+fn native_tools_command(
+    resolved: &hosts::ResolvedWorker,
+    argv: &[String],
+    cwd: Option<&PathBuf>,
+) -> Result<String> {
+    // Native execution environments remain owned by the host's APoC profile.
+    let invocation = shell_join(argv);
+    let mut commands = vec![format!(
+        "export PATH={}:$HOME/.local/bin:$PATH",
+        shell_quote(&format!(
+            "{}/bin",
+            resolved.environment_root.to_string_lossy()
+        ))
+    )];
+    if let Some(cwd) = cwd {
+        commands.push(format!("cd {}", shell_quote(&cwd.to_string_lossy())));
+    }
+    commands.push(format!("exec {invocation}"));
+    Ok(commands.join(" && "))
+}
+
+fn ssh_args(target: String, argv: Vec<String>) -> Vec<String> {
+    vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=15".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        target,
+        shell_join(&argv),
+    ]
 }
 
 fn discover_root(explicit: Option<&str>) -> Result<PathBuf> {
@@ -229,36 +384,19 @@ fn discover_root(explicit: Option<&str>) -> Result<PathBuf> {
     bail!("Workenv configuration not found. Use --root PATH or set WORKENV_ROOT to the folder containing fleet.json")
 }
 
-fn validate_fleet(fleet: &Value) -> Result<()> {
+pub fn validate_fleet(fleet: &Value) -> Result<()> {
+    hosts::validate_fleet(fleet)?;
     let workers = fleet["workers"]
         .as_array()
         .context("fleet.json requires a workers array")?;
-    let mut names = std::collections::HashSet::new();
     for worker in workers {
         let name = worker["name"].as_str().context("Worker requires a name")?;
-        let suffix = name
-            .strip_prefix("workenv-")
-            .context("Worker names must use workenv-NN")?;
-        if suffix.len() != 2 || !suffix.bytes().all(|c| c.is_ascii_digit()) || !names.insert(name) {
-            bail!("Invalid or duplicate worker name {name:?}");
-        }
-        for field in ["cpus", "memory_gb", "disk_gb"] {
-            if worker[field].as_u64().unwrap_or(0) == 0 {
-                bail!("{name}.{field} must be a positive integer");
-            }
-        }
         if let Some(profile) = worker.get("profile") {
             let profile = profile
                 .as_str()
                 .with_context(|| format!("{name}.profile must be a string"))?;
             crate::profiles::validate_name(profile)
                 .with_context(|| format!("{name}.profile is invalid"))?;
-        }
-        if let Some(host) = worker.get("ssh_host") {
-            let host = host
-                .as_str()
-                .with_context(|| format!("{name}.ssh_host must be a string"))?;
-            validate_ssh_host(host).with_context(|| format!("{name}.ssh_host is invalid"))?;
         }
     }
     if let Some(projects) = fleet.get("projects").and_then(Value::as_object) {
@@ -284,58 +422,7 @@ fn validate_fleet(fleet: &Value) -> Result<()> {
 }
 
 pub(crate) fn worker_ssh_target(fleet: &Value, worker: &str) -> Result<String> {
-    let user = fleet["remote_user"].as_str().unwrap_or("exedev");
-    let host = worker_ssh_host(fleet, worker)?;
-    Ok(format!("{user}@{host}"))
-}
-
-fn worker_ssh_host(fleet: &Value, worker: &str) -> Result<String> {
-    let host = fleet["workers"]
-        .as_array()
-        .and_then(|workers| {
-            workers
-                .iter()
-                .find(|entry| entry["name"].as_str() == Some(worker))
-        })
-        .and_then(|worker| worker.get("ssh_host"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{worker}.exe.xyz"));
-    validate_ssh_host(&host).with_context(|| format!("{worker}.ssh_host is invalid"))?;
-    Ok(host)
-}
-
-fn validate_ssh_host(host: &str) -> Result<()> {
-    if host.is_empty()
-        || host.trim() != host
-        || host.bytes().any(|c| c.is_ascii_whitespace())
-        || host.starts_with('-')
-        || host.contains('@')
-        || host.contains('/')
-        || host.contains('\\')
-        || host.contains("://")
-    {
-        bail!("ssh_host must be a DNS name or IP address");
-    }
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
-    }
-    if host.len() > 253 || host.ends_with('.') {
-        bail!("ssh_host must be a DNS name or IP address");
-    }
-    for label in host.split('.') {
-        if label.is_empty()
-            || label.len() > 63
-            || !label
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-            || label.starts_with('-')
-            || label.ends_with('-')
-        {
-            bail!("ssh_host must be a DNS name or IP address");
-        }
-    }
-    Ok(())
+    hosts::worker_ssh_target(fleet, worker)
 }
 
 pub fn shell_quote(value: &str) -> String {

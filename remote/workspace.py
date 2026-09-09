@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -33,13 +34,15 @@ class WorkspaceError(Exception):
 def main(argv: list[str] | None = None) -> dict:
     parser = argparse.ArgumentParser(description="Manage a remote task workspace.")
     parser.add_argument("--root", default=str(Path.home() / "workenv"))
+    parser.add_argument("--lifetime", choices=("static", "ephemeral"), default="static")
+    parser.add_argument("--worker", help="Stable worker name. Required for --lifetime ephemeral.")
     parser.add_argument("--request", help="JSON request payload.")
     parser.add_argument("--request-base64", help="Base64-encoded JSON request payload.")
     args = parser.parse_args(argv)
 
     try:
         request = _load_request(args)
-        manager = WorkspaceManager(Path(args.root).expanduser())
+        manager = WorkspaceManager(Path(args.root).expanduser(), lifetime=args.lifetime, worker=args.worker)
         return manager.handle(request)
     except WorkspaceError as exc:
         return _result(exc.status, error=exc.message, code=exc.code)
@@ -52,13 +55,22 @@ def main(argv: list[str] | None = None) -> dict:
 
 
 class WorkspaceManager:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, lifetime: str = "static", worker: str | None = None):
+        if lifetime not in {"static", "ephemeral"}:
+            raise WorkspaceError("conflict", "lifetime must be static or ephemeral")
+        if lifetime == "ephemeral" and (not isinstance(worker, str) or not worker):
+            raise WorkspaceError("conflict", "worker is required for ephemeral lifetime")
+        if worker is not None and not TASK_ID_RE.match(worker):
+            raise WorkspaceError("conflict", "worker must be a safe slug")
         self.root = root
+        self.lifetime = lifetime
+        self.worker = worker
         self.state_dir = root / "state"
         self.receipts_dir = self.state_dir / "receipts"
         self.services_dir = self.state_dir / "services"
         self.mirrors_dir = root / "mirrors"
         self.worktrees_dir = root / "worktrees"
+        self.allocations_dir = root / "allocations"
         self.collections_dir = root / "collections"
         self.active_path = self.state_dir / "active.json"
         self.lock_path = self.state_dir / "workspace.lock"
@@ -74,14 +86,22 @@ class WorkspaceManager:
             raise WorkspaceError("conflict", "request_id is required")
 
         self._ensure_layout()
-        payload_hash = _canonical_hash(request)
+        payload_hash = _canonical_hash({"request": request, "lifetime": self.lifetime, "worker": self.worker})
         with self._locked():
-            replay = self._read_replay(request_id, payload_hash)
-            if replay is not None:
-                replay["replay"] = True
-                return replay
+            if operation == "status":
+                return self._handle_status(request)
 
-            if self._receipt_path(request_id).exists():
+            receipt_path = self._receipt_path(request_id)
+            replay = self._read_replay(request_id, payload_hash)
+            retry_failed_cleanup = (
+                operation == "release" and replay is not None and replay.get("status") == "failed_cleanup_required"
+            )
+            if replay is not None:
+                if not retry_failed_cleanup:
+                    replay["replay"] = True
+                    return replay
+
+            if receipt_path.exists() and not retry_failed_cleanup:
                 return _result("conflict", error="request_id was already used for a different payload", code=1)
 
             handler = {
@@ -114,33 +134,45 @@ class WorkspaceManager:
             return _result("busy", error="task is already active under a different request_id", active=_redact_active(active), code=2)
 
         mirror = self.mirrors_dir / f"{_safe_name(spec['repo']['owner'])}__{_safe_name(spec['repo']['name'])}.git"
-        worktree = self.worktrees_dir / spec["task_id"]
-        service_state_dir = self.services_dir / spec["task_id"]
+        allocation = self._allocation_for_claim(request, spec)
+        worktree = allocation["worktree"]
+        service_state_dir = allocation["service_state_dir"]
+        if allocation["worker_lifetime"] == "ephemeral":
+            self._cleanup_existing_preactive_allocation(allocation, request, spec, mirror)
         if worktree.exists():
             raise WorkspaceError("conflict", f"worktree path already exists: {worktree}")
         if service_state_dir.exists():
             raise WorkspaceError("conflict", f"service state path already exists: {service_state_dir}")
 
-        self._prepare_mirror(mirror, spec, spec["revision"])
-        if _git_success(mirror, "show-ref", "--verify", "--quiet", f"refs/heads/{spec['branch']}"):
-            raise WorkspaceError("conflict", f"branch already exists and will not be reset: {spec['branch']}")
-        worktree.parent.mkdir(parents=True, exist_ok=True)
-        _git(mirror, "worktree", "add", "-b", spec["branch"], str(worktree), spec["revision"])
-        actual_head = _git(worktree, "rev-parse", "HEAD")
-        if actual_head != spec["revision"]:
-            raise WorkspaceError("conflict", f"claimed HEAD {actual_head} did not match requested revision")
-        if _git(worktree, "status", "--porcelain=v1"):
-            raise WorkspaceError("conflict", "claim produced a dirty worktree")
-        # Nix environment caches contain store symlinks and are rebuildable.
-        # Keep the project's tracked ignore rules and exact revision unchanged.
-        exclude_path = Path(_git(worktree, "rev-parse", "--git-path", "info/exclude"))
-        exclude_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_excludes = exclude_path.read_text() if exclude_path.exists() else ""
-        with exclude_path.open("a") as exclude:
-            for pattern in ("/.devenv/", "/.direnv/"):
-                if pattern not in existing_excludes.splitlines():
-                    exclude.write(f"\n{pattern}\n")
-        service_state_dir.mkdir(parents=True, exist_ok=False)
+        if allocation["worker_lifetime"] == "ephemeral":
+            self._create_allocation_marker(allocation, request, spec)
+
+        try:
+            self._prepare_mirror(mirror, spec, spec["revision"])
+            if _git_success(mirror, "show-ref", "--verify", "--quiet", f"refs/heads/{spec['branch']}"):
+                raise WorkspaceError("conflict", f"branch already exists and will not be reset: {spec['branch']}")
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            _git(mirror, "worktree", "add", "-b", spec["branch"], str(worktree), spec["revision"])
+            actual_head = _git(worktree, "rev-parse", "HEAD")
+            if actual_head != spec["revision"]:
+                raise WorkspaceError("conflict", f"claimed HEAD {actual_head} did not match requested revision")
+            if _git(worktree, "status", "--porcelain=v1"):
+                raise WorkspaceError("conflict", "claim produced a dirty worktree")
+            # Nix environment caches contain store symlinks and are rebuildable.
+            # Keep the project's tracked ignore rules and exact revision unchanged.
+            exclude_path = Path(_git(worktree, "rev-parse", "--git-path", "info/exclude"))
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            existing_excludes = exclude_path.read_text() if exclude_path.exists() else ""
+            with exclude_path.open("a") as exclude:
+                for pattern in ("/.devenv/", "/.direnv/"):
+                    if pattern not in existing_excludes.splitlines():
+                        exclude.write(f"\n{pattern}\n")
+            service_state_dir.mkdir(parents=True, exist_ok=False)
+        except Exception:
+            if allocation["worker_lifetime"] == "ephemeral":
+                with contextlib.suppress(Exception):
+                    self._cleanup_preactive_allocation(allocation, request, spec, mirror)
+            raise
 
         active = {
             "status": "claimed",
@@ -152,6 +184,11 @@ class WorkspaceManager:
             "mirror": str(mirror),
             "worktree": str(worktree),
             "service_state_dir": str(service_state_dir),
+            "worker_lifetime": allocation["worker_lifetime"],
+            "worker": self.worker,
+            "allocation_id": allocation["allocation_id"],
+            "allocation_root": str(allocation["allocation_root"]) if allocation["allocation_root"] is not None else None,
+            "claim_request_id": request["request_id"],
             "runtime": _empty_runtime(),
             "claimed_at": _now(),
         }
@@ -164,6 +201,9 @@ class WorkspaceManager:
             branch=spec["branch"],
             worktree=str(worktree),
             service_state_dir=str(service_state_dir),
+            worker_lifetime=allocation["worker_lifetime"],
+            allocation_id=allocation["allocation_id"],
+            allocation_root=str(allocation["allocation_root"]) if allocation["allocation_root"] is not None else None,
         )
 
     def _handle_record_runtime(self, request: dict) -> dict:
@@ -231,6 +271,10 @@ class WorkspaceManager:
             "branch": active["branch"],
             "dirty": fingerprint["dirty"],
             "runtime": _normalize_runtime(active.get("runtime")),
+            "worker_lifetime": active.get("worker_lifetime", "static"),
+            "worker": active.get("worker"),
+            "allocation_id": active.get("allocation_id"),
+            "allocation_root": active.get("allocation_root"),
         }
 
         staged_patch = collection_dir / "staged.diff"
@@ -374,22 +418,35 @@ class WorkspaceManager:
         collection_digest = request.get("collection_digest")
         if not isinstance(collection_digest, str) or not collection_digest:
             raise WorkspaceError("conflict", "collection_digest is required")
-        active = self._require_active_task(task_id, allow_collected=True)
+        active = self._require_active_task(task_id, allow_collected=True, allow_cleanup_required=True)
         collection = active.get("last_collection")
         if not collection:
             return _result("uncollected", error="task has not been collected", code=3)
         if collection.get("digest") != collection_digest:
             return _result("uncollected", error="collection_digest does not match the recorded collection", code=3)
 
-        current = _fingerprint(Path(active["worktree"]))
-        if current != collection.get("fingerprint"):
-            return _result(
-                "changed_since_collection",
-                error="worktree fingerprint changed after collection",
-                fingerprint=current,
-                collection_fingerprint=collection.get("fingerprint"),
-                code=4,
-            )
+        worktree = Path(active["worktree"])
+        if active.get("status") != "cleanup_required" or worktree.exists():
+            current = _fingerprint(worktree)
+            if current != collection.get("fingerprint"):
+                return _result(
+                    "changed_since_collection",
+                    error="worktree fingerprint changed after collection",
+                    fingerprint=current,
+                    collection_fingerprint=collection.get("fingerprint"),
+                    code=4,
+                )
+            if active.get("worker_lifetime") == "ephemeral" and request.get("runtime_quiescent") is not True:
+                return _result(
+                    "runtime_active",
+                    error="runtime_quiescent=true is required before ephemeral cleanup",
+                    code=3,
+                )
+
+        if active.get("worker_lifetime") == "ephemeral":
+            cleanup_result = self._release_ephemeral_allocation(active, collection_digest)
+            if cleanup_result is not None:
+                return cleanup_result
 
         active["status"] = "released"
         active["released_at"] = _now()
@@ -400,7 +457,181 @@ class WorkspaceManager:
             collection_digest=collection_digest,
             worktree=active["worktree"],
             collection_dir=collection["collection_dir"],
+            worker_lifetime=active.get("worker_lifetime", "static"),
+            allocation_id=active.get("allocation_id"),
+            allocation_root=active.get("allocation_root"),
         )
+
+    def _allocation_for_claim(self, request: dict, spec: dict) -> dict:
+        if self.lifetime == "static":
+            return {
+                "worker_lifetime": "static",
+                "allocation_id": None,
+                "allocation_root": None,
+                "worktree": self.worktrees_dir / spec["task_id"],
+                "service_state_dir": self.services_dir / spec["task_id"],
+            }
+        seed = {
+            "worker": self.worker,
+            "request_id": request["request_id"],
+            "task_id": spec["task_id"],
+            "repo": spec["repo"],
+            "revision": spec["revision"],
+        }
+        allocation_id = _canonical_hash(seed)[:32]
+        allocation_root = self.allocations_dir / allocation_id
+        return {
+            "worker_lifetime": "ephemeral",
+            "allocation_id": allocation_id,
+            "allocation_root": allocation_root,
+            "worktree": allocation_root / "worktree",
+            "service_state_dir": allocation_root / "service-state",
+        }
+
+    def _create_allocation_marker(self, allocation: dict, request: dict, spec: dict) -> None:
+        allocation_root = allocation["allocation_root"]
+        allocation_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+        os.chmod(allocation_root, 0o700)
+        marker = self._allocation_marker_payload(allocation, request, spec)
+        self._write_json_atomic(allocation_root / ".workenv-allocation.json", marker)
+
+    def _allocation_marker_payload(self, allocation: dict, request: dict, spec: dict) -> dict:
+        return {
+            "allocation_id": allocation["allocation_id"],
+            "allocation_root": str(allocation["allocation_root"]),
+            "worker": self.worker,
+            "task_id": spec["task_id"],
+            "repo": spec["repo"],
+            "revision": spec["revision"],
+            "request_id": request["request_id"],
+        }
+
+    def _cleanup_existing_preactive_allocation(
+        self,
+        allocation: dict,
+        request: dict,
+        spec: dict,
+        mirror: Path,
+    ) -> None:
+        allocation_root = allocation["allocation_root"]
+        if allocation_root.exists() or allocation_root.is_symlink():
+            self._cleanup_preactive_allocation(allocation, request, spec, mirror)
+
+    def _cleanup_preactive_allocation(self, allocation: dict, request: dict, spec: dict, mirror: Path) -> None:
+        allocation_root = self._validated_claim_allocation_root(allocation, request, spec)
+        worktree = allocation["worktree"]
+        if worktree.exists() and mirror.exists():
+            _git(mirror, "worktree", "remove", "--force", str(worktree))
+        if allocation_root.exists():
+            shutil.rmtree(allocation_root)
+
+    def _validated_claim_allocation_root(self, allocation: dict, request: dict, spec: dict) -> Path:
+        allocation_id = allocation.get("allocation_id")
+        allocation_root = allocation.get("allocation_root")
+        if not isinstance(allocation_id, str) or not allocation_id or not isinstance(allocation_root, Path):
+            raise WorkspaceError("conflict", "claim allocation is invalid")
+        expected_root = self.allocations_dir / allocation_id
+        if allocation_root != expected_root:
+            raise WorkspaceError("conflict", "claim allocation root does not match allocation_id")
+        if allocation_root.parent.resolve() != self.allocations_dir.resolve():
+            raise WorkspaceError("conflict", "claim allocation root is outside allocations")
+        if allocation_root.exists() and allocation_root.is_symlink():
+            raise WorkspaceError("conflict", "claim allocation root is a symlink")
+        marker_path = allocation_root / ".workenv-allocation.json"
+        if not marker_path.is_file() or marker_path.is_symlink():
+            raise WorkspaceError("conflict", "claim allocation marker is missing")
+        marker = _read_json(marker_path)
+        expected = self._allocation_marker_payload(allocation, request, spec)
+        for key, value in expected.items():
+            if marker.get(key) != value:
+                raise WorkspaceError("conflict", f"claim allocation marker {key} does not match request")
+        if allocation["worktree"] != allocation_root / "worktree":
+            raise WorkspaceError("conflict", "claim worktree is outside allocation root")
+        if allocation["service_state_dir"] != allocation_root / "service-state":
+            raise WorkspaceError("conflict", "claim service state is outside allocation root")
+        return allocation_root
+
+    def _release_ephemeral_allocation(self, active: dict, collection_digest: str) -> dict | None:
+        try:
+            self._cleanup_ephemeral_allocation(active)
+        except WorkspaceError as exc:
+            return self._record_cleanup_required(active, collection_digest, exc.message)
+        except subprocess.CalledProcessError as exc:
+            return self._record_cleanup_required(
+                active,
+                collection_digest,
+                f"git cleanup failed: {' '.join(exc.cmd)}: {exc.stderr.strip()}",
+            )
+        except OSError as exc:
+            return self._record_cleanup_required(active, collection_digest, str(exc))
+        return None
+
+    def _record_cleanup_required(self, active: dict, collection_digest: str, error: str) -> dict:
+        active["status"] = "cleanup_required"
+        active["cleanup"] = {
+            "collection_digest": collection_digest,
+            "error": error,
+            "failed_at": _now(),
+        }
+        self._write_json_atomic(self.active_path, active)
+        return _result(
+            "failed_cleanup_required",
+            error=error,
+            active=_redact_active(active),
+            task_id=active.get("task_id"),
+            collection_digest=collection_digest,
+            worker_lifetime=active.get("worker_lifetime"),
+            allocation_id=active.get("allocation_id"),
+            allocation_root=active.get("allocation_root"),
+            code=5,
+        )
+
+    def _cleanup_ephemeral_allocation(self, active: dict) -> None:
+        allocation_root = self._validated_allocation_root(active)
+        worktree = Path(active["worktree"])
+        if worktree.exists():
+            _git(Path(active["mirror"]), "worktree", "remove", "--force", str(worktree))
+        if allocation_root.exists():
+            shutil.rmtree(allocation_root)
+
+    def _validated_allocation_root(self, active: dict) -> Path:
+        allocation_id = active.get("allocation_id")
+        raw_root = active.get("allocation_root")
+        if not isinstance(allocation_id, str) or not allocation_id:
+            raise WorkspaceError("failed_cleanup_required", "active allocation_id is missing")
+        if not isinstance(raw_root, str) or not raw_root:
+            raise WorkspaceError("failed_cleanup_required", "active allocation_root is missing")
+        allocation_root = Path(raw_root)
+        expected_root = self.allocations_dir / allocation_id
+        if allocation_root != expected_root:
+            raise WorkspaceError("failed_cleanup_required", "active allocation root does not match allocation_id")
+        if allocation_root.parent.resolve() != self.allocations_dir.resolve():
+            raise WorkspaceError("failed_cleanup_required", "active allocation root is outside allocations")
+        if allocation_root.exists() and allocation_root.is_symlink():
+            raise WorkspaceError("failed_cleanup_required", "allocation root is a symlink")
+        if not allocation_root.exists():
+            return allocation_root
+        marker_path = allocation_root / ".workenv-allocation.json"
+        if not marker_path.is_file() or marker_path.is_symlink():
+            raise WorkspaceError("failed_cleanup_required", "allocation marker is missing")
+        marker = _read_json(marker_path)
+        expected = {
+            "allocation_id": allocation_id,
+            "allocation_root": raw_root,
+            "worker": active.get("worker"),
+            "task_id": active.get("task_id"),
+            "repo": active.get("repo"),
+            "revision": active.get("revision"),
+            "request_id": active.get("claim_request_id"),
+        }
+        for key, value in expected.items():
+            if marker.get(key) != value:
+                raise WorkspaceError("failed_cleanup_required", f"allocation marker {key} does not match active task")
+        if Path(active.get("worktree", "")) != allocation_root / "worktree":
+            raise WorkspaceError("failed_cleanup_required", "active worktree is outside allocation root")
+        if Path(active.get("service_state_dir", "")) != allocation_root / "service-state":
+            raise WorkspaceError("failed_cleanup_required", "active service state is outside allocation root")
+        return allocation_root
 
     def _prepare_mirror(self, mirror: Path, spec: dict, revision: str) -> None:
         if not mirror.exists():
@@ -424,13 +655,21 @@ class WorkspaceManager:
         if obj_type != "commit":
             raise WorkspaceError("conflict", "revision is not a commit")
 
-    def _require_active_task(self, task_id: str, allow_collected: bool = False) -> dict:
+    def _require_active_task(
+        self,
+        task_id: str,
+        allow_collected: bool = False,
+        allow_cleanup_required: bool = False,
+    ) -> dict:
         active = self._read_active()
         if active is None or active.get("status") == "released":
             raise WorkspaceError("conflict", "no active task")
         if active.get("task_id") != task_id:
             raise WorkspaceError("busy", "worker is occupied by a different task", code=2)
-        if active.get("status") not in ({"claimed", "collected"} if allow_collected else {"claimed", "collected"}):
+        allowed = {"claimed", "collected"} if allow_collected else {"claimed", "collected"}
+        if allow_cleanup_required:
+            allowed.add("cleanup_required")
+        if active.get("status") not in allowed:
             raise WorkspaceError("conflict", f"task is not collectable: {active.get('status')}")
         return active
 
@@ -441,6 +680,7 @@ class WorkspaceManager:
             self.services_dir,
             self.mirrors_dir,
             self.worktrees_dir,
+            self.allocations_dir,
             self.collections_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -918,8 +1158,13 @@ def _redact_active(active: dict) -> dict:
         "branch": active.get("branch"),
         "worktree": active.get("worktree"),
         "service_state_dir": active.get("service_state_dir"),
+        "worker_lifetime": active.get("worker_lifetime", "static"),
+        "worker": active.get("worker"),
+        "allocation_id": active.get("allocation_id"),
+        "allocation_root": active.get("allocation_root"),
         "runtime": _normalize_runtime(active.get("runtime")),
         "last_collection": active.get("last_collection"),
+        "cleanup": active.get("cleanup"),
     }
 
 

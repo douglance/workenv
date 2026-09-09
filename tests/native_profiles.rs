@@ -231,7 +231,7 @@ fn same_profile_assignment_does_not_shortcut_when_herdr_runtime_profile_mismatch
         "server_binary_stale": false,
         "capabilities": {"detached_server_daemon": true}
     }));
-    runtime.push(json!({"executions": [{"id":"herdr-exec", "status":"running"}]}));
+    runtime.push(json!({"status":"completed","result":{"executions": [{"id":"herdr-exec", "status":"running"}]}}));
     runtime.push(json!({"data": {"id":"herdr-exec", "status":"running", "outcome":"pending", "spec": {"labels": {
         "workenv.component":"herdr-server",
         "herdr.session":"workenv",
@@ -275,6 +275,34 @@ fn profile_wrapper_preserves_argument_boundaries_and_requires_exact_digest() {
     assert_eq!(&wrapped[wrapped.len() - 3..], &argv);
     assert!(wrapped.contains(&"--check-github".into()));
     assert!(wrapped.contains(&profiles::resolve(&ctx, "1").unwrap().unwrap().digest));
+}
+
+#[test]
+fn native_profile_wrapper_uses_environment_helper_and_worker_root_directly() {
+    let root = fixture();
+    let mut ctx = context(root.path());
+    profiles::create(&ctx, "personal", json!({})).unwrap();
+    ctx.fleet["hosts"] = json!({
+        "local": {
+            "transport": "local",
+            "root": "/tmp/workenv",
+            "tools": "native"
+        }
+    });
+    ctx.fleet["workers"][0]["name"] = json!("local-a");
+    ctx.fleet["workers"][0]["host"] = json!("local");
+    ctx.fleet["workers"][0]["profile"] = json!("personal");
+
+    let wrapped =
+        profiles::wrap(&ctx, "local-a", vec!["cargo".into(), "test".into()], true).unwrap();
+
+    assert_eq!(wrapped[0], "python3");
+    assert_eq!(wrapped[1], "/tmp/workenv/remote/profile.py");
+    assert!(wrapped
+        .windows(2)
+        .any(|pair| pair == ["--root", "/tmp/workenv/workers/local-a"]));
+    assert!(wrapped.contains(&"--check-github".into()));
+    assert!(!wrapped.contains(&"/usr/local/bin/devenv".into()));
 }
 
 #[test]

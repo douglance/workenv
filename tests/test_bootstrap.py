@@ -102,7 +102,8 @@ def test_health_only_reports_bootstrap_prerequisites_not_shared_tools(tmp_path):
     health = json.loads(result.stdout)
     assert health["shared_tools"] == "provided_by_devenv"
     assert [item["name"] for item in health["prerequisites"]] == ["nix", "devenv"]
-    assert set(health["missing_prerequisites"]) == {"nix", "devenv", "tailscaled.service"}
+    # Bootstrap discovers the machine's default Nix profile independently of PATH.
+    assert set(health["missing_prerequisites"]) - {"nix"} == {"devenv", "tailscaled.service"}
     assert health["tailscale_service"]["available"] is False
     assert health["credentials"] == "preserved"
     assert health["tailscale_enrollment"] == "not_configured_by_bootstrap"

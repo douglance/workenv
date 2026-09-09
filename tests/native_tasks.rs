@@ -10,7 +10,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
-use workenv::process::{write_json, CommandOutput, CommandSpec, Runtime};
+use workenv::process::{shell_join, write_json, CommandOutput, CommandSpec, Runtime};
 use workenv::{tasks, Context};
 
 const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -117,12 +117,16 @@ impl FakeRuntime {
 
 impl Runtime for FakeRuntime {
     fn run(&self, spec: CommandSpec) -> Result<CommandOutput> {
-        assert_eq!(spec.executable, "ssh");
-        let command = spec
-            .args
-            .last()
-            .cloned()
-            .ok_or_else(|| anyhow!("ssh command missing remote command"))?;
+        let command = if spec.executable == "ssh" {
+            spec.args
+                .last()
+                .cloned()
+                .ok_or_else(|| anyhow!("ssh command missing remote command"))?
+        } else {
+            let mut argv = vec![spec.executable.clone()];
+            argv.extend(spec.args.clone());
+            shell_join(&argv)
+        };
         let mut state = self.state.lock().unwrap();
         state.ssh_commands.push(command.clone());
         state.ssh_keys.push(spec.key.clone());
@@ -133,7 +137,8 @@ impl Runtime for FakeRuntime {
             .filter(|_| command.contains("python3") && !command.contains("workspace.py"))
         {
             let digest = hex_sha256(stdin);
-            let path = format!("/home/exedev/workenv/incoming/{digest}.bundle");
+            let path = staged_bundle_path(&command, &digest)
+                .unwrap_or_else(|| format!("/home/exedev/workenv/incoming/{digest}.bundle"));
             return Ok(json_output(
                 spec.key,
                 json!({"ok": true, "status": "staged", "path": path, "sha256": digest}),
@@ -150,6 +155,8 @@ impl Runtime for FakeRuntime {
                 });
             }
             let request = decode_workspace_request(&command)?;
+            let root = decode_workspace_root(&command)
+                .unwrap_or_else(|| "/home/exedev/workenv".to_string());
             state.workspace_requests.push(request.clone());
             let operation = request["operation"]
                 .as_str()
@@ -160,7 +167,7 @@ impl Runtime for FakeRuntime {
                     "status": "claimed",
                     "task_id": request["task_id"],
                     "source_bundle": request.get("source_bundle").cloned().unwrap_or(Value::Null),
-                    "worktree": format!("/home/exedev/workenv/tasks/{}", request["task_id"].as_str().unwrap()),
+                    "worktree": format!("{root}/tasks/{}", request["task_id"].as_str().unwrap()),
                 }),
                 "record-runtime" => json!({
                     "ok": true,
@@ -177,14 +184,17 @@ impl Runtime for FakeRuntime {
                         "/home/exedev/workenv/collections/{}/{}/metadata.json",
                         request["task_id"].as_str().unwrap(),
                         state.collection_digest.as_ref().unwrap()
-                    ),
+                    ).replacen("/home/exedev/workenv", &root, 1),
                 }),
-                "release" => json!({
-                    "ok": true,
-                    "status": "released",
-                    "task_id": request["task_id"],
-                    "collection_digest": request["collection_digest"],
-                }),
+                "release" => {
+                    assert_eq!(request["runtime_quiescent"], true);
+                    json!({
+                        "ok": true,
+                        "status": "released",
+                        "task_id": request["task_id"],
+                        "collection_digest": request["collection_digest"],
+                    })
+                }
                 other => return Err(anyhow!("unexpected workspace operation {other}")),
             };
             return Ok(json_output(spec.key, body));
@@ -248,9 +258,14 @@ impl Runtime for FakeRuntime {
             } else {
                 json!([])
             };
+            let page = json!({"executions": executions, "next_cursor": null});
             return Ok(json_output(
                 spec.key,
-                json!({"executions": executions, "next_cursor": null}),
+                if command.contains("apoc.execution_list") {
+                    json!({"status":"completed","result":page})
+                } else {
+                    page
+                },
             ));
         }
 
@@ -306,7 +321,11 @@ impl Runtime for FakeRuntime {
         Ok(match method {
             "session_open" => json!({"id":"session-1", "expires_at": EXPIRES_AT}),
             "reservation_acquire" => json!({
-                "id": "reservation-1",
+                "id": if args["key"].as_str().is_some_and(|key| key.ends_with("/local-a")) {
+                    "reservation-local-a"
+                } else {
+                    "reservation-1"
+                },
                 "key": args["key"],
                 "lease_id": args["lease"],
                 "expires_at": EXPIRES_AT,
@@ -317,10 +336,10 @@ impl Runtime for FakeRuntime {
                 } else {
                     EXPIRES_AT
                 };
-                let worker = if args["id"].as_str() == Some("reservation-2") {
-                    "workenv-02"
-                } else {
-                    "workenv-01"
+                let worker = match args["id"].as_str() {
+                    Some("reservation-2") => "workenv-02",
+                    Some("reservation-local-a") => "local-a",
+                    _ => "workenv-01",
                 };
                 json!({
                     "id": args["id"],
@@ -525,6 +544,24 @@ fn run_starts_remote_apoc_execution_and_records_runtime() {
 }
 
 #[test]
+fn run_can_collect_resource_telemetry_on_the_worker() {
+    let runtime = FakeRuntime::new();
+    let ctx = context(runtime.clone());
+    write_claimed_record(&ctx.state, json!({}));
+    let result = tasks::run_profiled(
+        &ctx,
+        "task-1",
+        vec!["cargo".into(), "test".into()],
+        "profile-run-key",
+    )
+    .unwrap();
+    assert_eq!(result["status"], "started");
+    assert_eq!(result["telemetry"], true);
+    let commands = runtime.ssh_commands().join("\n");
+    assert!(commands.contains("'--telemetry'"));
+}
+
+#[test]
 fn services_starts_devenv_up_as_owned_service() {
     let runtime = FakeRuntime::new();
     let ctx = context(runtime.clone());
@@ -563,6 +600,24 @@ fn collect_fetches_base64_tar_and_verifies_collection_digest() {
     assert_eq!(record["status"], "collected");
     assert_eq!(record["last_collection"]["digest"], digest);
     assert_eq!(record["last_collection"]["verified"]["status"], "verified");
+}
+
+#[test]
+fn ephemeral_collection_is_retrieved_from_stable_worker_storage() {
+    let (tarball, digest, _metadata) = collection_fixture("task-1");
+    let runtime = FakeRuntime::with_collection(tarball, digest);
+    let ctx = context(runtime);
+    write_claimed_record(&ctx.state, json!({
+        "worker_lifetime":"ephemeral",
+        "allocation_root":"/home/exedev/workenv/allocations/allocation-1",
+        "worktree":"/home/exedev/workenv/allocations/allocation-1/worktree"
+    }));
+
+    let result = tasks::collect(&ctx, "task-1", "collect-ephemeral-key").unwrap();
+
+    assert_eq!(result["status"], "collected");
+    assert!(Path::new(result["local_collection_dir"].as_str().unwrap())
+        .join("metadata.json").is_file());
 }
 
 #[test]
@@ -658,7 +713,7 @@ fn read_probes_use_fresh_ssh_execution_keys() {
     let activity_keys: Vec<String> = runtime
         .ssh_keys()
         .into_iter()
-        .filter(|key| key.contains("activity:list"))
+        .filter(|key| key.contains("runtime-inventory"))
         .collect();
     assert_eq!(activity_keys.len(), 2);
     assert_ne!(activity_keys[0], activity_keys[1]);
@@ -742,6 +797,47 @@ fn run_refuses_bound_task_profile_drift_before_remote_launch() {
 }
 
 #[test]
+fn run_refuses_worker_host_descriptor_drift_before_remote_launch() {
+    let runtime = FakeRuntime::new();
+    let ctx = context(runtime.clone());
+    write_claimed_record(
+        &ctx.state,
+        json!({
+            "worker_host": {"name":"workenv-01", "host_id":"other", "root":"/home/exedev/workenv", "environment_root":"/home/exedev/workenv", "session":"workenv"}
+        }),
+    );
+
+    let result = tasks::run(
+        &ctx,
+        "task-1",
+        vec!["cargo".into(), "test".into()],
+        "run-key",
+    );
+
+    assert!(result.is_err());
+    assert!(runtime.apoc_methods().is_empty());
+    assert!(runtime.ssh_commands().is_empty());
+}
+
+#[test]
+fn legacy_task_records_without_host_descriptor_must_still_be_under_worker_root() {
+    let runtime = FakeRuntime::new();
+    let ctx = context(runtime.clone());
+    write_claimed_record(&ctx.state, json!({"worktree": "/tmp/old-task"}));
+
+    let result = tasks::run(
+        &ctx,
+        "task-1",
+        vec!["cargo".into(), "test".into()],
+        "run-key",
+    );
+
+    assert!(result.is_err());
+    assert!(runtime.apoc_methods().is_empty());
+    assert!(runtime.ssh_commands().is_empty());
+}
+
+#[test]
 fn run_places_profile_wrapper_inside_remote_apoc_child_argv() {
     let runtime = FakeRuntime::new();
     let ctx = context_with_worker_profile(runtime.clone());
@@ -795,6 +891,55 @@ fn resolve_claim_revision_runs_head_lookup_on_selected_worker_profile() {
     assert!(commands.contains("ls-remote"));
 }
 
+#[test]
+fn local_transport_claim_bundle_and_collect_use_worker_and_environment_roots() {
+    let (tarball, digest, _) = collection_fixture("task-1");
+    let runtime = FakeRuntime::with_collection(tarball, digest);
+    let ctx = local_context(runtime.clone());
+    let bundle = ctx.root.join("source.bundle");
+    fs::write(&bundle, b"local bundle bytes").unwrap();
+
+    let claimed = tasks::claim(
+        &ctx,
+        json!({
+            "project":"incurs",
+            "task_id":"task-1",
+            "revision": REVISION,
+            "worker":"local-a",
+            "source_bundle": bundle,
+        }),
+        "local-claim",
+    )
+    .unwrap();
+    assert_eq!(claimed["status"], "claimed");
+    assert_eq!(
+        claimed["worker_host"]["root"],
+        "/tmp/workenv/workers/local-a"
+    );
+    assert_eq!(claimed["worker_host"]["environment_root"], "/tmp/workenv");
+    assert_eq!(claimed["worker_host"]["session"], "workenv-local-a");
+    assert!(claimed["worktree"]
+        .as_str()
+        .unwrap()
+        .starts_with("/tmp/workenv/workers/local-a/tasks/task-1"));
+    assert!(runtime
+        .ssh_commands()
+        .iter()
+        .all(|command| !command.contains("BatchMode=yes")));
+
+    let collect = tasks::collect(&ctx, "task-1", "local-collect").unwrap();
+    assert_eq!(collect["status"], "collected");
+    let requests = runtime.workspace_requests();
+    assert_eq!(
+        requests[0]["source_bundle"],
+        json!(format!(
+            "/tmp/workenv/workers/local-a/incoming/{}.bundle",
+            hex_sha256(b"local bundle bytes")
+        ))
+    );
+    assert_eq!(requests[1]["operation"], "collect");
+}
+
 fn context(runtime: Arc<FakeRuntime>) -> Context {
     let dir = tempfile::tempdir().unwrap().keep();
     Context {
@@ -804,6 +949,26 @@ fn context(runtime: Arc<FakeRuntime>) -> Context {
             "remote_user": "exedev",
             "remote_root": "/home/exedev/workenv",
             "workers": [{"name":"workenv-01", "cpus":2, "memory_gb":8, "disk_gb":50}],
+            "projects": {"incurs": {"repository": "example/incurs"}},
+        }),
+        runtime,
+    }
+}
+
+fn local_context(runtime: Arc<FakeRuntime>) -> Context {
+    let dir = tempfile::tempdir().unwrap().keep();
+    Context {
+        root: dir.clone(),
+        state: dir.join(".state/controller"),
+        fleet: json!({
+            "hosts": {
+                "local": {
+                    "transport": "local",
+                    "root": "/tmp/workenv",
+                    "tools": "native"
+                }
+            },
+            "workers": [{"name":"local-a", "host":"local", "cpus":2, "memory_gb":8, "disk_gb":50}],
             "projects": {"incurs": {"repository": "example/incurs"}},
         }),
         runtime,
@@ -1043,6 +1208,24 @@ fn decode_workspace_request(command: &str) -> Result<Value> {
         .ok_or_else(|| anyhow!("unterminated request-base64"))?;
     let decoded = BASE64.decode(&rest[..end])?;
     Ok(serde_json::from_slice(&decoded)?)
+}
+
+fn decode_workspace_root(command: &str) -> Option<String> {
+    decode_shell_arg_after(command, "'--root' '")
+}
+
+fn staged_bundle_path(command: &str, digest: &str) -> Option<String> {
+    let suffix = format!("/incoming/{digest}.bundle");
+    let end = command.find(&suffix)? + suffix.len();
+    let start = command[..end].rfind('\'')? + 1;
+    Some(command[start..end].to_string())
+}
+
+fn decode_shell_arg_after(command: &str, marker: &str) -> Option<String> {
+    let start = command.find(marker)? + marker.len();
+    let rest = &command[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
 }
 
 fn json_output(execution_id: String, value: Value) -> CommandOutput {

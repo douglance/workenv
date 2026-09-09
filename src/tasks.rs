@@ -10,12 +10,11 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::process::{read_json, shell_join, shell_quote, write_json};
+use crate::hosts::{self, Provider, RemoteCommandSpec, ResolvedTools, ResolvedTransport};
+use crate::process::{read_json, shell_quote, write_json};
 use crate::profiles;
-use crate::CommandSpec;
 use crate::Context;
 
-const DEFAULT_REMOTE_ROOT: &str = "/home/exedev/workenv";
 const LIVE_EXECUTION_STATUSES: &[&str] = &["queued", "running", "stalled", "interrupted"];
 const TERMINAL_EXECUTION_STATUSES: &[&str] =
     &["completed", "failed", "canceled", "cancelled", "skipped"];
@@ -65,23 +64,30 @@ pub fn resolve_claim_revision(ctx: &Context, request: &mut Value, key: &str) -> 
     if !open_task_records_for_worker(&ctx.state, &worker)?.is_empty() {
         bail!("worker {worker} already has an open task");
     }
-    let command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- git ls-remote -- {} HEAD",
-        shell_quote(&remote_root(&ctx.fleet)),
-        shell_quote(&project_spec.remote_url)
-    );
     let argv = profiles::wrap(
         ctx,
         &worker,
-        vec!["bash".to_string(), "-lc".to_string(), command],
+        vec![
+            "git".to_string(),
+            "ls-remote".to_string(),
+            "--".to_string(),
+            project_spec.remote_url.clone(),
+            "HEAD".to_string(),
+        ],
         true,
     )?;
-    let output = ctx.ssh(
+    let output = ctx.remote(
         &worker,
-        argv,
-        &format!("{key}:resolve-head:{worker}"),
-        "Resolve the exact task source revision on the selected worker profile.",
-        60_000,
+        RemoteCommandSpec {
+            argv,
+            stdin: None,
+            cwd: Some(ctx.worker_environment_root(&worker)?),
+            tools_env: false,
+            key: format!("{key}:resolve-head:{worker}"),
+            purpose: "Resolve the exact task source revision on the selected worker profile."
+                .into(),
+            timeout_ms: 60_000,
+        },
     )?;
     output.success()?;
     let stdout = String::from_utf8(output.stdout).context("git ls-remote output was not UTF-8")?;
@@ -138,6 +144,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("central task record missing worker"))?;
             profiles::validate_task_binding(ctx, &existing)?;
+            validate_task_host_binding(ctx, &existing)?;
             let reservation_id = required_record_str(&existing, "reservation_id")?;
             let reservation = validate_reservation(ctx, worker, reservation_id)?;
             if !truthy(&reservation, "ok") {
@@ -154,6 +161,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                     "reservation": reservation,
                     "task_record": { "status": "recorded", "ok": true, "task": existing },
                     "worker_profile": existing.get("worker_profile").cloned().unwrap_or(Value::Null),
+                    "worker_host": existing.get("worker_host").cloned().unwrap_or(Value::Null),
                     "replayed": true
                 }),
             ));
@@ -164,6 +172,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("central task record missing worker"))?;
             profiles::validate_task_binding(ctx, &existing)?;
+            validate_task_host_binding(ctx, &existing)?;
             let worker_profile = existing
                 .get("worker_profile")
                 .cloned()
@@ -200,6 +209,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
             )?;
             remote["worker"] = json!(worker);
             remote["worker_profile"] = worker_profile.clone();
+            remote["worker_host"] = resolved_worker_record(ctx, worker)?;
             remote["reservation"] = reservation;
             remote["replayed"] = json!(true);
             if should_record_claim(remote.get("status").and_then(Value::as_str)) {
@@ -224,6 +234,10 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                             .unwrap_or("unknown"),
                         worktree: worktree.as_deref(),
                         worker_profile,
+                        worker_host: resolved_worker_record(ctx, worker)?,
+                        allocation_id: remote.get("allocation_id").and_then(Value::as_str),
+                        allocation_root: remote.get("allocation_root").and_then(Value::as_str),
+                        worker_lifetime: remote.get("worker_lifetime").and_then(Value::as_str),
                         controller_execution_id: None,
                     },
                 )?;
@@ -320,6 +334,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
     )?;
     remote["worker"] = json!(worker);
     remote["worker_profile"] = worker_profile.clone();
+    remote["worker_host"] = resolved_worker_record(ctx, &worker)?;
     if should_record_claim(remote.get("status").and_then(Value::as_str)) {
         let worktree = remote
             .get("worktree")
@@ -342,6 +357,10 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                     .unwrap_or("unknown"),
                 worktree: worktree.as_deref(),
                 worker_profile,
+                worker_host: resolved_worker_record(ctx, &worker)?,
+                allocation_id: remote.get("allocation_id").and_then(Value::as_str),
+                allocation_root: remote.get("allocation_root").and_then(Value::as_str),
+                worker_lifetime: remote.get("worker_lifetime").and_then(Value::as_str),
                 controller_execution_id: None,
             },
         )?;
@@ -363,7 +382,11 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
 }
 
 pub fn run(ctx: &Context, task: &str, argv: Vec<String>, key: &str) -> Result<Value> {
-    run_with_kind(ctx, task, argv, key, "task")
+    run_with_kind(ctx, task, argv, key, "task", false)
+}
+
+pub fn run_profiled(ctx: &Context, task: &str, argv: Vec<String>, key: &str) -> Result<Value> {
+    run_with_kind(ctx, task, argv, key, "task", true)
 }
 
 pub fn services(ctx: &Context, task: &str, key: &str) -> Result<Value> {
@@ -373,6 +396,7 @@ pub fn services(ctx: &Context, task: &str, key: &str) -> Result<Value> {
         vec!["devenv".to_string(), "up".to_string()],
         key,
         "service",
+        false,
     )
 }
 
@@ -417,6 +441,7 @@ fn run_with_kind(
     argv: Vec<String>,
     key: &str,
     kind: &str,
+    telemetry: bool,
 ) -> Result<Value> {
     if !matches!(kind, "task" | "service") {
         bail!("unsupported task execution kind");
@@ -474,6 +499,21 @@ fn run_with_kind(
             ),
         ]);
     }
+    if let Some(allocation_id) = record.get("allocation_id").and_then(Value::as_str) {
+        args.extend([
+            "--label".to_string(),
+            format!("workenv.allocation_id={allocation_id}"),
+        ]);
+    }
+    if let Some(lifetime) = record.get("worker_lifetime").and_then(Value::as_str) {
+        args.extend([
+            "--label".to_string(),
+            format!("workenv.lifetime={lifetime}"),
+        ]);
+    }
+    if telemetry {
+        args.push("--telemetry".into());
+    }
     args.extend(["--format".to_string(), "json".to_string(), "--".to_string()]);
     args.extend(child_argv.into_iter().skip(1));
     let remote = ssh_json(
@@ -508,6 +548,7 @@ fn run_with_kind(
             "task_id": task,
             "execution_id": execution_id,
             "kind": kind,
+            "telemetry": telemetry,
             "worker_profile": profile,
             "remote": remote,
             "runtime_recorded": runtime_recorded
@@ -621,6 +662,7 @@ pub fn release(ctx: &Context, task: &str, key: &str) -> Result<Value> {
             "operation": "release",
             "request_id": key,
             "task_id": task,
+            "runtime_quiescent": true,
             "collection_digest": digest
         }),
         &format!("{key}:release"),
@@ -758,26 +800,38 @@ fn workspace_request(
     timeout_ms: u64,
 ) -> Result<Value> {
     let encoded = BASE64.encode(canonical_json(&request).as_bytes());
-    let remote_root = remote_root(&ctx.fleet);
+    let resolved = hosts::resolve(ctx, worker)?;
+    let worker_root = resolved.root.to_string_lossy().into_owned();
+    let environment_root = resolved.environment_root.to_string_lossy().into_owned();
+    let lifetime = worker_lifetime_value(&resolved);
     let argv = profiles::wrap(
         ctx,
         worker,
         vec![
             "python3".to_string(),
-            format!("{remote_root}/remote/workspace.py"),
+            format!("{environment_root}/remote/workspace.py"),
             "--root".to_string(),
-            remote_root,
+            worker_root,
+            "--worker".to_string(),
+            resolved.name.clone(),
+            "--lifetime".to_string(),
+            lifetime.to_string(),
             "--request-base64".to_string(),
             encoded,
         ],
         check_github,
     )?;
-    let output = ctx.ssh(
+    let output = ctx.remote(
         worker,
-        argv,
-        key,
-        "Run remote workenv workspace helper.",
-        timeout_ms,
+        RemoteCommandSpec {
+            argv,
+            stdin: None,
+            cwd: Some(resolved.root),
+            tools_env: false,
+            key: key.into(),
+            purpose: "Run remote workenv workspace helper.".into(),
+            timeout_ms,
+        },
     )?;
     command_json_result(output, worker)
 }
@@ -789,7 +843,19 @@ fn ssh_json(
     key: &str,
     timeout_ms: u64,
 ) -> Result<Value> {
-    let output = ctx.ssh(worker, argv, key, "Run remote workenv command.", timeout_ms)?;
+    let tools_env = matches!(argv.first().map(String::as_str), Some("apoc" | "herdr"));
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv,
+            stdin: None,
+            cwd: Some(ctx.worker_root(worker)?),
+            tools_env,
+            key: key.into(),
+            purpose: "Run remote workenv command.".into(),
+            timeout_ms,
+        },
+    )?;
     command_json_result(output, worker)
 }
 
@@ -806,7 +872,8 @@ fn stage_source_bundle(
     let bytes = fs::read(local_path)
         .with_context(|| format!("read source bundle {}", local_path.display()))?;
     let digest = hex(&Sha256::digest(&bytes));
-    let remote_path = format!("{}/incoming/{digest}.bundle", remote_root(&ctx.fleet));
+    let worker_root = ctx.worker_root(worker)?;
+    let remote_path = format!("{}/incoming/{digest}.bundle", worker_root.to_string_lossy());
     let script = r#"
 import hashlib, json, os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -835,31 +902,24 @@ else:
     os.replace(tmp, path)
 print(json.dumps({"status":"staged","ok":True,"path":str(path),"sha256":expected}))
 "#;
-    let target = worker_host(ctx, worker)?;
-    let output = ctx.runtime.run(CommandSpec {
-        executable: "ssh".to_string(),
-        args: vec![
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "ConnectTimeout=15".to_string(),
-            "-o".to_string(),
-            "StrictHostKeyChecking=yes".to_string(),
-            target,
-            shell_join(&[
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv: vec![
                 "python3".to_string(),
                 "-c".to_string(),
                 script.to_string(),
                 remote_path.clone(),
                 digest.clone(),
-            ]),
-        ],
-        cwd: Some(ctx.root.clone()),
-        stdin: Some(bytes),
-        timeout_ms: 300_000,
-        key: format!("{key}:stage-source-bundle:{digest}"),
-        purpose: format!("Stage workenv source bundle for task claim on {worker}."),
-    })?;
+            ],
+            stdin: Some(bytes),
+            cwd: Some(worker_root),
+            tools_env: false,
+            key: format!("{key}:stage-source-bundle:{digest}"),
+            purpose: format!("Stage workenv source bundle for task claim on {worker}."),
+            timeout_ms: 300_000,
+        },
+    )?;
     let result = command_json_result(output, worker)?;
     if result.get("status").and_then(Value::as_str) != Some("staged") {
         return Err(anyhow!(
@@ -928,7 +988,7 @@ fn retrieve_collection(
         .ok_or_else(|| anyhow!("remote metadata_path has no parent"))?
         .to_string_lossy()
         .to_string();
-    let expected_prefix = format!("{}/collections/{task}", remote_root(&ctx.fleet));
+    let expected_prefix = remote_task_collection_root(ctx, worker, task)?;
     if !(remote_dir == expected_prefix || remote_dir.starts_with(&format!("{expected_prefix}/"))) {
         bail!("remote collection path is outside the worker collection root");
     }
@@ -958,12 +1018,17 @@ fn retrieve_collection(
         "tar -C {} -cf - . | base64 | tr -d '\\n'",
         shell_quote(&remote_dir)
     );
-    let output = ctx.ssh(
+    let output = ctx.remote(
         worker,
-        vec!["bash".to_string(), "-lc".to_string(), command],
-        &format!("{key}:fetch-collection"),
-        "Fetch remote workenv collection as base64 tar.",
-        180_000,
+        RemoteCommandSpec {
+            argv: vec!["bash".to_string(), "-lc".to_string(), command],
+            stdin: None,
+            cwd: Some(PathBuf::from(&remote_dir)),
+            tools_env: false,
+            key: format!("{key}:fetch-collection"),
+            purpose: "Fetch remote workenv collection as base64 tar.".into(),
+            timeout_ms: 180_000,
+        },
     )?;
     if output.exit_code.unwrap_or(1) != 0 {
         bail!(
@@ -1332,23 +1397,7 @@ fn inspect_remote_apoc_activity(
             ExecutionState::Terminal => {}
         }
     }
-    let listed = ssh_json(
-        ctx,
-        worker,
-        vec![
-            "apoc".to_string(),
-            "execution".to_string(),
-            "list".to_string(),
-            "--purpose".to_string(),
-            format!("List workenv task {task} executions."),
-            "--format".to_string(),
-            "json".to_string(),
-            "--limit".to_string(),
-            "100".to_string(),
-        ],
-        &fresh_read_key(&format!("{task}:activity:list")),
-        60_000,
-    )?;
+    let listed = crate::worker::list_worker_executions(ctx, worker)?;
     if listed.get("next_cursor").is_some() && !listed.get("next_cursor").unwrap().is_null() {
         return Ok(failed(
             "task_activity_unknown",
@@ -1397,25 +1446,27 @@ fn inspect_remote_herdr_activity(
 ) -> Result<Value> {
     let mut live = Vec::new();
     let panes = runtime_herdr_ids(record, "pane_ids");
-    let session = ctx
-        .fleet
-        .get("herdr_session")
-        .and_then(Value::as_str)
-        .unwrap_or("workenv");
+    let session = ctx.worker_session(worker)?;
     let worktree = required_record_str(record, "worktree")?;
     for kind in ["pane", "agent"] {
-        let output = ctx.ssh(
+        let output = ctx.remote(
             worker,
-            vec![
-                "herdr".into(),
-                "--session".into(),
-                session.into(),
-                kind.into(),
-                "list".into(),
-            ],
-            &fresh_read_key(&format!("{task}:herdr:{kind}:inventory")),
-            "Inspect all remote Herdr activity before collecting or releasing a task.",
-            60_000,
+            RemoteCommandSpec {
+                argv: vec![
+                    "herdr".into(),
+                    "--session".into(),
+                    session.clone(),
+                    kind.into(),
+                    "list".into(),
+                ],
+                stdin: None,
+                cwd: Some(ctx.worker_root(worker)?),
+                tools_env: true,
+                key: fresh_read_key(&format!("{task}:herdr:{kind}:inventory")),
+                purpose: "Inspect all remote Herdr activity before collecting or releasing a task."
+                    .into(),
+                timeout_ms: 60_000,
+            },
         )?;
         if output.exit_code.unwrap_or(1) != 0 {
             return Ok(failed(
@@ -1576,6 +1627,7 @@ fn expired(value: &Value) -> bool {
 fn require_worker_bound(ctx: &Context, record: &Value) -> Result<()> {
     let worker = required_record_str(record, "worker")?;
     let _ = ctx.worker(worker)?;
+    validate_task_host_binding(ctx, record)?;
     Ok(())
 }
 
@@ -1603,6 +1655,83 @@ fn task_requested_profile(request: &Value, project_spec: &ProjectSpec) -> Result
 
 fn profile_binding_for_worker(ctx: &Context, worker: &str) -> Result<Value> {
     profiles::binding(ctx, worker)
+}
+
+fn resolved_worker_record(ctx: &Context, worker: &str) -> Result<Value> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    Ok(json!({
+        "name": resolved.name,
+        "host_id": resolved.host_id,
+        "transport": match resolved.transport {
+            ResolvedTransport::Local => json!({"kind": "local"}),
+            ResolvedTransport::Ssh { ref target } => json!({"kind": "ssh", "target": target}),
+        },
+        "root": resolved.root,
+        "environment_root": resolved.environment_root,
+        "session": resolved.session,
+        "tools": match resolved.tools {
+            ResolvedTools::Native => json!({"kind": "native"}),
+            ResolvedTools::Devenv { ref executable } => {
+                json!({"kind": "devenv", "executable": executable})
+            }
+        },
+        "provider": match resolved.provider {
+            Provider::ExeDev => "exe.dev",
+            Provider::Existing => "existing",
+        },
+        "lifetime": worker_lifetime_value(&resolved),
+    }))
+}
+
+fn validate_task_host_binding(ctx: &Context, record: &Value) -> Result<()> {
+    let worker = required_record_str(record, "worker")?;
+    let current = resolved_worker_record(ctx, worker)?;
+    if let Some(recorded) = record.get("worker_host") {
+        if recorded != &current {
+            bail!("Task worker host binding changed; restore its recorded host/root/session before continuing");
+        }
+    } else {
+        let worktree = required_record_str(record, "worktree")?;
+        let root = ctx.worker_root(worker)?.to_string_lossy().into_owned();
+        if !remote_path_contains(&root, worktree) {
+            bail!("Legacy task record worktree is outside the currently configured worker root");
+        }
+    }
+    if let Some(worktree) = record.get("worktree").and_then(Value::as_str) {
+        let root = record
+            .get("allocation_root")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                ctx.worker_root(worker)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        if root.is_empty() || !remote_path_contains(&root, worktree) {
+            bail!("Task worktree is outside its recorded allocation or worker root");
+        }
+    }
+    Ok(())
+}
+
+fn remote_task_collection_root(
+    ctx: &Context,
+    worker: &str,
+    task: &str,
+) -> Result<String> {
+    let root = ctx.worker_root(worker)?.to_string_lossy().into_owned();
+    Ok(format!("{root}/collections/{task}"))
+}
+
+fn worker_lifetime_value(worker: &hosts::ResolvedWorker) -> &'static str {
+    match worker.lifetime {
+        hosts::Lifetime::Static => "static",
+        hosts::Lifetime::Ephemeral => "ephemeral",
+    }
+}
+
+fn remote_path_contains(parent: &str, child: &str) -> bool {
+    child == parent || child.starts_with(&format!("{}/", parent.trim_end_matches('/')))
 }
 
 fn record_profile_name(record: &Value) -> Option<&str> {
@@ -1710,6 +1839,10 @@ struct TaskRecordUpdate<'a> {
     status: &'a str,
     worktree: Option<&'a str>,
     worker_profile: Value,
+    worker_host: Value,
+    allocation_id: Option<&'a str>,
+    allocation_root: Option<&'a str>,
+    worker_lifetime: Option<&'a str>,
     controller_execution_id: Option<&'a str>,
 }
 
@@ -1745,6 +1878,16 @@ fn upsert_task_record(state: &Path, update: TaskRecordUpdate<'_>) -> Result<Valu
         existing["worktree"] = json!(worktree);
     }
     existing["worker_profile"] = update.worker_profile;
+    existing["worker_host"] = update.worker_host;
+    if let Some(allocation_id) = update.allocation_id {
+        existing["allocation_id"] = json!(allocation_id);
+    }
+    if let Some(allocation_root) = update.allocation_root {
+        existing["allocation_root"] = json!(allocation_root);
+    }
+    if let Some(worker_lifetime) = update.worker_lifetime {
+        existing["worker_lifetime"] = json!(worker_lifetime);
+    }
     existing["controller_execution_ids"] = Value::Array(controller_ids);
     existing["remote_execution_ids"] = remote_ids;
     existing["updated_at"] = json!(now_ms());
@@ -2057,24 +2200,6 @@ fn merge_fields(result: &mut Map<String, Value>, fields: Value) {
             result.insert(key.clone(), value.clone());
         }
     }
-}
-
-fn remote_root(fleet: &Value) -> String {
-    fleet
-        .get("remote_root")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_REMOTE_ROOT)
-        .to_string()
-}
-
-fn worker_host(ctx: &Context, worker: &str) -> Result<String> {
-    let name = ctx.worker_name(worker)?;
-    let user = ctx
-        .fleet
-        .get("remote_user")
-        .and_then(Value::as_str)
-        .unwrap_or("exedev");
-    Ok(format!("{user}@{name}.exe.xyz"))
 }
 
 fn fresh_read_key(prefix: &str) -> String {

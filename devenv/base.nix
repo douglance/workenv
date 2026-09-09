@@ -10,7 +10,9 @@
     git
     gh
     jq
+    nodejs
     openssh
+    (python3.withPackages (ps: [ ps.pytest ]))
     ripgrep
     unzip
     zip

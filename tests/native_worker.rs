@@ -46,8 +46,46 @@ impl FakeRuntime {
 
 impl Runtime for FakeRuntime {
     fn run(&self, spec: CommandSpec) -> Result<CommandOutput> {
-        self.specs.lock().unwrap().push(spec);
-        Ok(self.outputs.lock().unwrap().remove(0))
+        self.specs.lock().unwrap().push(spec.clone());
+        if spec.key.contains(":cli:") {
+            let command = spec.args.join(" ");
+            let value = if command.contains("Configure native workenv CLI")
+                || command.contains("local_controller")
+            {
+                json!({"ok":true,"status":"configured"})
+            } else if command.contains("'logs'") || command.contains("execution logs") {
+                json!({"stdout":"{\"ok\":true,\"status\":\"installed\",\"new_sha256\":\"verified\"}","stderr":""})
+            } else if command.contains("'wait'")
+                || command.contains("execution wait")
+                || command.contains("'get'")
+            {
+                json!({"id":"cli-build","outcome":"passed"})
+            } else {
+                json!({"id":"cli-build","outcome":"pending"})
+            };
+            return Ok(CommandOutput {
+                stdout: serde_json::to_vec(&value).unwrap(),
+                exit_code: Some(0),
+                execution_id: "cli-observation".into(),
+                ..Default::default()
+            });
+        }
+        let mut outputs = self.outputs.lock().unwrap();
+        let mut output = outputs.remove(0);
+        if spec.args.join(" ").contains("apoc.execution_list") {
+            let mut page: Value = serde_json::from_slice(&output.stdout).unwrap();
+            if page.get("executions").is_some() {
+                let mut rows = page["executions"].as_array().unwrap().clone();
+                while page["next_cursor"].is_string() {
+                    page = serde_json::from_slice(&outputs.remove(0).stdout).unwrap();
+                    rows.extend(page["executions"].as_array().unwrap().iter().cloned());
+                }
+                output.stdout =
+                    serde_json::to_vec(&json!({"status":"completed","result":{"executions":rows}}))
+                        .unwrap();
+            }
+        }
+        Ok(output)
     }
 
     fn apoc(&self, method: &str, args: Value) -> Result<Value> {
@@ -88,10 +126,37 @@ fn ctx_with_ssh_host(runtime: Arc<FakeRuntime>, state: PathBuf, host: &str) -> C
     ctx
 }
 
+#[test]
+fn setup_error_releases_its_maintenance_reservation() {
+    let dir = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(json!({"unexpected":"provider reply"}));
+    let ctx = ctx(runtime.clone(), dir.path().into());
+    assert!(worker::up(&ctx, Some("1"), "setup-error").is_err());
+    assert!(runtime
+        .apoc_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, _)| method == "reservation_release"));
+    assert!(!dir
+        .path()
+        .join("worker-maintenance/workenv-01.json")
+        .exists());
+}
+
 fn use_temp_source_root(ctx: &mut Context, root: &Path) {
     std::fs::create_dir_all(root.join("bootstrap")).unwrap();
     std::fs::create_dir_all(root.join("remote")).unwrap();
     std::fs::create_dir_all(root.join("devenv")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"workenv\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(root.join("tools.json"), "{}").unwrap();
     std::fs::write(root.join("devenv.nix"), "").unwrap();
     std::fs::write(root.join("remote/tool_health.py"), "").unwrap();
@@ -300,7 +365,7 @@ fn up_uses_configured_ssh_host_for_managed_transport_but_not_provider_recovery()
 }
 
 #[test]
-fn sync_archive_includes_herdr_sources_when_plugin_exists() {
+fn sync_archive_includes_herdr_and_workenv_build_sources() {
     let temp = TempDir::new().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
     runtime.push(provider_present());
@@ -328,6 +393,11 @@ fn sync_archive_includes_herdr_sources_when_plugin_exists() {
     let root = temp.path().join("root");
     use_temp_source_root(&mut ctx, &root);
     add_space_attention_plugin(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"workenv\"\n").unwrap();
+    std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("fleet.json"), "{\"schema_version\":1}\n").unwrap();
 
     let result = worker::up(&ctx, Some("1"), "archive-up").unwrap();
 
@@ -347,6 +417,12 @@ fn sync_archive_includes_herdr_sources_when_plugin_exists() {
     assert!(names
         .iter()
         .any(|name| name == "herdr/space-attention/herdr-plugin.toml"));
+    for required in ["Cargo.toml", "Cargo.lock", "src/main.rs", "fleet.json"] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "missing {required}"
+        );
+    }
 }
 
 #[test]
@@ -363,10 +439,10 @@ fn down_checks_all_inventory_pages_and_refuses_stalled_tasks_before_stopping_ser
     let ctx = ctx(runtime.clone(), temp.path().join("state"));
     let result = worker::down(&ctx, "1", "paged-down").unwrap();
     assert_eq!(result["status"], "worker_busy");
-    assert!(runtime
-        .specs()
+    assert!(runtime.specs().iter().any(|spec| spec
+        .args
         .iter()
-        .any(|spec| spec.args.iter().any(|arg| arg.contains("page2"))));
+        .any(|arg| arg.contains("apoc.execution_list") && arg.contains("page.next_cursor"))));
     assert!(!runtime
         .specs()
         .iter()
@@ -871,6 +947,33 @@ fn worker_herdr_status_rejects_configured_profile_with_wrong_runtime_labels() {
 }
 
 #[test]
+fn native_worker_status_uses_one_probe_and_reports_disk_and_cli() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let mut ctx = ctx(runtime.clone(), temp.path().join("state"));
+    ctx.fleet["hosts"] = json!({"local":{"transport":"local","root":"/tmp/workenv-native-status","tools":"native","platform":"macos"}});
+    ctx.fleet["workers"][0]["host"] = json!("local");
+    runtime.push(json!({
+        "workspace":{"ok":true,"status":"available"},
+        "tools":{"tools_ready":true,"status":"tools_ready"},
+        "herdr":{"herdr_ready":true,"status":"herdr_ready"},
+        "auth":{"ready":false,"status":"auth_required"},
+        "tailscale":{"ok":false,"status":"tailscale_not_ready"},
+        "metadata":{"os":{"system":"Darwin"},"disk":{"total_bytes":1000,"free_bytes":700},"cli_install":{"workenv":{"available":true,"status":"available","sha256":"verified"}}},
+        "elapsed_ms":15,"probes":{"tools":{"elapsed_ms":2}}
+    }));
+    let result = worker::status_with_details(&ctx, Some("1"), false).unwrap();
+    assert_eq!(result["workers"][0]["status"], "available");
+    assert_eq!(result["workers"][0]["agent_ready"], false);
+    assert_eq!(result["workers"][0]["disk"]["free_bytes"], 700);
+    assert_eq!(result["workers"][0]["cli"]["sha256"], "verified");
+    let commands = runtime.specs();
+    assert_eq!(commands.len(), 1);
+    assert_ne!(commands[0].executable, "ssh");
+    assert!(commands[0].args.join(" ").contains("worker_health.py"));
+}
+
+#[test]
 fn down_refuses_open_task_records_before_stopping_runtime() {
     let temp = TempDir::new().unwrap();
     let state = temp.path().join(".state/controller");
@@ -916,6 +1019,35 @@ fn down_stops_only_owned_idle_herdr_runtime() {
 }
 
 #[test]
+fn native_maintenance_ignores_active_executions_outside_its_host_runtime() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(workspace_available());
+    runtime.push(json!([]));
+    runtime.push(json!([]));
+    runtime.push(json!({"status":"completed","result":{"executions":[
+        {"id":"unrelated","status":"running","cwd":"/some/other/project","cwd_truncated":false},
+        {"id":"other-session","status":"running","cwd":"/native/runtime"},
+        {"id":"herdr-exec","status":"running","cwd":"/native/runtime"}
+    ]}}));
+    runtime.push(json!({"id":"other-session","status":"running","outcome":"pending","spec":{"labels":{"workenv.component":"herdr-server","herdr.session":"peer-worker"}}}));
+    runtime.push(json!({"id":"herdr-exec","status":"running","outcome":"pending","spec":{"labels":{"workenv.component":"herdr-server","herdr.session":"workenv-workenv-01"}}}));
+    runtime.push(json!({"id":"herdr-exec","status":"canceled"}));
+    let mut ctx = ctx(runtime.clone(), temp.path().join("state"));
+    ctx.fleet["hosts"] =
+        json!({"mac":{"transport":"local","root":"/native/runtime","tools":"native"}});
+    ctx.fleet["workers"][0]["host"] = json!("mac");
+    assert_eq!(
+        worker::down(&ctx, "1", "native-down").unwrap()["status"],
+        "down"
+    );
+    assert!(!runtime
+        .specs()
+        .iter()
+        .any(|spec| spec.key.contains("runtime-get:workenv-01:unrelated")));
+}
+
+#[test]
 fn connection_returns_scoped_herdr_and_ssh_attach_commands() {
     let temp = TempDir::new().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
@@ -938,6 +1070,17 @@ fn connection_returns_scoped_herdr_and_ssh_attach_commands() {
         ])
     );
     assert_eq!(result["ssh_argv"][1], "exedev@workenv-01.exe.xyz");
+}
+
+#[test]
+fn connection_keeps_other_sessions_on_the_same_ssh_host_separate() {
+    let temp=TempDir::new().unwrap();
+    let runtime=Arc::new(FakeRuntime::default());
+    runtime.push(json!([{"id":"peer","label":"peer-worker","target":"exedev@workenv-01.exe.xyz","session":"other-session","enabled":true}]));
+    let ctx=ctx(runtime,temp.path().join("state"));
+    let result=worker::connection(&ctx,"1").unwrap();
+    assert!(result["machine"].is_null());
+    assert_eq!(result["session"],"workenv");
 }
 
 #[test]

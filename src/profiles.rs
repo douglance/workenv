@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::process::{read_json, shell_join, shell_quote, worker_ssh_target, write_json};
-use crate::{worker, CommandSpec, Context};
+use crate::hosts::{self, RemoteCommandSpec, ResolvedTools};
+use crate::process::{read_json, shell_join, shell_quote, write_json};
+use crate::{worker, Context};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -217,31 +218,33 @@ pub fn list(ctx: &Context) -> Result<Value> {
     )
 }
 
-fn remote_root(ctx: &Context) -> &str {
-    ctx.fleet["remote_root"]
-        .as_str()
-        .unwrap_or("/home/exedev/workenv")
-}
-
-fn helper_args(ctx: &Context) -> Vec<String> {
-    vec![
+fn helper_args(ctx: &Context, worker: &str) -> Result<Vec<String>> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    let environment_root = resolved.environment_root.to_string_lossy().into_owned();
+    let worker_root = resolved.root.to_string_lossy().into_owned();
+    Ok(vec![
         "python3".into(),
-        format!("{}/remote/profile.py", remote_root(ctx)),
+        format!("{environment_root}/remote/profile.py"),
         "--root".into(),
-        remote_root(ctx).into(),
-    ]
+        worker_root,
+    ])
 }
 
-fn shared_environment(ctx: &Context, argv: Vec<String>) -> Vec<String> {
-    vec![
-        "bash".into(),
-        "-lc".into(),
-        format!(
-            "cd {} && /usr/local/bin/devenv shell -- {}",
-            shell_quote(remote_root(ctx)),
-            shell_join(&argv)
-        ),
-    ]
+fn shared_environment(ctx: &Context, worker: &str, argv: Vec<String>) -> Result<Vec<String>> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    match resolved.tools {
+        ResolvedTools::Native => Ok(argv),
+        ResolvedTools::Devenv { executable } => Ok(vec![
+            "bash".into(),
+            "-lc".into(),
+            format!(
+                "cd {} && {} shell -- {}",
+                shell_quote(&resolved.environment_root.to_string_lossy()),
+                shell_quote(&executable),
+                shell_join(&argv)
+            ),
+        ]),
+    }
 }
 
 pub fn wrap(
@@ -250,10 +253,11 @@ pub fn wrap(
     argv: Vec<String>,
     check_github: bool,
 ) -> Result<Vec<String>> {
+    let resolved = hosts::resolve(ctx, worker)?;
     let Some(profile) = resolve(ctx, worker)? else {
         return Ok(argv);
     };
-    let mut args = helper_args(ctx);
+    let mut args = helper_args(ctx, worker)?;
     args.extend([
         "exec".into(),
         "--name".into(),
@@ -269,19 +273,27 @@ pub fn wrap(
     // APoC's daemon does not inherit the invoking SSH shell's environment.
     // Load tools inside the durable child, then restore the task's cwd before
     // direnv selects its identity. Exact command arguments remain separate.
-    let script = r#"workenv_command_cwd=$PWD
-cd -- "$1" || exit
-shift
-exec /usr/local/bin/devenv shell -- bash -c 'cd -- "$1" || exit; shift; exec "$@"' workenv-profile "$workenv_command_cwd" "$@""#;
-    let mut wrapped = vec![
-        "bash".into(),
-        "-c".into(),
-        script.into(),
-        "workenv-profile".into(),
-        remote_root(ctx).into(),
-    ];
-    wrapped.extend(args);
-    Ok(wrapped)
+    match resolved.tools {
+        ResolvedTools::Native => Ok(args),
+        ResolvedTools::Devenv { executable } => {
+            let script = r#"workenv_command_cwd=$PWD
+workenv_environment_root=$1
+workenv_devenv=$2
+shift 2
+cd -- "$workenv_environment_root" || exit
+exec "$workenv_devenv" shell -- bash -c 'cd -- "$1" || exit; shift; exec "$@"' workenv-profile "$workenv_command_cwd" "$@""#;
+            let mut wrapped = vec![
+                "bash".into(),
+                "-c".into(),
+                script.into(),
+                "workenv-profile".into(),
+                resolved.environment_root.to_string_lossy().into_owned(),
+                executable,
+            ];
+            wrapped.extend(args);
+            Ok(wrapped)
+        }
+    }
 }
 
 fn raw_remote(
@@ -292,24 +304,18 @@ fn raw_remote(
     key: &str,
     purpose: &str,
 ) -> Result<Value> {
-    let output = ctx.runtime.run(CommandSpec {
-        executable: "ssh".into(),
-        args: vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=15".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=yes".into(),
-            worker_ssh_target(&ctx.fleet, &ctx.worker_name(worker)?)?,
-            shell_join(&argv),
-        ],
-        cwd: Some(ctx.root.clone()),
-        stdin,
-        timeout_ms: 60_000,
-        key: key.into(),
-        purpose: purpose.into(),
-    })?;
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv,
+            stdin,
+            cwd: Some(ctx.worker_root(worker)?),
+            tools_env: false,
+            timeout_ms: 60_000,
+            key: key.into(),
+            purpose: purpose.into(),
+        },
+    )?;
     if output.exit_code != Some(0) {
         // Login helpers may mention credential paths or provider diagnostics.
         // Keep their raw output out of controller errors and durable receipts.
@@ -347,7 +353,10 @@ print(json.dumps({'ok':True,'status':'profile_runtime_installed'}))"#;
             "python3".into(),
             "-c".into(),
             install.into(),
-            format!("{}/remote/profile.py", remote_root(ctx)),
+            format!(
+                "{}/remote/profile.py",
+                ctx.worker_environment_root(worker)?.to_string_lossy()
+            ),
         ],
         Some(source),
         &format!("{key}:profile-runtime"),
@@ -356,7 +365,7 @@ print(json.dumps({'ok':True,'status':'profile_runtime_installed'}))"#;
     if installed["ok"] != true {
         return Ok(installed);
     }
-    let mut args = helper_args(ctx);
+    let mut args = helper_args(ctx, worker)?;
     args.extend([
         "prepare".into(),
         "--name".into(),
@@ -369,7 +378,7 @@ print(json.dumps({'ok':True,'status':'profile_runtime_installed'}))"#;
     raw_remote(
         ctx,
         worker,
-        shared_environment(ctx, args),
+        shared_environment(ctx, worker, args)?,
         None,
         &format!("{key}:profile-prepare"),
         "Prepare isolated worker profile directories without transferring credentials.",
@@ -381,7 +390,7 @@ pub fn status(ctx: &Context, worker: &str) -> Result<Value> {
     let Some(profile) = resolve(ctx, &worker)? else {
         return Ok(json!({"ok":true,"status":"profile_unassigned","worker":worker}));
     };
-    let mut args = helper_args(ctx);
+    let mut args = helper_args(ctx, &worker)?;
     args.extend([
         "status".into(),
         "--name".into(),
@@ -392,7 +401,7 @@ pub fn status(ctx: &Context, worker: &str) -> Result<Value> {
     let result = raw_remote(
         ctx,
         &worker,
-        shared_environment(ctx, args),
+        shared_environment(ctx, &worker, args)?,
         None,
         &format!("profile-status-{}", uuid::Uuid::new_v4()),
         "Check the selected worker profile and GitHub identity without exposing credentials.",
@@ -417,7 +426,7 @@ pub fn assign(ctx: &Context, selector: &str, name: &str, key: &str) -> Result<Va
         .truncate(false)
         .read(true)
         .write(true)
-        .open(ctx.state.join("profile-assignment.lock"))?;
+        .open(ctx.state.join("fleet.lock"))?;
     lock.try_lock_exclusive()
         .context("Another worker profile assignment is in progress")?;
     if read_json(&ctx.root.join("fleet.json"))? != ctx.fleet {
@@ -501,25 +510,30 @@ pub fn login(ctx: &Context, selector: &str, service: &str, key: &str) -> Result<
             json!({"ok":false,"status":"profile_not_prepared","worker":worker,"observed":observed}),
         );
     }
-    let session = ctx.fleet["herdr_session"].as_str().unwrap_or("workenv");
+    let session = ctx.worker_session(&worker)?;
     let created = ctx
-        .ssh(
+        .remote(
             &worker,
-            vec![
-                "herdr".into(),
-                "--session".into(),
-                session.into(),
-                "workspace".into(),
-                "create".into(),
-                "--cwd".into(),
-                remote_root(ctx).into(),
-                "--label".into(),
-                format!("{} {service} login", profile.name),
-                "--focus".into(),
-            ],
-            &format!("{key}:login-pane"),
-            "Open a profile login workspace in the worker's Herdr session.",
-            60_000,
+            RemoteCommandSpec {
+                argv: vec![
+                    "herdr".into(),
+                    "--session".into(),
+                    session.clone(),
+                    "workspace".into(),
+                    "create".into(),
+                    "--cwd".into(),
+                    ctx.worker_root(&worker)?.to_string_lossy().into_owned(),
+                    "--label".into(),
+                    format!("{} {service} login", profile.name),
+                    "--focus".into(),
+                ],
+                stdin: None,
+                cwd: Some(ctx.worker_root(&worker)?),
+                tools_env: true,
+                key: format!("{key}:login-pane"),
+                purpose: "Open a profile login workspace in the worker's Herdr session.".into(),
+                timeout_ms: 60_000,
+            },
         )?
         .json()?;
     let result = created.get("result").unwrap_or(&created);
@@ -528,20 +542,25 @@ pub fn login(ctx: &Context, selector: &str, service: &str, key: &str) -> Result<
         .and_then(Value::as_str)
         .context("Herdr did not return a login pane ID")?;
     let command = shell_join(&wrap(ctx, &worker, argv, false)?);
-    let sent = ctx.ssh(
+    let sent = ctx.remote(
         &worker,
-        vec![
-            "herdr".into(),
-            "--session".into(),
-            session.into(),
-            "pane".into(),
-            "run".into(),
-            pane.into(),
-            command,
-        ],
-        &format!("{key}:login-command"),
-        "Start the requested interactive login inside its worker profile.",
-        60_000,
+        RemoteCommandSpec {
+            argv: vec![
+                "herdr".into(),
+                "--session".into(),
+                session.clone(),
+                "pane".into(),
+                "run".into(),
+                pane.into(),
+                command,
+            ],
+            stdin: None,
+            cwd: Some(ctx.worker_root(&worker)?),
+            tools_env: true,
+            key: format!("{key}:login-command"),
+            purpose: "Start the requested interactive login inside its worker profile.".into(),
+            timeout_ms: 60_000,
+        },
     )?;
     sent.success()?;
     Ok(

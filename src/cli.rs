@@ -1,6 +1,6 @@
 use crate::{
     process::{read_json, write_json},
-    profiles, tasks, worker, Context,
+    profiles, registry, tasks, worker, Context,
 };
 use anyhow::{bail, Context as _, Result};
 use fs2::FileExt;
@@ -30,6 +30,13 @@ struct StatusOptions {
     /// Include full probe evidence.
     #[serde(default)]
     details: bool,
+}
+#[derive(Deserialize, incurs::Options)]
+struct InstallOptions {
+    /// Stable request key. Required for MCP and noninteractive calls.
+    idempotency_key: Option<String>,
+    /// Workenv source checkout to build; defaults to the configured runtime source.
+    source: Option<String>,
 }
 #[derive(Deserialize, incurs::Args)]
 struct WorkerArgs {
@@ -111,10 +118,59 @@ struct RunArgs {
     argv: Vec<String>,
 }
 #[derive(Deserialize, incurs::Options)]
+struct RunOptions {
+    /// Stable request key. Required for MCP and noninteractive calls.
+    idempotency_key: Option<String>,
+    /// Record CPU and memory usage on the worker for this execution.
+    #[serde(default)]
+    telemetry: bool,
+}
+#[derive(Deserialize, incurs::Options)]
 struct InOptions {
     /// Return connection details without opening the interactive Herdr client.
     #[serde(default)]
     print: bool,
+}
+
+#[derive(Deserialize, incurs::Args)]
+struct RegistrationArgs {
+    /// A unique lowercase name for this host or worker.
+    name: String,
+}
+
+#[derive(Deserialize, incurs::Options)]
+struct HostAddOptions {
+    /// Stable request key. Required for MCP and noninteractive calls.
+    idempotency_key: Option<String>,
+    /// Register this machine without an SSH connection.
+    #[serde(default)]
+    local: bool,
+    /// Register an existing machine reachable as USER@HOST over SSH.
+    ssh: Option<String>,
+    /// Absolute directory for shared Workenv source and tools on the host.
+    directory: Option<String>,
+    /// Use native host tools (default) or a shared devenv environment.
+    tools: Option<String>,
+}
+
+#[derive(Deserialize, incurs::Options)]
+struct WorkerAddOptions {
+    /// Stable request key. Required for MCP and noninteractive calls.
+    idempotency_key: Option<String>,
+    /// Registered host on which this worker runs.
+    host: String,
+    /// Scheduler class; defaults to general.
+    class: Option<String>,
+    /// CPU budget; defaults to 2.
+    cpus: Option<u64>,
+    /// Memory budget in GB; defaults to 8.
+    memory_gb: Option<u64>,
+    /// Disk budget metadata in GB; defaults to 50. Existing hosts share their filesystem.
+    disk_gb: Option<u64>,
+    /// static preserves task worktrees; ephemeral removes them after verified release.
+    lifetime: Option<String>,
+    /// Absolute worker state directory; defaults to the host directory plus workers/NAME.
+    directory: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -216,6 +272,7 @@ fn summarize_status(mut value: Value) -> Value {
                 "codex":row.pointer("/auth/auth/codex/chatgpt_subscription"),
                 "claude":row.pointer("/auth/auth/claude/subscription_auth"),
                 "tailscale":row.pointer("/tailscale/ok"),"blockers":blockers,
+                "cli":row["cli"],"disk":row["disk"],"probe_elapsed_ms":row["probe_elapsed_ms"],"agent_ready":row["agent_ready"],
             });
         }
     }
@@ -261,11 +318,15 @@ where
         }
         if previous.get("result").is_some() {
             let mut result = previous["result"].clone();
-            result["replayed"] = true.into();
-            return Ok(result);
+            if command != "install" || result["status"] != "pending" {
+                result["replayed"] = true.into();
+                return Ok(result);
+            }
+            // Install checkpoints retain accepted build IDs and only advance observation.
+        } else {
+            return Ok(json!({"ok":false,"status":"unknown","idempotency_key":key,
+                "error":"The previous controller stopped before saving its result. Inspect worker and task state before issuing a new request; this request will not be repeated."}));
         }
-        return Ok(json!({"ok":false,"status":"unknown","idempotency_key":key,
-            "error":"The previous controller stopped before saving its result. Inspect worker and task state before issuing a new request; this request will not be repeated."}));
     }
     write_json(
         &path,
@@ -328,7 +389,9 @@ fn status_command() -> CommandDef {
                         Some(target) if ctx.worker_name(target).is_err() => {
                             tasks::status(&ctx, Some(target))
                         }
-                        selector => worker::status(&ctx, selector),
+                        selector => {
+                            worker::status_with_details(&ctx, selector, input.options.details)
+                        }
                     })
                     .map(|value| {
                         if input.options.details {
@@ -431,7 +494,74 @@ fn profile_commands() -> Cli {
         .command("login", login)
 }
 
+fn host_commands() -> Cli {
+    let add = CommandDef::typed::<RegistrationArgs, HostAddOptions, (), Report, _, _>(
+        "add", |input:TypedContext<RegistrationArgs,HostAddOptions,()>| async move {
+            report(context(&input.globals).and_then(|ctx| {
+                let tools=input.options.tools.as_deref().unwrap_or("native").to_string();
+                let request=json!({"name":input.args.name,"local":input.options.local,"ssh":input.options.ssh,"directory":input.options.directory,"tools":tools});
+                mutation(&ctx,"host add",request,
+                    &mutation_globals(&input.globals,input.options.idempotency_key.as_deref()),
+                    input.agent || input.request.is_some(),
+                    |key|registry::add_host(&ctx,&input.args.name,registry::HostRegistration {
+                        local:input.options.local,ssh:input.options.ssh,directory:input.options.directory,tools,
+                    },key))
+            }))
+        },
+    ).description("Register this Mac/Linux machine or an existing SSH host.").mcp(mcp_options(false,false)).done();
+    let list = CommandDef::typed::<(), (), (), Report, _, _>(
+        "list",
+        |input: TypedContext<(), (), ()>| async move {
+            report(context(&input.globals).map(|ctx| registry::list_hosts(&ctx)))
+        },
+    )
+    .description("List registered portable hosts without contacting them.")
+    .mcp(mcp_options(true, false))
+    .done();
+    Cli::create("host")
+        .description("Register existing Mac and Linux machines.")
+        .command("add", add)
+        .command("list", list)
+}
+
+fn worker_commands() -> Cli {
+    let add = CommandDef::typed::<RegistrationArgs, WorkerAddOptions, (), Report, _, _>(
+        "add", |input:TypedContext<RegistrationArgs,WorkerAddOptions,()>| async move {
+            report(context(&input.globals).and_then(|ctx| {
+                let class=input.options.class.unwrap_or_else(||"general".into());
+                let lifetime=input.options.lifetime.unwrap_or_else(||"static".into());
+                let cpus=input.options.cpus.unwrap_or(2);
+                let memory_gb=input.options.memory_gb.unwrap_or(8);
+                let disk_gb=input.options.disk_gb.unwrap_or(50);
+                let request=json!({"name":input.args.name,"host":input.options.host,"class":class,"lifetime":lifetime,"directory":input.options.directory,"cpus":cpus,"memory_gb":memory_gb,"disk_gb":disk_gb});
+                mutation(&ctx,"worker add",request,
+                    &mutation_globals(&input.globals,input.options.idempotency_key.as_deref()),
+                    input.agent || input.request.is_some(),
+                    |key|registry::add_worker(&ctx,&input.args.name,registry::WorkerRegistration {
+                        host:input.options.host,class,cpus,memory_gb,disk_gb,lifetime,directory:input.options.directory,
+                    },key))
+            }))
+        },
+    ).description("Register a persistent or temporary worker on an existing host.").mcp(mcp_options(false,false)).done();
+    Cli::create("worker")
+        .description("Configure workers on registered hosts.")
+        .command("add", add)
+}
+
 pub fn build() -> Cli {
+    let install = CommandDef::typed::<WorkerArgs, InstallOptions, (), Report, _, _>(
+        "install", |input:TypedContext<WorkerArgs,InstallOptions,()>| async move {
+            report(context(&input.globals).and_then(|ctx| {
+                let source = input.options.source.as_ref().map(std::path::PathBuf::from)
+                    .unwrap_or_else(||ctx.root.clone()).canonicalize()?;
+                mutation(&ctx,"install",json!({"worker":input.args.worker,"source":source}),
+                    &mutation_globals(&input.globals,input.options.idempotency_key.as_deref()),
+                    input.agent || input.request.is_some(),
+                    |key|crate::install::install_from(&ctx,input.args.worker.as_deref(),key,&source))
+            }))
+        },
+    ).description("Build and install the Workenv CLI on selected workers with local self-hosting configuration.")
+        .mcp(mcp_options(false,false)).done();
     let up = CommandDef::typed::<WorkerArgs, MutationOptions, (), Report, _, _>(
         "up",
         |input: TypedContext<WorkerArgs, MutationOptions, ()>| async move {
@@ -468,14 +598,17 @@ pub fn build() -> Cli {
                     && value["ok"] != false
                 {
                     // Foreground terminal UI; worker processes retain their remote owners.
-                    let target = format!(
-                        "{}@{}.exe.xyz",
-                        ctx.fleet["remote_user"].as_str().unwrap_or("exedev"),
-                        name
-                    );
-                    let session = ctx.fleet["herdr_session"].as_str().unwrap_or("workenv");
-                    let result = std::process::Command::new("herdr")
-                        .args(["--remote", &target, "--session", session])
+                    let argv = value["attach_argv"]
+                        .as_array()
+                        .context("Worker connection omitted its attach command")?
+                        .iter()
+                        .map(|arg| arg.as_str().context("Invalid attach argument"))
+                        .collect::<Result<Vec<_>>>()?;
+                    let (executable, arguments) = argv
+                        .split_first()
+                        .context("Worker connection returned an empty attach command")?;
+                    let result = std::process::Command::new(executable)
+                        .args(arguments)
                         .status()?;
                     value["ok"] = result.success().into();
                     value["status"] = if result.success() {
@@ -558,17 +691,23 @@ pub fn build() -> Cli {
             })
         }))
     }).description("Reserve an available worker and check out an exact revision for one task.").mcp(mcp_options(false, false)).done();
-    let run = CommandDef::typed::<RunArgs, MutationOptions, (), Report, _, _>(
+    let run = CommandDef::typed::<RunArgs, RunOptions, (), Report, _, _>(
         "run",
-        |input: TypedContext<RunArgs, MutationOptions, ()>| async move {
+        |input: TypedContext<RunArgs, RunOptions, ()>| async move {
             report(context(&input.globals).and_then(|ctx| {
                 mutation(
                     &ctx,
                     "run",
-                    json!({"task":input.args.task,"argv":input.args.argv}),
+                    json!({"task":input.args.task,"argv":input.args.argv,"telemetry":input.options.telemetry}),
                     &mutation_globals(&input.globals, input.options.idempotency_key.as_deref()),
                     input.agent || input.request.is_some(),
-                    |key| tasks::run(&ctx, &input.args.task, input.args.argv, key),
+                    |key| {
+                        if input.options.telemetry {
+                            tasks::run_profiled(&ctx, &input.args.task, input.args.argv, key)
+                        } else {
+                            tasks::run(&ctx, &input.args.task, input.args.argv, key)
+                        }
+                    },
                 )
             }))
         },
@@ -636,7 +775,7 @@ pub fn build() -> Cli {
     .done();
     Cli::create("workenv")
         .version(env!("CARGO_PKG_VERSION"))
-        .description("Your personal cloud development workers.")
+        .description("Development workers on local, SSH, and exe.dev machines.")
         .globals::<Globals>()
         .root(status_command())
         .command("status", status_command())
@@ -645,12 +784,15 @@ pub fn build() -> Cli {
         .command("out", out)
         .command("down", down)
         .command("doctor", doctor)
+        .command("install", install)
         .command("claim", claim)
         .command("run", run)
         .command("services", services)
         .command("collect", collect)
         .command("release", release)
         .group(profile_commands())
+        .group(host_commands())
+        .group(worker_commands())
 }
 
 #[cfg(test)]
@@ -666,6 +808,31 @@ mod tests {
         fn apoc(&self, _: &str, _: Value) -> Result<Value> {
             panic!("unexpected APoC call")
         }
+    }
+    #[test]
+    fn pending_install_advances_observation_then_replays_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            root: dir.path().into(),
+            state: dir.path().join("state"),
+            fleet: json!({}),
+            runtime: Arc::new(NoCommands),
+        };
+        let globals = json!({"idempotency_key":"install-pending"});
+        mutation(&ctx, "install", json!({}), &globals, true, |_| {
+            Ok(json!({"ok":false,"status":"pending","execution_id":"build"}))
+        })
+        .unwrap();
+        let completed = mutation(&ctx, "install", json!({}), &globals, true, |_| {
+            Ok(json!({"ok":true,"status":"installed","execution_id":"build"}))
+        })
+        .unwrap();
+        assert_eq!(completed["status"], "installed");
+        let replay = mutation(&ctx, "install", json!({}), &globals, true, |_| {
+            panic!("completed install must not restart")
+        })
+        .unwrap();
+        assert_eq!(replay["replayed"], true);
     }
     #[test]
     fn pending_receipt_is_returned_without_repeating_the_operation() {

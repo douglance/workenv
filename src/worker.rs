@@ -14,11 +14,11 @@ use sha2::{Digest, Sha256};
 use tar::Builder;
 use uuid::Uuid;
 
+use crate::hosts::{self, Provider, RemoteCommandSpec, ResolvedTools, ResolvedTransport};
 use crate::process::{read_json, shell_quote, worker_ssh_target, write_json};
 use crate::profiles;
 use crate::{CommandSpec, Context};
 
-const REMOTE_ROOT: &str = "/home/exedev/workenv";
 const SPACE_ATTENTION_PLUGIN: &str = "operator.space-attention";
 const HERDR_VERSION: &str = "0.9.0";
 const HERDR_PROTOCOL_VERSION: i64 = 22;
@@ -26,14 +26,30 @@ const TERMINAL_TASK_STATUSES: &[&str] = &["released"];
 const LIVE_EXECUTION_STATUSES: &[&str] = &["queued", "running", "stalled", "interrupted"];
 
 pub fn status(ctx: &Context, selector: Option<&str>) -> Result<Value> {
-    let inventory = provider_inventory(ctx, &observation_key("worker-status-provider"))
-        .unwrap_or_else(
-            |error| json!({"status":"unknown","ok":false,"error":error.to_string(),"vms":[]}),
-        );
+    status_with_details(ctx, selector, false)
+}
+
+pub fn status_with_details(ctx: &Context, selector: Option<&str>, details: bool) -> Result<Value> {
     let workers = selected_worker_names(ctx, selector)?;
+    let needs_provider = workers.iter().any(|worker| {
+        hosts::resolve(ctx, worker).is_ok_and(|resolved| resolved.provider == Provider::ExeDev)
+    });
+    let inventory = if needs_provider {
+        provider_inventory(ctx, &observation_key("worker-status-provider")).unwrap_or_else(
+            |error| json!({"status":"unknown","ok":false,"error":error.to_string(),"vms":[]}),
+        )
+    } else {
+        json!({"ok":true,"vms":[]})
+    };
     let mut rows = Vec::new();
-    for worker in workers {
-        rows.push(worker_status(ctx, &worker, &inventory));
+    for batch in workers.chunks(8) {
+        rows.extend(thread::scope(|scope| {
+            let handles=batch.iter().map(|worker| {
+                let inventory=&inventory;
+                scope.spawn(move||worker_status(ctx,worker,inventory,details))
+            }).collect::<Vec<_>>();
+            handles.into_iter().map(|handle|handle.join().unwrap_or_else(|_|json!({"worker":"unknown","status":"partial","blockers":[{"kind":"probe","status":"worker_probe_unknown"}]}))).collect::<Vec<_>>()
+        }));
     }
     let aggregate = if rows.iter().any(row_has_unknown) {
         "partial"
@@ -80,7 +96,17 @@ pub fn up(ctx: &Context, selector: Option<&str>, key: &str) -> Result<Value> {
 
 pub fn connection(ctx: &Context, selector: &str) -> Result<Value> {
     let worker = ctx.worker_name(selector)?;
-    let session = herdr_session(ctx);
+    let session = ctx.worker_session(&worker)?;
+    if hosts::resolve(ctx, &worker)?.transport == ResolvedTransport::Local {
+        return Ok(ok(
+            "connection",
+            json!({
+                "worker":worker,"worker_profile":profiles::binding(ctx,&worker)?,"session":session,
+                "target":"local","machine":null,"attach_argv":["herdr","--session",session],"ssh_argv":null,
+                "detach":{"shortcut":"ctrl+b q","note":"Detach the client while worker processes continue."}
+            }),
+        ));
+    }
     let target = connection_target(ctx, &worker)?;
     let machines = herdr_machine_list(ctx)
         .unwrap_or_else(|error| json!({"status":"unknown","ok":false,"error":error.to_string()}));
@@ -93,7 +119,7 @@ pub fn connection(ctx: &Context, selector: &str) -> Result<Value> {
             "session": session,
             "target": target,
             "machine": machine,
-            "attach_argv": ["herdr", "--remote", target, "--session", herdr_session(ctx)],
+            "attach_argv": ["herdr", "--remote", target, "--session", ctx.worker_session(&worker)?],
             "ssh_argv": ["ssh", target],
             "detach": {"shortcut": "ctrl+b q", "note": "default Herdr prefix plus q detaches the local client; worker runtime stays up"},
         }),
@@ -203,20 +229,7 @@ pub fn end_profile_change(ctx: &Context, selector: &str, key: &str) -> Result<()
 }
 
 pub fn doctor(ctx: &Context) -> Result<Value> {
-    let inventory = provider_inventory(ctx, &observation_key("worker-doctor-provider"))
-        .unwrap_or_else(
-            |error| json!({"status":"unknown","ok":false,"error":error.to_string(),"vms":[]}),
-        );
-    let workers = selected_worker_names(ctx, None)?;
-    let mut checks = Vec::new();
-    for worker in workers {
-        checks.push(json!({
-            "worker": worker,
-            "provider": provider_inspect(ctx, &worker, Some(&inventory)).unwrap_or_else(|error| json!({"status":"unknown","ok":false,"error":error.to_string()})),
-            "status": worker_status(ctx, &worker, &inventory),
-        }));
-    }
-    Ok(ok("doctor", json!({"workers": checks})))
+    status_with_details(ctx, None, true)
 }
 
 fn up_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
@@ -233,152 +246,195 @@ fn up_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
     if reservation.get("ok") != Some(&json!(true)) {
         return Ok(reservation);
     }
-    let provider = ensure_provider_worker(ctx, worker, key)?;
-    if provider.get("status") != Some(&json!("present")) {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(provider);
-    }
-    let remote_status = workspace_status(ctx, worker).unwrap_or_else(|error| {
-        failed(
-            "worker_state_unknown",
-            "could not verify remote workspace is idle before worker up",
-            json!({"worker": worker, "error": error.to_string()}),
-        )
-    });
-    let preflight = if remote_status.get("status") == Some(&json!("available")) {
-        inspect_worker_runtime(ctx, worker, Some(remote_status.clone()))?
-    } else {
-        // A first installation has no workspace helper yet. Only an absent or
-        // empty managed root is sufficient evidence to initialize it.
-        let root = remote_root(ctx);
-        let script = "import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); empty=not p.exists() or (p.is_dir() and not any(p.iterdir())); print(json.dumps({'ok':empty,'status':'uninitialized' if empty else 'worker_state_unknown'}))";
-        ctx.run(
-            "ssh",
-            recovery_ssh_args(
-                ctx,
-                worker,
-                vec!["python3".into(), "-c".into(), script.into(), root],
-            )?,
-            &observation_key("initial-worker-state"),
-            "Inspect managed worker root before first installation.",
-            60000,
-        )?
-        .json()?
-    };
-    if preflight["ok"] != true {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(merge(
-            json!({"worker":worker,"provider":provider,"remote_status":remote_status}),
-            preflight,
-        ));
-    }
-
-    let source_sync = sync_worker_sources(ctx, worker, key)?;
-    if source_sync.get("ok") != Some(&json!(true)) {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(source_sync);
-    }
-
-    let bootstrap = bootstrap_worker(ctx, worker, key)?;
-    if bootstrap.get("ok") != Some(&json!(true)) {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(bootstrap);
-    }
-
-    let profile_prepare = profiles::prepare(ctx, worker, key)?;
-    if profile_prepare.get("ok") != Some(&json!(true)) {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(profile_prepare);
-    }
-
-    let health = bootstrap_health(ctx, worker, key)?;
-    if health.get("ok") == Some(&json!(false)) {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(health);
-    }
-
-    let tools = worker_tool_status(ctx, worker, key)?;
-    let herdr = if tools.get("tools_ready") == Some(&json!(true)) {
-        start_worker_herdr(ctx, worker, key)?
-    } else {
-        failed(
-            "tools_unknown",
-            "shared devenv tool verification did not pass",
-            json!({"worker": worker, "tools": tools}),
-        )
-    };
-    if herdr.get("ok") != Some(&json!(true)) {
-        release_worker_maintenance(ctx, worker, key)?;
-        return Ok(merge(
-            json!({"provider": provider, "source_sync": source_sync, "bootstrap": bootstrap, "health": health, "tools": tools}),
-            herdr,
-        ));
-    }
-
-    let registration = register_herdr_machine(ctx, worker, key)?;
-    let mut enrollment = json!({"status": "skipped"});
-    let mut tailscale = tailscale_status(ctx, worker, key)?;
-    if tailscale.get("ok") != Some(&json!(true)) {
-        enrollment = enroll_worker_if_credentials_available(ctx, worker, key)?;
-        if enrollment.get("ok") != Some(&json!(true)) {
+    let operation = (|| -> Result<Value> {
+        let provider = ensure_provider_worker(ctx, worker, key)?;
+        if provider.get("status") != Some(&json!("present")) {
             release_worker_maintenance(ctx, worker, key)?;
-            return Ok(ok_field(
-                "auth_required",
-                false,
-                json!({"worker": worker, "worker_profile": worker_profile, "provider": provider, "source_sync": source_sync, "bootstrap": bootstrap, "profile_prepare": profile_prepare, "health": health, "tools": tools, "herdr": herdr, "registration": registration, "tailscale": tailscale, "enrollment": enrollment, "remote_status": remote_status, "reservation": reservation}),
+            return Ok(provider);
+        }
+        let remote_status = workspace_status(ctx, worker).unwrap_or_else(|error| {
+            failed(
+                "worker_state_unknown",
+                "could not verify remote workspace is idle before worker up",
+                json!({"worker": worker, "error": error.to_string()}),
+            )
+        });
+        let preflight = if remote_status.get("status") == Some(&json!("available")) {
+            inspect_worker_runtime(ctx, worker, Some(remote_status.clone()))?
+        } else {
+            // A first installation has no workspace helper yet. Only an absent or
+            // empty managed root is sufficient evidence to initialize it.
+            let root = ctx.worker_root(worker)?.to_string_lossy().into_owned();
+            let script = "import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); empty=not p.exists() or (p.is_dir() and not any(p.iterdir())); print(json.dumps({'ok':empty,'status':'uninitialized' if empty else 'worker_state_unknown'}))";
+            let argv = vec!["python3".into(), "-c".into(), script.into(), root];
+            if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+                ctx.remote(
+                    worker,
+                    RemoteCommandSpec {
+                        argv,
+                        stdin: None,
+                        cwd: Some(PathBuf::from("/")),
+                        tools_env: false,
+                        key: observation_key("initial-worker-state"),
+                        purpose: "Inspect managed worker root before first installation.".into(),
+                        timeout_ms: 60_000,
+                    },
+                )?
+                .json()?
+            } else {
+                ctx.run(
+                    "ssh",
+                    recovery_ssh_args(ctx, worker, argv)?,
+                    &observation_key("initial-worker-state"),
+                    "Inspect managed worker root before first installation.",
+                    60000,
+                )?
+                .json()?
+            }
+        };
+        if preflight["ok"] != true {
+            release_worker_maintenance(ctx, worker, key)?;
+            return Ok(merge(
+                json!({"worker":worker,"provider":provider,"remote_status":remote_status}),
+                preflight,
             ));
         }
-        tailscale = tailscale_status(ctx, worker, key)?;
-    }
 
-    let auth = match worker_auth_status(ctx, worker, key) {
-        Ok(auth) => auth,
-        Err(error) => {
+        let source_sync = sync_worker_sources(ctx, worker, key)?;
+        if source_sync.get("ok") != Some(&json!(true)) {
             release_worker_maintenance(ctx, worker, key)?;
-            return Err(error);
+            return Ok(source_sync);
         }
-    };
-    let missing = health
-        .get("missing_prerequisites")
-        .or_else(|| health.get("missing_tools"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let ready = missing
-        .as_array()
-        .map(|items| items.is_empty())
-        .unwrap_or(false)
-        && tools.get("tools_ready") == Some(&json!(true))
-        && tools.pointer("/nib_auth/authenticated") == Some(&json!(true))
-        && herdr.get("herdr_ready") == Some(&json!(true))
-        && registration.get("ok").unwrap_or(&json!(true)) == &json!(true)
-        && auth.get("ready") == Some(&json!(true));
-    let result = ok_field(
-        if ready { "ready" } else { "partial" },
-        ready,
-        json!({
-            "worker": worker,
-            "worker_profile": worker_profile,
-            "provider": provider,
-            "remote_status": remote_status,
-            "reservation": reservation,
-            "source_sync": source_sync,
-            "bootstrap": bootstrap,
-            "profile_prepare": profile_prepare,
-            "health": health,
-            "tools": tools,
-            "herdr": herdr,
-            "tailscale": tailscale,
-            "registration": registration,
-            "auth": auth,
-            "enrollment": enrollment,
-            "missing_tools": missing,
-        }),
-    );
-    release_worker_maintenance(ctx, worker, key)?;
-    Ok(result)
+
+        let bootstrap = bootstrap_worker(ctx, worker, key)?;
+        if bootstrap.get("ok") != Some(&json!(true)) {
+            release_worker_maintenance(ctx, worker, key)?;
+            return Ok(bootstrap);
+        }
+
+        let cli = crate::install::ensure_cli(ctx, worker, &format!("{key}:cli:{worker}"))?;
+        if cli["ok"] != true {
+            release_worker_maintenance(ctx, worker, key)?;
+            return Ok(merge(json!({"worker":worker,"cli":cli.clone()}), cli));
+        }
+
+        let profile_prepare = profiles::prepare(ctx, worker, key)?;
+        if profile_prepare.get("ok") != Some(&json!(true)) {
+            release_worker_maintenance(ctx, worker, key)?;
+            return Ok(profile_prepare);
+        }
+
+        let health = bootstrap_health(ctx, worker, key)?;
+        if health.get("ok") == Some(&json!(false)) {
+            release_worker_maintenance(ctx, worker, key)?;
+            return Ok(health);
+        }
+
+        let tools = worker_tool_status(ctx, worker, key)?;
+        let herdr = if tools.get("tools_ready") == Some(&json!(true)) {
+            start_worker_herdr(ctx, worker, key)?
+        } else {
+            failed(
+                "tools_unknown",
+                "shared devenv tool verification did not pass",
+                json!({"worker": worker, "tools": tools}),
+            )
+        };
+        if herdr.get("ok") != Some(&json!(true)) {
+            release_worker_maintenance(ctx, worker, key)?;
+            return Ok(merge(
+                json!({"provider": provider, "source_sync": source_sync, "bootstrap": bootstrap, "health": health, "tools": tools}),
+                herdr,
+            ));
+        }
+
+        let registration = register_herdr_machine(ctx, worker, key)?;
+        let existing = hosts::resolve(ctx, worker)?.provider == Provider::Existing;
+        let mut enrollment = json!({"status": "skipped"});
+        let mut tailscale = if existing {
+            json!({"ok":true,"status":"not_required"})
+        } else {
+            tailscale_status(ctx, worker, key)?
+        };
+        if !existing && tailscale.get("ok") != Some(&json!(true)) {
+            enrollment = enroll_worker_if_credentials_available(ctx, worker, key)?;
+            if enrollment.get("ok") != Some(&json!(true)) {
+                release_worker_maintenance(ctx, worker, key)?;
+                return Ok(ok_field(
+                    "auth_required",
+                    false,
+                    json!({"worker": worker, "worker_profile": worker_profile, "provider": provider, "source_sync": source_sync, "bootstrap": bootstrap, "profile_prepare": profile_prepare, "health": health, "tools": tools, "herdr": herdr, "registration": registration, "tailscale": tailscale, "enrollment": enrollment, "remote_status": remote_status, "reservation": reservation}),
+                ));
+            }
+            tailscale = tailscale_status(ctx, worker, key)?;
+        }
+
+        let auth = match if existing {
+            worker_probe(ctx, worker, false).map(|probe| probe["auth"].clone())
+        } else {
+            worker_auth_status(ctx, worker, key)
+        } {
+            Ok(auth) => auth,
+            Err(error) => {
+                json!({"ready":false,"status":"auth_unknown","error":error.to_string()})
+            }
+        };
+        let missing = health
+            .get("missing_prerequisites")
+            .or_else(|| health.get("missing_tools"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let ready = missing
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(false)
+            && tools.get("tools_ready") == Some(&json!(true))
+            && (existing || tools.pointer("/nib_auth/authenticated") == Some(&json!(true)))
+            && herdr.get("herdr_ready") == Some(&json!(true))
+            && registration.get("ok").unwrap_or(&json!(true)) == &json!(true)
+            && (existing || auth.get("ready") == Some(&json!(true)));
+        let result = ok_field(
+            if ready { "ready" } else { "partial" },
+            ready,
+            json!({
+                "worker": worker,
+                "worker_profile": worker_profile,
+                "provider": provider,
+                "remote_status": remote_status,
+                "reservation": reservation,
+                "source_sync": source_sync,
+                "cli":cli,
+                "bootstrap": bootstrap,
+                "profile_prepare": profile_prepare,
+                "health": health,
+                "tools": tools,
+                "herdr": herdr,
+                "tailscale": tailscale,
+                "registration": registration,
+                "auth": auth,
+                "enrollment": enrollment,
+                "missing_tools": missing,
+            }),
+        );
+        release_worker_maintenance(ctx, worker, key)?;
+        Ok(result)
+    })();
+    if operation.is_err()
+        && ctx
+            .state
+            .join("worker-maintenance")
+            .join(format!("{}.json", safe_name(worker)))
+            .is_file()
+    {
+        release_worker_maintenance(ctx, worker, key)?;
+    }
+    operation
 }
 
 fn ensure_provider_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+    if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+        return existing_host_status(ctx, worker, key);
+    }
     let inventory = provider_inventory(ctx, &observation_key(&format!("provider-list:{worker}")))?;
     let inspected = provider_inspect(ctx, worker, Some(&inventory))?;
     match inspected.get("status").and_then(Value::as_str) {
@@ -456,7 +512,99 @@ fn provider_inventory(ctx: &Context, key: &str) -> Result<Value> {
     Ok(value)
 }
 
+fn existing_host_status(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    let script="import json,os,pathlib,platform; print(json.dumps({'system':platform.system(),'architecture':platform.machine(),'home':str(pathlib.Path.home()),'cpus':os.cpu_count()}))";
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv: vec!["python3".into(), "-c".into(), script.into()],
+            stdin: None,
+            cwd: Some(PathBuf::from("/")),
+            tools_env: false,
+            timeout_ms: 20_000,
+            key: format!("{key}:existing-host"),
+            purpose: format!("Verify existing host for worker {worker}."),
+        },
+    )?;
+    let observed = output.json()?;
+    let platform = match observed["system"].as_str() {
+        Some("Darwin") => "macos",
+        Some("Linux") => "linux",
+        _ => "unsupported",
+    };
+    let configured = ctx.fleet["hosts"][&resolved.host_id]["platform"]
+        .as_str()
+        .unwrap_or("auto");
+    let ready = platform != "unsupported" && (configured == "auto" || configured == platform);
+    Ok(ok_field(
+        if ready {
+            "present"
+        } else {
+            "host_platform_mismatch"
+        },
+        ready,
+        json!({"worker":worker,"host":resolved.host_id,"provider":"existing","platform":platform,"observed":observed}),
+    ))
+}
+
+fn native_bootstrap(ctx: &Context, worker: &str, key: &str, start: bool) -> Result<Value> {
+    let root = environment_root(ctx, worker)?;
+    let mut argv = vec![
+        "python3".into(),
+        format!("{root}/bootstrap/native-host.py"),
+        "--root".into(),
+        root,
+        "--json".into(),
+    ];
+    if let Some(profile) = profiles::resolve(ctx, worker)? {
+        argv.extend([
+            "--profile".into(),
+            profile.name,
+            "--digest".into(),
+            profile.digest,
+        ]);
+    }
+    if start {
+        argv.extend([
+            "--start-session".into(),
+            ctx.worker_session(worker)?,
+            "--worker".into(),
+            worker.into(),
+            "--idempotency-key".into(),
+            format!("{key}:native-herdr"),
+        ]);
+    }
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv,
+            stdin: None,
+            cwd: Some(PathBuf::from("/")),
+            tools_env: true,
+            timeout_ms: 60_000,
+            key: format!(
+                "{key}:native-bootstrap:{}",
+                if start { "start" } else { "prepare" }
+            ),
+            purpose: format!("Prepare native Workenv runtime for {worker}."),
+        },
+    )?;
+    let mut value: Value = serde_json::from_slice(&output.stdout)
+        .context("Native host bootstrap did not return JSON")?;
+    value["ok"] = json!(output.exit_code == Some(0) && value["ready"] == true);
+    value["worker"] = json!(worker);
+    value["missing_prerequisites"] = value["needs_setup"].clone();
+    if value["status"].is_null() {
+        value["status"] = json!("native_bootstrap");
+    }
+    Ok(value)
+}
+
 fn provider_inspect(ctx: &Context, worker: &str, inventory: Option<&Value>) -> Result<Value> {
+    if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+        return existing_host_status(ctx, worker, &observation_key("existing-host"));
+    }
     let inventory = match inventory {
         Some(value) => value.clone(),
         None => provider_inventory(
@@ -570,26 +718,96 @@ fn provider_capacity_blocker(
 }
 
 pub(crate) fn sync_worker_sources(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
-    let archive = source_archive(&ctx.root)?;
-    let remote_script = "import pathlib,sys,tarfile; root=pathlib.Path(sys.argv[1]); root.mkdir(parents=True,exist_ok=True); archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz'); archive.extractall(path=root,filter='data'); assert (root/'devenv.nix').is_file(); assert (root/'remote/tool_health.py').is_file(); print('workenv-source-sync-v1')";
-    let output = ctx.runtime.run(CommandSpec {
-        executable: "ssh".into(),
-        args: recovery_ssh_args(
-            ctx,
+    sync_worker_sources_from(ctx, worker, key, &ctx.root)
+}
+
+pub(crate) fn sync_worker_sources_from(
+    ctx: &Context,
+    worker: &str,
+    key: &str,
+    source: &Path,
+) -> Result<Value> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    if resolved.transport == ResolvedTransport::Local
+        && resolved.environment_root.canonicalize().ok().as_ref() == Some(&source.canonicalize()?)
+    {
+        return Ok(ok(
+            "sources_current",
+            json!({"worker":worker,"root":resolved.environment_root}),
+        ));
+    }
+    let archive = source_archive(
+        source,
+        &ctx.root,
+        matches!(resolved.tools, ResolvedTools::Devenv { .. }),
+    )?;
+    let remote_script = r#"import pathlib,sys,tarfile,json,os,fcntl,shutil,tempfile
+root=pathlib.Path(sys.argv[1])
+for path in [root,*root.parents]:
+ if path.is_symlink(): raise SystemExit('managed runtime path is a symlink')
+if root.exists() and any(root.iterdir()):
+ if not ((root/'.state/runtime-owner.json').is_file() or ((root/'devenv.nix').is_file() and (root/'remote/tool_health.py').is_file())):
+  raise SystemExit('refusing to replace a nonempty unmanaged runtime directory')
+root.mkdir(parents=True,exist_ok=True)
+state=root/'.state';state.mkdir(exist_ok=True)
+lock=open(state/'cli-build.lock','a+')
+try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError: raise SystemExit('CLI build is active; retry source sync after its execution completes')
+archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz')
+preserve_fleet=False
+if (root/'fleet.json').is_file():
+ preserve_fleet=json.loads((root/'fleet.json').read_text()).get('local_controller') is True
+for member in archive:
+ if member.name=='fleet.json' and preserve_fleet: continue
+ relative=pathlib.PurePosixPath(member.name)
+ if relative.is_absolute() or '..' in relative.parts or not member.isfile():
+  raise SystemExit('source archive must contain relative regular files')
+ target=root.joinpath(*relative.parts)
+ for path in [target,*target.parents]:
+  if path.is_symlink(): raise SystemExit('source archive target is a symlink')
+ target.parent.mkdir(parents=True,exist_ok=True)
+ with tempfile.NamedTemporaryFile(dir=target.parent,delete=False) as output:
+  temporary=pathlib.Path(output.name)
+  try:
+   with archive.extractfile(member) as source: shutil.copyfileobj(source,output)
+   output.flush();os.fsync(output.fileno());os.chmod(temporary,member.mode & 0o777)
+   os.replace(temporary,target)
+  finally:
+   if temporary.exists(): temporary.unlink()
+assert (root/'devenv.nix').is_file()
+assert (root/'remote/tool_health.py').is_file()
+(state/'runtime-owner.json').write_text(json.dumps({'schema':1,'owner':'workenv'}))
+print('workenv-source-sync-v1')"#;
+    let argv = vec![
+        "python3".into(),
+        "-c".into(),
+        remote_script.into(),
+        environment_root(ctx, worker)?,
+    ];
+    let output = if resolved.provider == Provider::ExeDev {
+        ctx.runtime.run(CommandSpec {
+            executable: "ssh".into(),
+            args: recovery_ssh_args(ctx, worker, argv)?,
+            cwd: Some(ctx.root.clone()),
+            stdin: Some(archive),
+            timeout_ms: 180_000,
+            key: format!("{key}:sync:{worker}"),
+            purpose: format!("Sync workenv bootstrap and shared devenv sources to {worker}."),
+        })?
+    } else {
+        ctx.remote(
             worker,
-            vec![
-                "python3".into(),
-                "-c".into(),
-                remote_script.into(),
-                remote_root(ctx),
-            ],
-        )?,
-        cwd: Some(ctx.root.clone()),
-        stdin: Some(archive),
-        timeout_ms: 180_000,
-        key: format!("{key}:sync:{worker}"),
-        purpose: format!("Sync workenv bootstrap and shared devenv sources to {worker}."),
-    })?;
+            RemoteCommandSpec {
+                argv,
+                stdin: Some(archive),
+                cwd: Some(PathBuf::from("/")),
+                tools_env: false,
+                timeout_ms: 180_000,
+                key: format!("{key}:sync:{worker}"),
+                purpose: format!("Sync Workenv source to existing host for {worker}."),
+            },
+        )?
+    };
     if output.exit_code != Some(0) {
         return Ok(failed(
             "source_sync_failed",
@@ -607,15 +825,18 @@ pub(crate) fn sync_worker_sources(ctx: &Context, worker: &str, key: &str) -> Res
     }
     Ok(ok(
         "synced",
-        json!({"worker": worker, "tools_dir": format!("{}/tool-builds", remote_root(ctx)), "execution_id": output.execution_id}),
+        json!({"worker": worker, "tools_dir": format!("{}/tool-builds", environment_root(ctx, worker)?), "execution_id": output.execution_id}),
     ))
 }
 
 pub(crate) fn bootstrap_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+    if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+        return native_bootstrap(ctx, worker, key, false);
+    }
     remote_shell(
         ctx,
         worker,
-        &format!("{}/bootstrap/bootstrap.sh", remote_root(ctx)),
+        &format!("{}/bootstrap/bootstrap.sh", environment_root(ctx, worker)?),
         &format!("{key}:bootstrap:{worker}"),
         &format!("Bootstrap workenv prerequisites on {worker}."),
         900_000,
@@ -623,9 +844,20 @@ pub(crate) fn bootstrap_worker(ctx: &Context, worker: &str, key: &str) -> Result
 }
 
 fn bootstrap_health(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
+    if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+        return native_bootstrap(
+            ctx,
+            worker,
+            &observation_key("native-bootstrap-health"),
+            false,
+        );
+    }
     let command = format!(
         "{} --health-only --json",
-        shell_quote(&format!("{}/bootstrap/bootstrap.sh", remote_root(ctx)))
+        shell_quote(&format!(
+            "{}/bootstrap/bootstrap.sh",
+            environment_root(ctx, worker)?
+        ))
     );
     let value = remote_json_shell(
         ctx,
@@ -642,10 +874,10 @@ fn bootstrap_health(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
 }
 
 fn worker_tool_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
-    let command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- python3 remote/tool_health.py --require-nix",
-        shell_quote(&remote_root(ctx))
-    );
+    if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+        return Ok(worker_probe(ctx, worker, false)?["tools"].clone());
+    }
+    let command = shared_tool_command(ctx, worker, "python3 remote/tool_health.py --require-nix")?;
     remote_json_shell(
         ctx,
         worker,
@@ -657,7 +889,25 @@ fn worker_tool_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> 
 }
 
 pub fn start_worker_herdr(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
-    let session = herdr_session(ctx);
+    if hosts::resolve(ctx, worker)?.provider == Provider::Existing {
+        let boot = native_bootstrap(ctx, worker, key, true)?;
+        if boot["ok"] != true {
+            return Ok(boot);
+        }
+        for _ in 0..10 {
+            let ready = worker_herdr_status(ctx, worker, key)?;
+            if ready["herdr_ready"] == true {
+                return Ok(ready);
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        return Ok(failed(
+            "herdr_start_pending",
+            "Herdr start was accepted but readiness is not confirmed",
+            json!({"worker":worker,"boot":boot,"herdr_ready":false}),
+        ));
+    }
+    let session = ctx.worker_session(worker)?;
     let worker_profile = profiles::binding(ctx, worker)?;
     let profile_runtime =
         persist_worker_profile_runtime_binding(ctx, worker, key, &worker_profile)?;
@@ -665,7 +915,10 @@ pub fn start_worker_herdr(ctx: &Context, worker: &str, key: &str) -> Result<Valu
         return Ok(profile_runtime);
     }
     let mut env = vec![
-        format!("WORKENV_ROOT={}", shell_quote(&remote_root(ctx))),
+        format!(
+            "WORKENV_ROOT={}",
+            shell_quote(&environment_root(ctx, worker)?)
+        ),
         format!("WORKENV_HERDR_SESSION={}", shell_quote(&session)),
         format!("WORKENV_BOOT_ID={}", shell_quote(key)),
     ];
@@ -757,7 +1010,7 @@ print(json.dumps({"ok": True, "status": "profile_runtime_recorded", "path": str(
             "python3".into(),
             "-c".into(),
             script.into(),
-            remote_root(ctx),
+            environment_root(ctx, worker)?,
             encoded,
         ],
         &format!("{key}:profile-runtime-binding:{worker}"),
@@ -775,14 +1028,17 @@ fn setup_worker_herdr_sidebar(ctx: &Context, worker: &str, key: &str) -> Result<
             json!({"worker": worker, "plugin": "space-attention", "reason": "local plugin manifest is absent"}),
         ));
     }
-    let session = herdr_session(ctx);
-    let remote_plugin = format!("{}/{}", remote_root(ctx), relative.display());
-    let command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} plugin link {}",
-        shell_quote(&remote_root(ctx)),
-        shell_quote(&session),
-        shell_quote(&remote_plugin),
-    );
+    let session = ctx.worker_session(worker)?;
+    let remote_plugin = format!("{}/{}", environment_root(ctx, worker)?, relative.display());
+    let command = shared_tool_command(
+        ctx,
+        worker,
+        &format!(
+            "herdr --session {} plugin link {}",
+            shell_quote(&session),
+            shell_quote(&remote_plugin),
+        ),
+    )?;
     let linked = remote_shell(
         ctx,
         worker,
@@ -808,13 +1064,16 @@ fn refresh_worker_herdr_sidebar(
     remote_plugin: String,
     linked: Value,
 ) -> Result<Value> {
-    let session = herdr_session(ctx);
-    let invoke_command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} plugin action invoke refresh --plugin {}",
-        shell_quote(&remote_root(ctx)),
-        shell_quote(&session),
-        shell_quote(SPACE_ATTENTION_PLUGIN),
-    );
+    let session = ctx.worker_session(worker)?;
+    let invoke_command = shared_tool_command(
+        ctx,
+        worker,
+        &format!(
+            "herdr --session {} plugin action invoke refresh --plugin {}",
+            shell_quote(&session),
+            shell_quote(SPACE_ATTENTION_PLUGIN),
+        ),
+    )?;
     let invoked = match remote_json_shell(
         ctx,
         worker,
@@ -880,12 +1139,15 @@ fn worker_herdr_plugin_logs(
     session: &str,
     attempt: usize,
 ) -> Result<Value> {
-    let command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} plugin log list --plugin {} --limit 10",
-        shell_quote(&remote_root(ctx)),
-        shell_quote(session),
-        shell_quote(SPACE_ATTENTION_PLUGIN),
-    );
+    let command = shared_tool_command(
+        ctx,
+        worker,
+        &format!(
+            "herdr --session {} plugin log list --plugin {} --limit 10",
+            shell_quote(session),
+            shell_quote(SPACE_ATTENTION_PLUGIN),
+        ),
+    )?;
     remote_json_shell(
         ctx,
         worker,
@@ -949,13 +1211,16 @@ fn plugin_log_failed(log: &Value) -> bool {
 }
 
 pub fn worker_herdr_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
-    let session = herdr_session(ctx);
+    let session = ctx.worker_session(worker)?;
     let worker_profile = profiles::binding(ctx, worker)?;
-    let command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- herdr --session {} status server --json",
-        shell_quote(&remote_root(ctx)),
-        shell_quote(&session)
-    );
+    let command = shared_tool_command(
+        ctx,
+        worker,
+        &format!(
+            "herdr --session {} status server --json",
+            shell_quote(&session)
+        ),
+    )?;
     let payload = remote_json_shell(
         ctx,
         worker,
@@ -967,7 +1232,10 @@ pub fn worker_herdr_status(ctx: &Context, worker: &str, _key: &str) -> Result<Va
     let ready = payload.get("running") == Some(&json!(true))
         && payload.get("compatible") == Some(&json!(true))
         && payload.get("version") == Some(&json!(HERDR_VERSION))
-        && payload.get("protocol_version") == Some(&json!(HERDR_PROTOCOL_VERSION))
+        && payload
+            .get("protocol")
+            .or_else(|| payload.get("protocol_version"))
+            == Some(&json!(HERDR_PROTOCOL_VERSION))
         && payload.get("server_binary_stale") == Some(&json!(false))
         && payload.pointer("/capabilities/detached_server_daemon") == Some(&json!(true));
     if ready {
@@ -1159,10 +1427,7 @@ fn tailscale_prefs(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
 }
 
 fn worker_auth_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
-    let command = format!(
-        "cd {} && /usr/local/bin/devenv shell -- python3 remote/health.py",
-        shell_quote(&remote_root(ctx))
-    );
+    let command = shared_tool_command(ctx, worker, "python3 remote/health.py")?;
     let argv = profiles::wrap(
         ctx,
         worker,
@@ -1224,7 +1489,13 @@ fn enroll_worker_if_credentials_available(ctx: &Context, worker: &str, key: &str
 }
 
 fn register_herdr_machine(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
-    let session = herdr_session(ctx);
+    if hosts::resolve(ctx, worker)?.transport == ResolvedTransport::Local {
+        return Ok(ok(
+            "local_session",
+            json!({"worker":worker,"session":ctx.worker_session(worker)?}),
+        ));
+    }
+    let session = ctx.worker_session(worker)?;
     let target = worker_ssh_target(&ctx.fleet, worker)?;
     let machines = herdr_machine_list(ctx)?;
     if let Some(machine) = find_herdr_machine(&machines, worker, &target, &session) {
@@ -1284,7 +1555,7 @@ fn herdr_machine_list(ctx: &Context) -> Result<Value> {
 }
 
 fn inspect_remote_herdr_activity(ctx: &Context, worker: &str) -> Result<Value> {
-    let session = herdr_session(ctx);
+    let session = ctx.worker_session(worker)?;
     let panes = remote_json(
         ctx,
         worker,
@@ -1374,7 +1645,8 @@ fn inspect_worker_runtime(
     worker: &str,
     known_workspace: Option<Value>,
 ) -> Result<Value> {
-    let session = herdr_session(ctx);
+    let resolved = hosts::resolve(ctx, worker)?;
+    let session = ctx.worker_session(worker)?;
     let expected_profile = profiles::binding(ctx, worker)?;
     let remote_status = known_workspace.unwrap_or_else(|| {
         workspace_status(ctx, worker).unwrap_or_else(|error| {
@@ -1413,6 +1685,15 @@ fn inspect_worker_runtime(
         .cloned()
         .unwrap_or_default()
     {
+        if resolved.provider == Provider::Existing && summary["cwd_truncated"] != true {
+            if let Some(cwd) = summary["cwd"].as_str() {
+                let cwd = Path::new(cwd);
+                if !cwd.starts_with(&resolved.root) && !cwd.starts_with(&resolved.environment_root)
+                {
+                    continue;
+                }
+            }
+        }
         if matches!(
             summary["status"].as_str(),
             Some("completed" | "failed" | "canceled" | "cancelled" | "skipped")
@@ -1443,6 +1724,22 @@ fn inspect_worker_runtime(
         )?;
         let execution = execution.get("data").cloned().unwrap_or(execution);
         let labels = execution_labels(&execution);
+        if resolved.provider == Provider::Existing {
+            let owner = labels.get("workenv.worker");
+            if owner.is_some_and(|owner| owner != worker) {
+                continue;
+            }
+            if owner.is_none()
+                && labels
+                    .get("workenv.component")
+                    .is_some_and(|component| component == "herdr-server")
+                && labels.get("herdr.session").is_some_and(|other_session| {
+                    !other_session.is_empty() && other_session != &session
+                })
+            {
+                continue;
+            }
+        }
         if matches!(
             execution["status"].as_str(),
             Some("completed" | "failed" | "canceled" | "cancelled" | "skipped")
@@ -1493,46 +1790,43 @@ fn inspect_worker_runtime(
     ))
 }
 
-fn list_worker_executions(ctx: &Context, worker: &str) -> Result<Value> {
-    let mut rows = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut seen = std::collections::BTreeSet::new();
-    loop {
-        let mut argv = vec![
+pub(crate) fn list_worker_executions(ctx: &Context, worker: &str) -> Result<Value> {
+    let key = observation_key(&format!("runtime-inventory:{worker}"));
+    let script = r#"const purpose='Inspect active Workenv host executions.';
+const pages=await Promise.all(['queued','running','stalled','interrupted'].map(async status=>{
+ const rows=[];let cursor;const seen=new Set();
+ do {
+  const page=await apoc.execution_list({status,limit:100,...(cursor?{cursor}:{}),purpose});
+  rows.push(...page.executions);cursor=page.next_cursor;
+  if(cursor && (seen.has(cursor)||rows.length>10000))throw new Error('Active execution inventory is incomplete');
+  if(cursor)seen.add(cursor);
+ }while(cursor);
+ return rows;
+}));
+return {executions:Array.from(new Map(pages.flat().map(row=>[row.id,row])).values())};"#;
+    let result = remote_json(
+        ctx,
+        worker,
+        vec![
             "apoc".into(),
-            "execution".into(),
-            "list".into(),
-            "--limit".into(),
-            "100".into(),
+            "code".into(),
+            "run".into(),
+            script.into(),
             "--purpose".into(),
-            "Inspect worker runtime occupancy.".into(),
+            "Inspect active Workenv host executions.".into(),
+            "--idempotency-key".into(),
+            key.clone(),
             "--format".into(),
             "json".into(),
-        ];
-        if let Some(value) = &cursor {
-            argv.extend(["--cursor".into(), value.clone()]);
-        }
-        let page = remote_json(
-            ctx,
-            worker,
-            argv,
-            &observation_key("runtime-inventory"),
-            "Inspect worker runtime occupancy.",
-            60000,
-        )?;
-        let items = page["executions"]
-            .as_array()
-            .context("Remote runtime inventory has no executions")?;
-        rows.extend(items.iter().cloned());
-        cursor = page["next_cursor"].as_str().map(str::to_owned);
-        let Some(value) = &cursor else {
-            break;
-        };
-        if rows.len() > 10000 || !seen.insert(value.clone()) {
-            bail!("Remote runtime inventory could not be completely inspected");
-        }
+        ],
+        &key,
+        "Inspect active Workenv host executions.",
+        60_000,
+    )?;
+    if result["status"] != "completed" {
+        bail!("Active host execution inventory is incomplete: {result}");
     }
-    Ok(json!({"executions":rows}))
+    Ok(result["result"].clone())
 }
 
 fn stop_owned_herdr_runtime(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
@@ -1603,26 +1897,85 @@ fn stop_owned_herdr_runtime(ctx: &Context, worker: &str, key: &str) -> Result<Va
     ))
 }
 
-fn worker_status(ctx: &Context, worker: &str, inventory: &Value) -> Value {
+fn worker_status(ctx: &Context, worker: &str, inventory: &Value, details: bool) -> Value {
     let worker_profile = profiles::binding(ctx, worker).unwrap_or_else(
         |error| json!({"status":"profile_unknown","ok":false,"error":error.to_string()}),
     );
-    let provider = provider_inspect(ctx, worker, Some(inventory))
-        .unwrap_or_else(|error| json!({"status":"unknown","ok":false,"error":error.to_string()}));
-    let workspace = workspace_status(ctx, worker)
-        .unwrap_or_else(|error| json!({"status":"unknown","ok":false,"error":error.to_string()}));
-    let tools = worker_tool_status(ctx, worker, "worker-status").unwrap_or_else(
-        |error| json!({"status":"tools_unknown","ok":false,"error":error.to_string()}),
-    );
-    let herdr = worker_herdr_status(ctx, worker, "worker-status").unwrap_or_else(
-        |error| json!({"status":"herdr_unknown","ok":false,"error":error.to_string()}),
-    );
-    let auth = worker_auth_status(ctx, worker, "worker-status").unwrap_or_else(
-        |error| json!({"status":"auth_unknown","ok":false,"error":error.to_string()}),
-    );
-    let tailscale = tailscale_status(ctx, worker, "worker-status").unwrap_or_else(
-        |error| json!({"status":"tailscale_unknown","ok":false,"error":error.to_string()}),
-    );
+    let resolved = match hosts::resolve(ctx, worker) {
+        Ok(value) => value,
+        Err(error) => {
+            return failed(
+                "worker_unknown",
+                &error.to_string(),
+                json!({"worker":worker}),
+            )
+        }
+    };
+    let probe = worker_probe(ctx, worker, details)
+        .unwrap_or_else(|error| json!({"error":error.to_string()}));
+    let section = |name: &str| {
+        probe.get(name).cloned().unwrap_or_else(
+            || json!({"ok":false,"status":format!("{name}_unknown"),"error":probe["error"]}),
+        )
+    };
+    let workspace = section("workspace");
+    let tools = section("tools");
+    let mut herdr = section("herdr");
+    let auth = section("auth");
+    let mut tailscale = section("tailscale");
+    let existing = resolved.provider == Provider::Existing;
+    let provider = if existing {
+        let system = probe.pointer("/metadata/os/system").and_then(Value::as_str);
+        let observed = match system {
+            Some("Darwin") => "macos",
+            Some("Linux") => "linux",
+            _ => "unknown",
+        };
+        let expected = ctx.fleet["hosts"][&resolved.host_id]["platform"]
+            .as_str()
+            .unwrap_or("auto");
+        let ready = observed != "unknown" && (expected == "auto" || expected == observed);
+        ok_field(
+            if ready { "present" } else { "host_unknown" },
+            ready,
+            json!({"host":resolved.host_id,"platform":observed,"provider":"existing"}),
+        )
+    } else {
+        provider_inspect(ctx, worker, Some(inventory)).unwrap_or_else(
+            |error| json!({"ok":false,"status":"provider_unknown","error":error.to_string()}),
+        )
+    };
+    if worker_profile.is_object() && herdr["herdr_ready"] == true {
+        let runtime=herdr_profile_runtime_status(ctx,worker,&resolved.session,&worker_profile)
+            .unwrap_or_else(|error|json!({"ok":false,"status":"herdr_profile_unknown","error":error.to_string()}));
+        if runtime["ok"] != true {
+            herdr = merge(json!({"herdr_ready":false}), runtime);
+        }
+    }
+    if !existing && tailscale["ok"] == true {
+        let expected_dns = format!(
+            "{}.{}",
+            worker,
+            ctx.fleet["tailnet_suffix"].as_str().unwrap_or("")
+        );
+        let dns = tailscale
+            .pointer("/tailscale/Self/DNSName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end_matches('.');
+        let suffix = tailscale
+            .pointer("/tailscale/CurrentTailnet/MagicDNSSuffix")
+            .or_else(|| tailscale.pointer("/tailscale/CurrentTailnet/Name"));
+        let tag = ctx.fleet["tailscale_tag"].as_str().unwrap_or("tag:workenv");
+        let tagged = tailscale
+            .pointer("/tailscale/Self/Tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|value| value == tag));
+        if dns != expected_dns || suffix != Some(&ctx.fleet["tailnet_suffix"]) || !tagged {
+            tailscale["ok"] = json!(false);
+            tailscale["status"] = json!("tailscale_mismatch");
+        }
+    }
     let tasks = open_task_records(ctx, worker).unwrap_or_else(|error| {
         vec![json!({"task_id":"unreadable-record","status":"unknown","error":error.to_string()})]
     });
@@ -1642,11 +1995,15 @@ fn worker_status(ctx: &Context, worker: &str, inventory: &Value) -> Value {
     if herdr.get("herdr_ready") != Some(&json!(true)) {
         blockers.push(json!({"kind":"herdr", "status": herdr.get("status")}));
     }
-    if tailscale.get("ok") != Some(&json!(true)) {
+    if !existing && tailscale.get("ok") != Some(&json!(true)) {
         blockers.push(json!({"kind":"tailscale", "status": tailscale.get("status")}));
     }
-    if auth.get("ready") != Some(&json!(true)) {
-        blockers.push(json!({"kind":"auth", "status": auth.get("status")}));
+    let cli = probe
+        .pointer("/metadata/cli_install/workenv")
+        .cloned()
+        .unwrap_or_else(|| json!({"available":false,"status":"cli_unknown"}));
+    if cli["available"] != true {
+        blockers.push(json!({"kind":"cli","status":cli["status"]}));
     }
     let available = blockers.is_empty();
     let status = if available {
@@ -1671,6 +2028,11 @@ fn worker_status(ctx: &Context, worker: &str, inventory: &Value) -> Value {
             "herdr": herdr,
             "tailscale": tailscale,
             "auth": auth,
+            "agent_ready":auth["ready"]==true,
+            "cli":cli,
+            "disk":probe.pointer("/metadata/disk"),
+            "probe_elapsed_ms":probe["elapsed_ms"],
+            "probes":probe["probes"],
             "ownership": {"open_tasks": tasks},
             "blockers": blockers,
         }),
@@ -1698,7 +2060,7 @@ fn workspace_status(ctx: &Context, worker: &str) -> Result<Value> {
     workspace_request(
         ctx,
         worker,
-        json!({"operation":"status", "request_id": format!("native-status-{worker}")}),
+        json!({"operation":"status", "request_id": observation_key(&format!("native-status-{worker}"))}),
         &observation_key(&format!("workspace-status:{worker}")),
         "Inspect remote workspace state.",
         30_000,
@@ -1719,9 +2081,9 @@ fn workspace_request(
         worker,
         vec![
             "python3".into(),
-            format!("{}/remote/workspace.py", remote_root(ctx)),
+            format!("{}/remote/workspace.py", environment_root(ctx, worker)?),
             "--root".into(),
-            remote_root(ctx),
+            ctx.worker_root(worker)?.to_string_lossy().into_owned(),
             "--request-base64".into(),
             encoded,
         ],
@@ -1739,7 +2101,19 @@ fn remote_json(
     purpose: &str,
     timeout_ms: u64,
 ) -> Result<Value> {
-    let output = ctx.ssh(worker, argv, key, purpose, timeout_ms)?;
+    let tools_env = matches!(argv.first().map(String::as_str), Some("apoc" | "herdr"));
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv,
+            stdin: None,
+            cwd: Some(PathBuf::from("/")),
+            tools_env,
+            key: key.into(),
+            purpose: purpose.into(),
+            timeout_ms,
+        },
+    )?;
     if output.exit_code != Some(0) {
         bail!(
             "remote command failed: {}",
@@ -1775,12 +2149,17 @@ fn remote_shell(
     purpose: &str,
     timeout_ms: u64,
 ) -> Result<Value> {
-    let output = ctx.ssh(
+    let output = ctx.remote(
         worker,
-        vec!["bash".into(), "-lc".into(), command.into()],
-        key,
-        purpose,
-        timeout_ms,
+        RemoteCommandSpec {
+            argv: vec!["bash".into(), "-lc".into(), command.into()],
+            stdin: None,
+            cwd: Some(PathBuf::from("/")),
+            tools_env: false,
+            key: key.into(),
+            purpose: purpose.into(),
+            timeout_ms,
+        },
     )?;
     Ok(ok_field(
         if output.exit_code == Some(0) {
@@ -1793,11 +2172,23 @@ fn remote_shell(
     ))
 }
 
-fn source_archive(root: &Path) -> Result<Vec<u8>> {
+fn source_archive(
+    root: &Path,
+    artifact_root: &Path,
+    include_tool_artifacts: bool,
+) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut tar = Builder::new(&mut encoder);
-        for dir in ["bootstrap", "remote", "devenv", "herdr"] {
+        for dir in [
+            "bootstrap",
+            "remote",
+            "devenv",
+            "herdr",
+            "src",
+            "tests",
+            "scripts",
+        ] {
             add_dir(&mut tar, root, &root.join(dir))?;
         }
         for name in [
@@ -1806,13 +2197,18 @@ fn source_archive(root: &Path) -> Result<Vec<u8>> {
             "devenv.yaml",
             "devenv.lock",
             "tools.json",
+            "Cargo.toml",
+            "Cargo.lock",
+            "fleet.json",
         ] {
             let path = root.join(name);
             if path.is_file() {
                 tar.append_path_with_name(&path, name)?;
             }
         }
-        add_manifest_tool_archives(&mut tar, root)?;
+        if include_tool_artifacts {
+            add_manifest_tool_archives(&mut tar, artifact_root)?;
+        }
         tar.finish()?;
     }
     encoder.flush()?;
@@ -1826,11 +2222,16 @@ fn add_manifest_tool_archives<W: Write>(tar: &mut Builder<W>, root: &Path) -> Re
             let Some(archive) = artifact.get("archive").and_then(Value::as_str) else {
                 continue;
             };
-            let path = root.join(".state/tool-builds").join(archive);
+            let artifact_dir = if root.join(".state/tool-builds").join(archive).is_file() {
+                root.join(".state/tool-builds")
+            } else {
+                root.join("tool-builds")
+            };
+            let path = artifact_dir.join(archive);
             verify_manifest_archive(&path, artifact)?;
             tar.append_path_with_name(&path, Path::new("tool-builds").join(archive))?;
             if let Some(sidecar) = artifact.get("sha256_sidecar").and_then(Value::as_str) {
-                let sidecar_path = root.join(".state/tool-builds").join(sidecar);
+                let sidecar_path = artifact_dir.join(sidecar);
                 if sidecar_path.is_file() {
                     tar.append_path_with_name(
                         &sidecar_path,
@@ -2103,20 +2504,74 @@ fn connection_target(ctx: &Context, worker: &str) -> Result<String> {
     worker_ssh_target(&ctx.fleet, worker)
 }
 
-fn remote_root(ctx: &Context) -> String {
-    ctx.fleet
-        .get("remote_root")
-        .and_then(Value::as_str)
-        .unwrap_or(REMOTE_ROOT)
-        .to_string()
+fn environment_root(ctx: &Context, worker: &str) -> Result<String> {
+    Ok(ctx
+        .worker_environment_root(worker)?
+        .to_string_lossy()
+        .into_owned())
 }
 
-fn herdr_session(ctx: &Context) -> String {
-    ctx.fleet
-        .get("herdr_session")
-        .and_then(Value::as_str)
-        .unwrap_or("workenv")
-        .to_string()
+fn shared_tool_command(ctx: &Context, worker: &str, command: &str) -> Result<String> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    let root = shell_quote(&resolved.environment_root.to_string_lossy());
+    Ok(match resolved.tools {
+        ResolvedTools::Devenv { executable } => format!(
+            "cd {root} && {} shell -- {command}",
+            shell_quote(&executable)
+        ),
+        ResolvedTools::Native => format!(
+            "export PATH={}:$HOME/.local/bin:$PATH; cd {root} && {command}",
+            shell_quote(&format!(
+                "{}/bin",
+                resolved.environment_root.to_string_lossy()
+            ))
+        ),
+    })
+}
+
+fn worker_probe(ctx: &Context, worker: &str, details: bool) -> Result<Value> {
+    let resolved = hosts::resolve(ctx, worker)?;
+    let mut argv = vec![
+        "python3".into(),
+        format!(
+            "{}/remote/worker_health.py",
+            resolved.environment_root.to_string_lossy()
+        ),
+        "--root".into(),
+        resolved.root.to_string_lossy().into_owned(),
+        "--session".into(),
+        resolved.session,
+        "--tools".into(),
+        if matches!(resolved.tools, ResolvedTools::Native) {
+            "native".into()
+        } else {
+            "devenv".into()
+        },
+    ];
+    if details {
+        argv.push("--details".into());
+    }
+    let argv = profiles::wrap(ctx, worker, argv, false)?;
+    let output = ctx.remote(
+        worker,
+        RemoteCommandSpec {
+            argv,
+            stdin: None,
+            cwd: Some(PathBuf::from("/")),
+            tools_env: true,
+            timeout_ms: 30_000,
+            key: observation_key(&format!("worker-probe:{worker}")),
+            purpose: format!("Inspect worker {worker} with bounded parallel health probes."),
+        },
+    )?;
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Worker health probe {} did not return JSON (exit {:?}): {}",
+            output.execution_id,
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn find_herdr_machine(
@@ -2130,8 +2585,8 @@ fn find_herdr_machine(
         .or_else(|| machines.get("machines").and_then(Value::as_array))?;
     rows.iter()
         .find(|machine| {
-            machine.get("target") == Some(&json!(target))
-                || (machine.get("label") == Some(&json!(worker))
+            machine.get("label") == Some(&json!(worker))
+                || (machine.get("target") == Some(&json!(target))
                     && machine.get("session") == Some(&json!(session)))
         })
         .cloned()

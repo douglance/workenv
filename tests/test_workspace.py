@@ -567,13 +567,32 @@ def test_collect_preserves_staged_and_unstaged_patches_separately(tmp_path, orig
     assert b"+unstaged" in Path(collected["archives"]["unstaged_diff"]).read_bytes()
 
 
-def test_receipt_paths_are_collision_proof_for_similar_request_ids(tmp_path):
-    first = call_helper(tmp_path, {"operation": "status", "request_id": "same/name"})
-    second = call_helper(tmp_path, {"operation": "status", "request_id": "same_name"})
+def test_receipt_paths_are_collision_proof_for_similar_request_ids(tmp_path, origin_repo):
+    call_helper(tmp_path, claim_request(origin_repo))
+    first = call_helper(
+        tmp_path,
+        {
+            "operation": "record-runtime",
+            "request_id": "same/name",
+            "task_id": "task-a",
+            "revision": origin_repo["first"],
+            "runtime": {"apoc_execution_ids": ["exec-1"]},
+        },
+    )
+    second = call_helper(
+        tmp_path,
+        {
+            "operation": "record-runtime",
+            "request_id": "same_name",
+            "task_id": "task-a",
+            "revision": origin_repo["first"],
+            "runtime": {"apoc_execution_ids": ["exec-2"]},
+        },
+    )
 
-    assert first["status"] == "available"
-    assert second["status"] == "available"
-    receipts = sorted((tmp_path / "worker/state/receipts").glob("*.json"))
+    assert first["status"] == "runtime_recorded"
+    assert second["status"] == "runtime_recorded"
+    receipts = sorted(path for path in (tmp_path / "worker/state/receipts").glob("*.json") if path.name.startswith("same_name."))
     assert len(receipts) == 2
     assert receipts[0].name != receipts[1].name
 
