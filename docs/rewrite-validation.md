@@ -17,18 +17,19 @@ sessions, credentials, and legacy state were not replaced. Linux acceptance used
 separate build and canary directories on `workenv-02.exe.xyz`. No global binary
 or PATH installation was changed. `fleet.json` remains migration input only.
 
-## Final Linux artifact
+## Linux canary artifact
 
 | Field | Value |
 | --- | --- |
-| Package | `/nix/store/qn2ni3sfgbk17gkw883fakqyjkhc0i7l-workenv-0.2.0` |
+| Implementation revision | `b4f734b727c7127f962cb41f7fce293e958b2df0` |
+| Package | `/nix/store/fm64lpwr55hm50x90xv0j4lqq3qxq9rh-workenv-0.2.0` |
 | CLI SHA-256 | `50ca9f5681f40ee12148929d4aca95dfa25243ec0029c6ea3079315af2b2fb59` |
-| Filtered source | `/nix/store/2sm1d92f148yi8m0xf8gn44c0fw63my0-source` |
-| Source NAR hash | `sha256-aIzYFU9HLrQn3fyKba7E3H7E0amMeU0vO/5XUggItCU=` |
-| Source NAR size | 514960 bytes |
-| Nix build | `01a085ae-e767-7641-b99e-d3264803b6d5` |
-| Artifact validation | `01a085b2-9ec4-7b93-b90b-999afd715866` |
-| Source hash capture | `01a085b3-74c5-7ea2-93d5-56809f1f2552` |
+| Filtered source | `/nix/store/5jk4iq2r2s8g93y3z735wr18868gbvml-source` |
+| Source NAR hash | `sha256-ANKTXBvbLXBQY9WRTSWuOHNr8+5dCpOgCorWvnajQmU=` |
+| Source NAR size | 514984 bytes |
+| Nix build | `01a085c1-fc10-7d22-b991-3650112094e3` |
+| Artifact validation | `01a085c5-bfeb-7da1-84cb-af9e0e7ffc58` |
+| Source hash capture | `01a085c6-0d18-73c2-93d4-3d0abc224009` |
 
 The package contains the CLI and all seven adapter executables. This is an
 isolated Nix installation, not a fleet-wide promotion. The source filter excludes
@@ -116,10 +117,50 @@ and `/nix/store/7gvd1i12x2v1vi8lccmn6k3q236p6lvq-workenv-external-example-2.0.0`
 | Existing local Mac Nix/devenv environment | `/nix` absent; noninteractive sudo requires administrator interaction | Complete the verified Nix installer step, then run the Mac canary |
 | Dedicated exe.dev create/configure/connect/destroy | All 16 CPUs and 64 GB memory allocated across six existing VMs | Authorize capacity from an existing VM or provide another available allocation |
 | Remaining-machine migration and promotion | Both required canaries have not passed | Keep active installations in place until Mac/provider acceptance passes |
-| Four-target release artifacts | Build matrix configured; hosted results recorded separately | Run and verify Linux/macOS x86-64/ARM64 builds |
 
 The bootstrap installer prepared for the Mac is Nix 2.35.2 from the official
 release URL. Its verified SHA-256 is
 `9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c`.
 No existing VM was resized or deleted to make room for acceptance, and no plan
 upgrade was purchased.
+
+## Hosted release artifacts
+
+Release Build run `34341724177` passed for all four targets at implementation
+revision `b4f734b727c7127f962cb41f7fce293e958b2df0`. All downloaded archives matched
+their accompanying SHA-256 files (APoC `01a085d8-946d-7dc2-8c5a-357aaad64639`).
+
+| Target | Archive SHA-256 | Runtime evidence |
+| --- | --- | --- |
+| Linux x86-64 | `cd2585094c7e8871e2f685e47e126972d4038acca9b5ba2003fd2a6857b7bd79` | Downloaded CLI ran outside Nix on worker 02; `01a085d9-27d4-75a2-93e3-7819e1c23752` |
+| Linux ARM64 | `f891da8b5fd446ed540ab2b197ebd981fcaa5285a0bf53303a40015ffce21597` | Hosted build only |
+| macOS x86-64 | `1801ca4ebcbc29613fa20549847e5a598c8e1eb11e69ce2b58ccf593a04bc400` | Hosted build only |
+| macOS ARM64 | `5e59492cdbfdf71a683a5ab5949fd8083e83b4ea404038a479937b6083778153` | Downloaded CLI ran locally; `01a085cd-c785-7222-b154-5d198de76ad9` |
+
+These are CI artifacts, not a published release or installed fleet update.
+Quality run `34341724174` exhausted the Linux runner disk while building upstream
+devenv dependencies. Commit `719e245` enables the official upstream binary caches;
+replacement Quality run `34343120731` is pending at this record's last update.
+
+## Bootstrap follow-up
+
+The bootstrap adapter now permits installs into writable user directories when
+Nix is already available. Missing Nix and protected install paths still require
+administrator privileges. A seed-only install creates its link directory even
+when devenv is already ready.
+
+Seven bootstrap tests passed (`01a085da-384c-7d10-b0cf-ab0f33a70a16`), along with
+formatting (`01a085da-393a-7f32-b958-0251e79b48eb`), Clippy
+(`01a085da-f367-7ad1-b114-1748ef650900`), and the workspace source policy
+(`01a085da-f3eb-7e01-93b0-a06981681b52`). Retrying the isolated Mac bootstrap
+with this adapter still returned `privilege_required`, with no install execution
+started (`01a085da-05cb-77c1-b407-5252c0b50742`). The release archives and Linux Nix
+package above predate this follow-up; their hashes do not represent the updated
+bootstrap executable.
+
+The corrected adapter also passed a real Linux seed install into a fresh nested
+user directory. The first call returned `changed`, the repeat returned `ready`,
+and the installed seed retained the expected SHA-256. Build execution:
+`01a085db-f5c6-7400-a423-171f71694ed0`; live smoke:
+`01a085dd-e10e-7d50-be22-0e473715acf0`. Its isolated install location is
+`/home/exedev/workenv-rewrite-user-bootstrap-20260909/nested/bin/workenv-canary-seed`.

@@ -1,5 +1,6 @@
 //! Bootstrap adapter for installing Nix, devenv, and seed tools.
 mod config;
+mod privilege;
 mod scripts;
 #[cfg(test)]
 mod tests;
@@ -8,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use config::BootstrapConfig;
+use privilege::{can_install_without_privilege, has_privilege, privilege_required};
 use scripts::{install_script, probe_script};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -57,7 +59,7 @@ fn bootstrap(request: &AdapterRequest) -> Result<AdapterResponse> {
     if before["ready"] == true {
         return Ok(AdapterResponse::new(request, ResponseStatus::Ready, before));
     }
-    if !has_privilege(request)? {
+    if !can_install_without_privilege(request, &config, &before)? && !has_privilege(request)? {
         return Ok(response(
             request,
             ResponseStatus::Failed,
@@ -131,35 +133,6 @@ fn probe(
     Ok((parse_probe(&output.stdout, config), None))
 }
 
-fn has_privilege(request: &AdapterRequest) -> Result<bool> {
-    let script = "if [ \"$(id -u)\" -eq 0 ]; then exit 0; fi; sudo -n true";
-    Ok(run_target(request, script, Duration::from_secs(10), "privilege")?.exit_code == Some(0))
-}
-
-fn privilege_required(request: &AdapterRequest, config: &BootstrapConfig) -> Value {
-    let script = install_script(config);
-    let argv = request.target.address.as_deref().map_or_else(
-        || json!(["bash", "-lc", script]),
-        |address| {
-            json!([
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=15",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                address,
-                script
-            ])
-        },
-    );
-    json!({"ready":false,"status":"privilege_required",
-        "reason":"passwordless sudo or root is required to install Nix and devenv prerequisites",
-        "argv":argv,"shared_tools":"provided_by_devenv","cargo_runtime_required":false,
-        "seed_tools":seed_tool_data(config)})
-}
-
 fn parse_probe(text: &str, config: &BootstrapConfig) -> Value {
     let mut rows = serde_json::Map::new();
     for line in text.lines() {
@@ -186,7 +159,7 @@ fn parse_probe(text: &str, config: &BootstrapConfig) -> Value {
         "shared_tools":"provided_by_devenv","cargo_runtime_required":false})
 }
 
-fn run_target(
+pub(crate) fn run_target(
     request: &AdapterRequest,
     script: &str,
     timeout: Duration,
@@ -267,14 +240,6 @@ fn seed_tool_report(rows: &serde_json::Map<String, Value>, config: &BootstrapCon
             json!({"name":tool.name,"path":path,"sha256":hash,
                 "expected_sha256":tool.sha256,"ok":hash == tool.sha256})
         })
-        .collect()
-}
-
-fn seed_tool_data(config: &BootstrapConfig) -> Vec<Value> {
-    config
-        .seed_tools
-        .iter()
-        .map(|tool| json!({"name":tool.name,"source":tool.source,"sha256":tool.sha256}))
         .collect()
 }
 

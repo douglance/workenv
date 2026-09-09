@@ -54,8 +54,11 @@ nix_url={nix_url}
 nix_sha={nix_sha}
 devenv_version={devenv_version}
 devenv_flake={devenv_flake}
-sudo_cmd=
-if [ "$(id -u)" -ne 0 ]; then sudo_cmd="sudo -n"; fi
+{writable_paths}
+prefix_sudo=
+link_sudo=
+if sudo_for_path "$prefix"; then prefix_sudo="sudo -n"; fi
+if sudo_for_path "$link_dir"; then link_sudo="sudo -n"; fi
 PATH="/nix/var/nix/profiles/default/bin:$link_dir:$PATH"
 if ! nix --version 2>/dev/null | grep -F "$nix_version" >/dev/null; then
   tmp="$(mktemp -d)"
@@ -69,9 +72,10 @@ if [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
   . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 fi
 if ! devenv version 2>/dev/null | grep -F "$devenv_version" >/dev/null; then
-  $sudo_cmd install -d -m 0755 "$prefix" "$link_dir"
-  nix --extra-experimental-features "nix-command flakes" profile install --accept-flake-config --profile "$prefix/nix-profile" "$devenv_flake"
-  $sudo_cmd ln -sfn "$prefix/nix-profile/bin/devenv" "$link_dir/devenv"
+  $prefix_sudo install -d -m 0755 "$prefix"
+  $link_sudo install -d -m 0755 "$link_dir"
+  $prefix_sudo nix --extra-experimental-features "nix-command flakes" profile install --accept-flake-config --profile "$prefix/nix-profile" "$devenv_flake"
+  $link_sudo ln -sfn "$prefix/nix-profile/bin/devenv" "$link_dir/devenv"
 fi
 {tool_installs}
 "#,
@@ -81,8 +85,46 @@ fi
         nix_url = shell_quote(&config.nix_url),
         nix_sha = shell_quote(&config.nix_sha256),
         devenv_version = shell_quote(&config.devenv_version),
-        devenv_flake = shell_quote(&config.devenv_flake)
+        devenv_flake = shell_quote(&config.devenv_flake),
+        writable_paths = writable_paths_script()
     )
+}
+
+pub(crate) fn can_install_without_privilege_script(
+    config: &BootstrapConfig,
+    report: &serde_json::Value,
+) -> String {
+    let nix_ready = report["nix"]["ok"] == true;
+    format!(
+        r#"set -eu
+prefix={prefix}
+link_dir={link_dir}
+{writable_paths}
+if [ {nix_ready} != true ]; then exit 1; fi
+can_write_path "$prefix" && can_write_path "$link_dir"
+"#,
+        prefix = shell_quote(&config.prefix),
+        link_dir = shell_quote(&config.link_dir),
+        nix_ready = if nix_ready { "true" } else { "false" },
+        writable_paths = writable_paths_script()
+    )
+}
+
+fn writable_paths_script() -> &'static str {
+    r#"can_write_path() {
+  path="$1"
+  while [ ! -e "$path" ]; do
+    parent="$(dirname "$path")"
+    if [ "$parent" = "$path" ]; then return 1; fi
+    path="$parent"
+  done
+  [ -d "$path" ] && [ -w "$path" ] && [ -x "$path" ]
+}
+sudo_for_path() {
+  if [ "$(id -u)" -eq 0 ]; then return 1; fi
+  if can_write_path "$1"; then return 1; fi
+  return 0
+}"#
 }
 
 fn tool_install_script(tool: &SeedTool) -> String {
@@ -104,7 +146,8 @@ if [ "$tool_actual" != "$tool_sha" ]; then
   esac
   actual="$(shasum -a 256 "$tmp_tool" | awk '{{print $1}}')"
   if [ "$actual" != "$tool_sha" ]; then echo "$tool_name sha256 mismatch" >&2; exit 1; fi
-  $sudo_cmd install -m 0755 "$tmp_tool" "$link_dir/$tool_name"
+  $link_sudo install -d -m 0755 "$link_dir"
+  $link_sudo install -m 0755 "$tmp_tool" "$link_dir/$tool_name"
   rm -f "$tmp_tool"
 fi
 "#,
