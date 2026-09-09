@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::{json, Map, Value};
@@ -15,6 +15,7 @@ use tar::Builder;
 use uuid::Uuid;
 
 use crate::process::{read_json, shell_quote, worker_ssh_target, write_json};
+use crate::profiles;
 use crate::{CommandSpec, Context};
 
 const REMOTE_ROOT: &str = "/home/exedev/workenv";
@@ -88,6 +89,7 @@ pub fn connection(ctx: &Context, selector: &str) -> Result<Value> {
         "connection",
         json!({
             "worker": worker,
+            "worker_profile": profiles::binding(ctx, &worker)?,
             "session": session,
             "target": target,
             "machine": machine,
@@ -144,6 +146,62 @@ pub fn down(ctx: &Context, selector: &str, key: &str) -> Result<Value> {
     ))
 }
 
+pub fn begin_profile_change(ctx: &Context, selector: &str, key: &str) -> Result<Value> {
+    if key.is_empty() {
+        bail!("key is required");
+    }
+    let worker = ctx.worker_name(selector)?;
+    let open_tasks = open_task_records(ctx, &worker)?;
+    if !open_tasks.is_empty() {
+        return Ok(failed(
+            "worker_has_open_task",
+            "worker has central task records that are not released",
+            json!({"worker": worker, "tasks": open_tasks}),
+        ));
+    }
+    let reservation = reserve_worker_maintenance(ctx, &worker, key)?;
+    if reservation["ok"] != true {
+        return Ok(reservation);
+    }
+    let result = (|| -> Result<Value> {
+        let open_tasks = open_task_records(ctx, &worker)?;
+        if !open_tasks.is_empty() {
+            return Ok(failed(
+                "worker_has_open_task",
+                "worker has central task records that are not released",
+                json!({"worker": worker, "tasks": open_tasks}),
+            ));
+        }
+        let stopped = stop_owned_herdr_runtime(ctx, &worker, key)?;
+        if stopped["ok"] != true {
+            return Ok(stopped);
+        }
+        Ok(ok(
+            "profile_change_ready",
+            json!({"worker": worker, "reservation": reservation, "stopped": stopped}),
+        ))
+    })();
+    match result {
+        Ok(value) if value["ok"] == true => Ok(value),
+        Ok(value) => {
+            release_worker_maintenance(ctx, &worker, key)?;
+            Ok(value)
+        }
+        Err(error) => {
+            release_worker_maintenance(ctx, &worker, key)?;
+            Err(error)
+        }
+    }
+}
+
+pub fn end_profile_change(ctx: &Context, selector: &str, key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("key is required");
+    }
+    let worker = ctx.worker_name(selector)?;
+    release_worker_maintenance(ctx, &worker, key)
+}
+
 pub fn doctor(ctx: &Context) -> Result<Value> {
     let inventory = provider_inventory(ctx, &observation_key("worker-doctor-provider"))
         .unwrap_or_else(
@@ -162,6 +220,7 @@ pub fn doctor(ctx: &Context) -> Result<Value> {
 }
 
 fn up_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+    let worker_profile = profiles::binding(ctx, worker)?;
     let open_tasks = open_task_records(ctx, worker)?;
     if !open_tasks.is_empty() {
         return Ok(failed(
@@ -226,6 +285,12 @@ fn up_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
         return Ok(bootstrap);
     }
 
+    let profile_prepare = profiles::prepare(ctx, worker, key)?;
+    if profile_prepare.get("ok") != Some(&json!(true)) {
+        release_worker_maintenance(ctx, worker, key)?;
+        return Ok(profile_prepare);
+    }
+
     let health = bootstrap_health(ctx, worker, key)?;
     if health.get("ok") == Some(&json!(false)) {
         release_worker_maintenance(ctx, worker, key)?;
@@ -260,7 +325,7 @@ fn up_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
             return Ok(ok_field(
                 "auth_required",
                 false,
-                json!({"worker": worker, "provider": provider, "source_sync": source_sync, "bootstrap": bootstrap, "health": health, "tools": tools, "herdr": herdr, "registration": registration, "tailscale": tailscale, "enrollment": enrollment, "remote_status": remote_status, "reservation": reservation}),
+                json!({"worker": worker, "worker_profile": worker_profile, "provider": provider, "source_sync": source_sync, "bootstrap": bootstrap, "profile_prepare": profile_prepare, "health": health, "tools": tools, "herdr": herdr, "registration": registration, "tailscale": tailscale, "enrollment": enrollment, "remote_status": remote_status, "reservation": reservation}),
             ));
         }
         tailscale = tailscale_status(ctx, worker, key)?;
@@ -292,11 +357,13 @@ fn up_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
         ready,
         json!({
             "worker": worker,
+            "worker_profile": worker_profile,
             "provider": provider,
             "remote_status": remote_status,
             "reservation": reservation,
             "source_sync": source_sync,
             "bootstrap": bootstrap,
+            "profile_prepare": profile_prepare,
             "health": health,
             "tools": tools,
             "herdr": herdr,
@@ -502,7 +569,7 @@ fn provider_capacity_blocker(
     Ok(None)
 }
 
-fn sync_worker_sources(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+pub(crate) fn sync_worker_sources(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
     let archive = source_archive(&ctx.root)?;
     let remote_script = "import pathlib,sys,tarfile; root=pathlib.Path(sys.argv[1]); root.mkdir(parents=True,exist_ok=True); archive=tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz'); archive.extractall(path=root,filter='data'); assert (root/'devenv.nix').is_file(); assert (root/'remote/tool_health.py').is_file(); print('workenv-source-sync-v1')";
     let output = ctx.runtime.run(CommandSpec {
@@ -544,7 +611,7 @@ fn sync_worker_sources(ctx: &Context, worker: &str, key: &str) -> Result<Value> 
     ))
 }
 
-fn bootstrap_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
+pub(crate) fn bootstrap_worker(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
     remote_shell(
         ctx,
         worker,
@@ -591,12 +658,30 @@ fn worker_tool_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> 
 
 pub fn start_worker_herdr(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
     let session = herdr_session(ctx);
-    let command = format!(
-        "WORKENV_ROOT={} WORKENV_HERDR_SESSION={} WORKENV_BOOT_ID={} /opt/workenv/bin/workenv-herdr-bootstrap",
-        shell_quote(&remote_root(ctx)),
-        shell_quote(&session),
-        shell_quote(key),
-    );
+    let worker_profile = profiles::binding(ctx, worker)?;
+    let profile_runtime =
+        persist_worker_profile_runtime_binding(ctx, worker, key, &worker_profile)?;
+    if profile_runtime.get("ok") != Some(&json!(true)) {
+        return Ok(profile_runtime);
+    }
+    let mut env = vec![
+        format!("WORKENV_ROOT={}", shell_quote(&remote_root(ctx))),
+        format!("WORKENV_HERDR_SESSION={}", shell_quote(&session)),
+        format!("WORKENV_BOOT_ID={}", shell_quote(key)),
+    ];
+    if let Some(name) = worker_profile.get("name").and_then(Value::as_str) {
+        env.push(format!("WORKENV_IDENTITY_PROFILE={}", shell_quote(name)));
+        env.push(format!(
+            "WORKENV_IDENTITY_DIGEST={}",
+            shell_quote(
+                worker_profile
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            )
+        ));
+    }
+    let command = format!("{} /opt/workenv/bin/workenv-herdr-bootstrap", env.join(" "));
     let boot = remote_shell(
         ctx,
         worker,
@@ -605,6 +690,13 @@ pub fn start_worker_herdr(ctx: &Context, worker: &str, key: &str) -> Result<Valu
         &format!("Start workenv Herdr server on {worker}."),
         120_000,
     )?;
+    if boot.get("ok") != Some(&json!(true)) {
+        return Ok(failed(
+            "herdr_boot_failed",
+            "workenv Herdr bootstrap failed",
+            json!({"worker": worker, "worker_profile": worker_profile, "profile_runtime": profile_runtime, "boot": boot, "herdr_ready": false}),
+        ));
+    }
     let herdr = worker_herdr_status(ctx, worker, key)?;
     if herdr.get("ok") != Some(&json!(true)) {
         return Ok(merge(json!({"boot": boot}), herdr));
@@ -618,8 +710,60 @@ pub fn start_worker_herdr(ctx: &Context, worker: &str, key: &str) -> Result<Valu
     }
     Ok(ok(
         "herdr_ready",
-        json!({"worker": worker, "boot": boot, "herdr_status": herdr, "sidebar": sidebar, "herdr_ready": true}),
+        json!({"worker": worker, "worker_profile": worker_profile, "profile_runtime": profile_runtime, "boot": boot, "herdr_status": herdr, "sidebar": sidebar, "herdr_ready": true}),
     ))
+}
+
+fn persist_worker_profile_runtime_binding(
+    ctx: &Context,
+    worker: &str,
+    key: &str,
+    binding: &Value,
+) -> Result<Value> {
+    let encoded = BASE64.encode(serde_json::to_vec(binding)?);
+    let script = r#"
+import base64, json, os, pathlib, sys, uuid
+root = pathlib.Path(sys.argv[1])
+encoded = sys.argv[2]
+state = root / ".state"
+path = state / "identity-profile.json"
+state.mkdir(parents=True, exist_ok=True)
+for parent in [state, root]:
+    if parent.is_symlink():
+        raise SystemExit("managed runtime path is a symlink")
+binding = json.loads(base64.b64decode(encoded).decode())
+if binding is None:
+    if path.exists():
+        path.unlink()
+    print(json.dumps({"ok": True, "status": "profile_runtime_unassigned", "path": str(path)}))
+    raise SystemExit(0)
+payload = json.dumps(binding, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+if path.exists() and path.read_bytes() == payload:
+    print(json.dumps({"ok": True, "status": "profile_runtime_recorded", "path": str(path), "replayed": True}))
+    raise SystemExit(0)
+tmp = path.with_name(path.name + ".tmp." + uuid.uuid4().hex)
+with tmp.open("xb") as handle:
+    os.chmod(tmp, 0o600)
+    handle.write(payload)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, path)
+print(json.dumps({"ok": True, "status": "profile_runtime_recorded", "path": str(path), "replayed": False}))
+"#;
+    remote_json(
+        ctx,
+        worker,
+        vec![
+            "python3".into(),
+            "-c".into(),
+            script.into(),
+            remote_root(ctx),
+            encoded,
+        ],
+        &format!("{key}:profile-runtime-binding:{worker}"),
+        &format!("Record selected worker profile descriptor for boot on {worker}."),
+        60_000,
+    )
 }
 
 fn setup_worker_herdr_sidebar(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
@@ -806,6 +950,7 @@ fn plugin_log_failed(log: &Value) -> bool {
 
 pub fn worker_herdr_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> {
     let session = herdr_session(ctx);
+    let worker_profile = profiles::binding(ctx, worker)?;
     let command = format!(
         "cd {} && /usr/local/bin/devenv shell -- herdr --session {} status server --json",
         shell_quote(&remote_root(ctx)),
@@ -826,23 +971,110 @@ pub fn worker_herdr_status(ctx: &Context, worker: &str, _key: &str) -> Result<Va
         && payload.get("server_binary_stale") == Some(&json!(false))
         && payload.pointer("/capabilities/detached_server_daemon") == Some(&json!(true));
     if ready {
+        if worker_profile.is_object() {
+            let runtime = herdr_profile_runtime_status(ctx, worker, &session, &worker_profile)?;
+            if runtime.get("ok") != Some(&json!(true)) {
+                return Ok(merge(
+                    json!({"worker": worker, "worker_profile": worker_profile, "herdr_ready": false, "server": payload}),
+                    runtime,
+                ));
+            }
+            return Ok(ok(
+                "herdr_ready",
+                json!({"worker": worker, "worker_profile": worker_profile, "herdr_ready": true, "server": payload, "runtime": runtime}),
+            ));
+        }
         Ok(ok(
             "herdr_ready",
-            json!({"worker": worker, "herdr_ready": true, "server": payload}),
+            json!({"worker": worker, "worker_profile": worker_profile, "herdr_ready": true, "server": payload}),
         ))
     } else if payload.get("server_binary_stale") == Some(&json!(true)) {
         Ok(failed(
             "herdr_stale",
             "worker Herdr server binary is stale",
-            json!({"worker": worker, "herdr_ready": false, "server": payload}),
+            json!({"worker": worker, "worker_profile": worker_profile, "herdr_ready": false, "server": payload}),
         ))
     } else {
         Ok(failed(
             "herdr_not_ready",
             "worker Herdr server is not healthy",
-            json!({"worker": worker, "herdr_ready": false, "server": payload}),
+            json!({"worker": worker, "worker_profile": worker_profile, "herdr_ready": false, "server": payload}),
         ))
     }
+}
+
+fn herdr_profile_runtime_status(
+    ctx: &Context,
+    worker: &str,
+    session: &str,
+    expected_profile: &Value,
+) -> Result<Value> {
+    let list = list_worker_executions(ctx, worker)?;
+    let mut inspected = Vec::new();
+    for summary in list
+        .get("executions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        if matches!(
+            summary["status"].as_str(),
+            Some("completed" | "failed" | "canceled" | "cancelled" | "skipped")
+        ) {
+            continue;
+        }
+        let execution_id = summary["id"]
+            .as_str()
+            .context("Remote execution summary has no ID")?;
+        let execution = remote_json(
+            ctx,
+            worker,
+            vec![
+                "apoc".into(),
+                "execution".into(),
+                "get".into(),
+                execution_id.into(),
+                "--purpose".into(),
+                "Inspect running workenv Herdr server profile.".into(),
+                "--verbosity".into(),
+                "trace".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+            &observation_key(&format!(
+                "herdr-profile-runtime-get:{worker}:{execution_id}"
+            )),
+            &format!("Inspect running workenv Herdr server profile {execution_id} on {worker}."),
+            60_000,
+        )?;
+        let execution = execution.get("data").cloned().unwrap_or(execution);
+        if !is_live_execution(&execution) {
+            continue;
+        }
+        let labels = execution_labels(&execution);
+        if labels.get("workenv.component") != Some(&"herdr-server".to_string())
+            || labels.get("herdr.session") != Some(&session.to_string())
+        {
+            continue;
+        }
+        inspected.push(json!({"execution_id": execution_id, "labels": labels}));
+        if runtime_profile_matches(&labels, expected_profile) {
+            return Ok(ok(
+                "herdr_profile_ready",
+                json!({"worker": worker, "inspected": inspected}),
+            ));
+        }
+        return Ok(failed(
+            "herdr_profile_mismatch",
+            "worker Herdr server profile does not match the configured worker profile",
+            json!({"worker": worker, "worker_profile": expected_profile, "execution_id": execution_id, "labels": labels, "inspected": inspected}),
+        ));
+    }
+    Ok(failed(
+        "herdr_profile_unknown",
+        "worker Herdr server is healthy but its APoC profile labels could not be verified",
+        json!({"worker": worker, "worker_profile": expected_profile, "inspected": inspected}),
+    ))
 }
 
 fn tailscale_status(ctx: &Context, worker: &str, key: &str) -> Result<Value> {
@@ -931,10 +1163,16 @@ fn worker_auth_status(ctx: &Context, worker: &str, _key: &str) -> Result<Value> 
         "cd {} && /usr/local/bin/devenv shell -- python3 remote/health.py",
         shell_quote(&remote_root(ctx))
     );
-    remote_json_shell(
+    let argv = profiles::wrap(
         ctx,
         worker,
-        &command,
+        vec!["bash".into(), "-lc".into(), command],
+        false,
+    )?;
+    remote_json(
+        ctx,
+        worker,
+        argv,
         &observation_key(&format!("auth-health:{worker}")),
         &format!("Inspect subscription authentication on {worker}."),
         120_000,
@@ -1137,6 +1375,7 @@ fn inspect_worker_runtime(
     known_workspace: Option<Value>,
 ) -> Result<Value> {
     let session = herdr_session(ctx);
+    let expected_profile = profiles::binding(ctx, worker)?;
     let remote_status = known_workspace.unwrap_or_else(|| {
         workspace_status(ctx, worker).unwrap_or_else(|error| {
             failed(
@@ -1228,6 +1467,13 @@ fn inspect_worker_runtime(
             && labels.get("herdr.session") == Some(&session)
             && is_live_execution(&execution)
         {
+            if !runtime_profile_matches(&labels, &expected_profile) {
+                return Ok(failed(
+                    "runtime_profile_mismatch",
+                    "idle Herdr server profile does not match the configured worker profile",
+                    json!({"worker": worker, "execution_id": execution_id, "labels": labels, "worker_profile": expected_profile}),
+                ));
+            }
             inspected.push(json!({"execution_id": execution_id, "labels": labels}));
             candidates.push(execution_id.to_string());
             continue;
@@ -1358,6 +1604,9 @@ fn stop_owned_herdr_runtime(ctx: &Context, worker: &str, key: &str) -> Result<Va
 }
 
 fn worker_status(ctx: &Context, worker: &str, inventory: &Value) -> Value {
+    let worker_profile = profiles::binding(ctx, worker).unwrap_or_else(
+        |error| json!({"status":"profile_unknown","ok":false,"error":error.to_string()}),
+    );
     let provider = provider_inspect(ctx, worker, Some(inventory))
         .unwrap_or_else(|error| json!({"status":"unknown","ok":false,"error":error.to_string()}));
     let workspace = workspace_status(ctx, worker)
@@ -1414,6 +1663,7 @@ fn worker_status(ctx: &Context, worker: &str, inventory: &Value) -> Value {
         available,
         json!({
             "worker": worker,
+            "worker_profile": worker_profile,
             "capacity": worker_capacity(ctx, worker).unwrap_or_else(|_| json!({})),
             "provider": provider,
             "agent_state": workspace,
@@ -1898,8 +2148,32 @@ fn execution_labels(execution: &Value) -> BTreeMap<String, String> {
                 labels.insert(key.clone(), value.to_string());
             }
         }
+    } else if let Some(array) = spec_labels.as_array() {
+        for value in array {
+            if let Some(label) = value.as_str() {
+                if let Some((key, value)) = label.split_once('=') {
+                    labels.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
     }
     labels
+}
+
+fn runtime_profile_matches(labels: &BTreeMap<String, String>, expected: &Value) -> bool {
+    match expected {
+        Value::Null => {
+            !labels.contains_key("workenv.profile")
+                && !labels.contains_key("workenv.profile.digest")
+        }
+        Value::Object(_) => {
+            labels.get("workenv.profile").map(String::as_str)
+                == expected.get("name").and_then(Value::as_str)
+                && labels.get("workenv.profile.digest").map(String::as_str)
+                    == expected.get("digest").and_then(Value::as_str)
+        }
+        _ => false,
+    }
 }
 
 fn json_items(value: &Value) -> Option<Vec<Value>> {

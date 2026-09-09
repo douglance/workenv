@@ -190,6 +190,15 @@ impl Runtime for FakeRuntime {
             return Ok(json_output(spec.key, body));
         }
 
+        if command.contains("git") && command.contains("ls-remote") && command.contains("HEAD") {
+            return Ok(CommandOutput {
+                stdout: format!("{REVISION}\tHEAD\n").into_bytes(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+                execution_id: spec.key,
+            });
+        }
+
         if command.contains("tar -C") && command.contains("base64") {
             let raw = state.collection_tar.clone().unwrap();
             return Ok(CommandOutput {
@@ -215,7 +224,10 @@ impl Runtime for FakeRuntime {
 
         if command.contains("execution") && command.contains("start") {
             assert!(command.contains("workenv.task_id=task-1"));
-            assert!(command.contains("workenv.worker=workenv-01"));
+            assert!(
+                command.contains("workenv.worker=workenv-01")
+                    || command.contains("workenv.worker=workenv-02")
+            );
             if command.contains("devenv") && command.contains("up") {
                 assert!(command.contains("workenv.kind=service"));
                 return Ok(json_output(
@@ -305,9 +317,14 @@ impl Runtime for FakeRuntime {
                 } else {
                     EXPIRES_AT
                 };
+                let worker = if args["id"].as_str() == Some("reservation-2") {
+                    "workenv-02"
+                } else {
+                    "workenv-01"
+                };
                 json!({
                     "id": args["id"],
-                    "key": "workenv/worker/workenv-01",
+                    "key": format!("workenv/worker/{worker}"),
                     "lease_id": "session/session-1",
                     "expires_at": expires_at,
                 })
@@ -647,6 +664,137 @@ fn read_probes_use_fresh_ssh_execution_keys() {
     assert_ne!(activity_keys[0], activity_keys[1]);
 }
 
+#[test]
+fn claim_filters_automatic_worker_by_project_profile() {
+    let runtime = FakeRuntime::new();
+    let ctx = context_with_worker_profile(runtime.clone());
+
+    let result = tasks::claim(
+        &ctx,
+        json!({"project":"incurs", "task_id":"task-1", "revision": REVISION}),
+        "claim-key",
+    )
+    .unwrap();
+
+    assert_eq!(result["status"], "claimed");
+    assert_eq!(result["worker"], "workenv-02");
+    assert_eq!(result["worker_profile"]["name"], "personal");
+    let record = read_only_task_record(&ctx.state, "task-1");
+    assert_eq!(record["worker"], "workenv-02");
+    assert_eq!(record["worker_profile"]["name"], "personal");
+    assert_eq!(
+        runtime.apoc_methods(),
+        vec!["session_open", "reservation_acquire"]
+    );
+    let commands = runtime.ssh_commands().join("\n");
+    assert!(commands.contains("/home/exedev/workenv/remote/profile.py"));
+    assert!(commands.contains("--check-github"));
+}
+
+#[test]
+fn claim_rejects_requested_profile_on_wrong_worker_before_mutation() {
+    let runtime = FakeRuntime::new();
+    let ctx = context_with_worker_profile(runtime.clone());
+    let bundle = ctx.root.join("source.bundle");
+    fs::write(&bundle, b"bundle bytes").unwrap();
+
+    let result = tasks::claim(
+        &ctx,
+        json!({
+            "project":"incurs",
+            "task_id":"task-1",
+            "revision": REVISION,
+            "worker":"workenv-01",
+            "profile":"personal",
+            "source_bundle": bundle,
+        }),
+        "claim-key",
+    );
+
+    assert!(result.is_err());
+    assert!(runtime.apoc_methods().is_empty());
+    assert!(runtime.ssh_commands().is_empty());
+}
+
+#[test]
+fn run_refuses_bound_task_profile_drift_before_remote_launch() {
+    let runtime = FakeRuntime::new();
+    let ctx = context_with_worker_profile(runtime.clone());
+    write_claimed_record_for_worker(
+        &ctx.state,
+        "workenv-02",
+        json!({
+            "reservation_id": "reservation-2",
+            "worker_profile": {"name":"personal", "digest":"stale"},
+        }),
+    );
+
+    let result = tasks::run(
+        &ctx,
+        "task-1",
+        vec!["cargo".into(), "test".into()],
+        "run-key",
+    );
+
+    assert!(result.is_err());
+    assert!(runtime.apoc_methods().is_empty());
+    assert!(runtime.ssh_commands().is_empty());
+}
+
+#[test]
+fn run_places_profile_wrapper_inside_remote_apoc_child_argv() {
+    let runtime = FakeRuntime::new();
+    let ctx = context_with_worker_profile(runtime.clone());
+    write_claimed_record_for_worker(
+        &ctx.state,
+        "workenv-02",
+        json!({
+            "reservation_id": "reservation-2",
+            "worker_profile": personal_binding(&ctx),
+        }),
+    );
+
+    let result = tasks::run(
+        &ctx,
+        "task-1",
+        vec!["cargo".into(), "test".into(), "--lib".into()],
+        "run-key",
+    )
+    .unwrap();
+
+    assert_eq!(result["status"], "started");
+    assert_eq!(result["worker_profile"]["name"], "personal");
+    let commands = runtime.ssh_commands().join("\n");
+    assert!(commands.contains("execution"));
+    assert!(commands.contains("start"));
+    assert!(commands.contains("bash"));
+    assert!(commands.contains("/home/exedev/workenv/remote/profile.py"));
+    assert!(commands.contains("'exec' '--name' 'personal'"));
+    assert!(commands.contains("'--check-github'"));
+    assert!(commands.contains("cargo"));
+    assert!(commands.contains("test"));
+    assert!(commands.contains("--lib"));
+    assert!(commands.contains("workenv.profile=personal"));
+}
+
+#[test]
+fn resolve_claim_revision_runs_head_lookup_on_selected_worker_profile() {
+    let runtime = FakeRuntime::new();
+    let ctx = context_with_worker_profile(runtime.clone());
+    let mut request = json!({"project":"incurs", "task_id":"task-1"});
+
+    tasks::resolve_claim_revision(&ctx, &mut request, "resolve-key").unwrap();
+
+    assert_eq!(request["revision"], REVISION);
+    assert_eq!(request["worker"], "workenv-02");
+    assert!(runtime.apoc_methods().is_empty());
+    let commands = runtime.ssh_commands().join("\n");
+    assert!(commands.contains("/home/exedev/workenv/remote/profile.py"));
+    assert!(commands.contains("--check-github"));
+    assert!(commands.contains("git"));
+    assert!(commands.contains("ls-remote"));
+}
+
 fn context(runtime: Arc<FakeRuntime>) -> Context {
     let dir = tempfile::tempdir().unwrap().keep();
     Context {
@@ -662,10 +810,61 @@ fn context(runtime: Arc<FakeRuntime>) -> Context {
     }
 }
 
+fn context_with_worker_profile(runtime: Arc<FakeRuntime>) -> Context {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::create_dir_all(dir.join("profiles")).unwrap();
+    std::fs::write(
+        dir.join("profiles/personal.json"),
+        r#"{"schema_version":1,"name":"personal","github_login":"example-user","git_name":"Example User","git_email":"example@example.invalid"}"#,
+    )
+    .unwrap();
+    Context {
+        root: dir.clone(),
+        state: dir.join(".state/controller"),
+        fleet: json!({
+            "remote_user": "exedev",
+            "remote_root": "/home/exedev/workenv",
+            "workers": [
+                {"name":"workenv-01", "cpus":2, "memory_gb":8, "disk_gb":50},
+                {"name":"workenv-02", "cpus":2, "memory_gb":8, "disk_gb":50, "profile":"personal"}
+            ],
+            "projects": {"incurs": {"repository": "example/incurs", "worker_profile":"personal"}},
+        }),
+        runtime,
+    }
+}
+
+fn personal_binding(ctx: &Context) -> Value {
+    workenv::profiles::binding(ctx, "workenv-02").unwrap()
+}
+
 fn write_claimed_record(state: &Path, extra: Value) {
     let mut record = json!({
         "task_id": "task-1",
         "worker": "workenv-01",
+        "project": "incurs",
+        "repo": {"owner":"example", "name":"incurs"},
+        "revision": REVISION,
+        "reservation_id": "reservation-1",
+        "session_id": "session-1",
+        "source": "remote",
+        "status": "claimed",
+        "worktree": "/home/exedev/workenv/tasks/task-1",
+        "remote_execution_ids": [],
+        "runtime": {"apoc_execution_ids": [], "herdr": {}},
+    });
+    if let Some(extra) = extra.as_object() {
+        for (key, value) in extra {
+            record[key] = value.clone();
+        }
+    }
+    write_json(&task_record_path(state, "task-1"), &record).unwrap();
+}
+
+fn write_claimed_record_for_worker(state: &Path, worker: &str, extra: Value) {
+    let mut record = json!({
+        "task_id": "task-1",
+        "worker": worker,
         "project": "incurs",
         "repo": {"owner":"example", "name":"incurs"},
         "revision": REVISION,

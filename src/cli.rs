@@ -1,6 +1,6 @@
 use crate::{
     process::{read_json, write_json},
-    tasks, worker, Context,
+    profiles, tasks, worker, Context,
 };
 use anyhow::{bail, Context as _, Result};
 use fs2::FileExt;
@@ -63,6 +63,45 @@ struct ClaimOptions {
     worker: Option<String>,
     /// Local Git bundle containing the exact revision, for unpublished source.
     source_bundle: Option<String>,
+    /// Require a worker assigned to this named identity profile.
+    profile: Option<String>,
+}
+#[derive(Deserialize, incurs::Args)]
+struct ProfileNameArgs {
+    /// Profile name: lowercase letters, digits, and hyphens.
+    name: String,
+}
+#[derive(Deserialize, incurs::Options)]
+struct ProfileCreateOptions {
+    /// Stable request key. Required for MCP and noninteractive calls.
+    idempotency_key: Option<String>,
+    /// Expected GitHub username. Task commands refuse a different login.
+    github_login: Option<String>,
+    /// Git commit author name for this profile.
+    git_name: Option<String>,
+    /// Git commit author email for this profile.
+    git_email: Option<String>,
+    /// Named profile for the Anthropic CLI, when used.
+    anthropic_profile: Option<String>,
+}
+#[derive(Deserialize, incurs::Args)]
+struct ProfileAssignArgs {
+    /// Worker name or number. Existing work must be stopped first.
+    worker: String,
+    /// Existing profile name.
+    name: String,
+}
+#[derive(Deserialize, incurs::Args)]
+struct ProfileWorkerArgs {
+    /// Worker name or number.
+    worker: String,
+}
+#[derive(Deserialize, incurs::Args)]
+struct ProfileLoginArgs {
+    /// Worker name or number with an assigned profile.
+    worker: String,
+    /// Login service: github (default), codex, or claude.
+    service: Option<String>,
 }
 #[derive(Deserialize, incurs::Args)]
 struct RunArgs {
@@ -307,6 +346,91 @@ fn status_command() -> CommandDef {
     .done()
 }
 
+fn profile_commands() -> Cli {
+    let create = CommandDef::typed::<ProfileNameArgs, ProfileCreateOptions, (), Report, _, _>(
+        "create",
+        |input: TypedContext<ProfileNameArgs, ProfileCreateOptions, ()>| async move {
+            report(context(&input.globals).and_then(|ctx| {
+                let metadata = json!({
+                    "github_login":input.options.github_login,
+                    "git_name":input.options.git_name,
+                    "git_email":input.options.git_email,
+                    "anthropic_profile":input.options.anthropic_profile,
+                });
+                mutation(
+                    &ctx,
+                    "profile create",
+                    json!({"name":input.args.name,"metadata":metadata}),
+                    &mutation_globals(&input.globals, input.options.idempotency_key.as_deref()),
+                    input.agent || input.request.is_some(),
+                    |_| profiles::create(&ctx, &input.args.name, metadata),
+                )
+            }))
+        },
+    )
+    .description(
+        "Create a reusable identity profile without copying credentials or changing workers.",
+    )
+    .mcp(mcp_options(false, false))
+    .done();
+    let list = CommandDef::typed::<(), (), (), Report, _, _>(
+        "list",
+        |input: TypedContext<(), (), ()>| async move {
+            report(context(&input.globals).and_then(|ctx| profiles::list(&ctx)))
+        },
+    )
+    .description(
+        "List profile definitions and their worker assignments without contacting workers.",
+    )
+    .mcp(mcp_options(true, false))
+    .done();
+    let status = CommandDef::typed::<ProfileWorkerArgs, (), (), Report, _, _>(
+        "status",|input:TypedContext<ProfileWorkerArgs,(),()>| async move {
+            report(context(&input.globals).and_then(|ctx| profiles::status(&ctx,&input.args.worker)))
+        },
+    ).description("Verify a worker's profile directories and expected GitHub login without exposing credentials.")
+        .mcp(mcp_options(true,false)).done();
+    let assign = CommandDef::typed::<ProfileAssignArgs, MutationOptions, (), Report, _, _>(
+        "assign",|input:TypedContext<ProfileAssignArgs,MutationOptions,()>| async move {
+            report(context(&input.globals).and_then(|ctx| {
+                mutation(&ctx,"profile assign",json!({"worker":input.args.worker,"name":input.args.name}),
+                    &mutation_globals(&input.globals,input.options.idempotency_key.as_deref()),
+                    input.agent || input.request.is_some(),
+                    |key| profiles::assign(&ctx,&input.args.worker,&input.args.name,key))
+            }))
+        },
+    ).description("Assign a profile to an idle worker and restart its empty Herdr runtime; active work blocks the change.")
+        .mcp(mcp_options(false,false)).done();
+    let login = CommandDef::typed::<ProfileLoginArgs, MutationOptions, (), Report, _, _>(
+        "login",
+        |input: TypedContext<ProfileLoginArgs, MutationOptions, ()>| async move {
+            report(context(&input.globals).and_then(|ctx| {
+                let service = input.args.service.as_deref().unwrap_or("github");
+                mutation(
+                    &ctx,
+                    "profile login",
+                    json!({"worker":input.args.worker,"service":service}),
+                    &mutation_globals(&input.globals, input.options.idempotency_key.as_deref()),
+                    input.agent || input.request.is_some(),
+                    |key| profiles::login(&ctx, &input.args.worker, service, key),
+                )
+            }))
+        },
+    )
+    .description(
+        "Open GitHub, Codex, or Claude login in a Herdr workspace scoped to the worker's profile.",
+    )
+    .mcp(mcp_options(false, false))
+    .done();
+    Cli::create("profile")
+        .description("Named worker identities with directory-scoped credentials.")
+        .command("create", create)
+        .command("list", list)
+        .command("assign", assign)
+        .command("status", status)
+        .command("login", login)
+}
+
 pub fn build() -> Cli {
     let up = CommandDef::typed::<WorkerArgs, MutationOptions, (), Report, _, _>(
         "up",
@@ -416,22 +540,19 @@ pub fn build() -> Cli {
     .done();
     let claim = CommandDef::typed::<ClaimArgs, ClaimOptions, (), Report, _, _>("claim", |input: TypedContext<ClaimArgs, ClaimOptions, ()>| async move {
         report(context(&input.globals).and_then(|ctx| {
-            let request = json!({"project":input.args.project,"task_id":input.args.task,"revision":input.options.revision,"worker":input.options.worker,"source_bundle":input.options.source_bundle});
+            let request = json!({"project":input.args.project,"task_id":input.args.task,"revision":input.options.revision,"worker":input.options.worker,"source_bundle":input.options.source_bundle,"profile":input.options.profile});
             mutation(&ctx, "claim", request.clone(), &mutation_globals(&input.globals, input.options.idempotency_key.as_deref()), input.agent || input.request.is_some(), |key| {
                 let mut request = request;
                 if request["revision"].is_null() {
-                    let source = if let Some(bundle) = request["source_bundle"].as_str() {
-                        std::path::Path::new(bundle).canonicalize()?.to_string_lossy().into_owned()
+                    if let Some(bundle) = request["source_bundle"].as_str() {
+                        let source = std::path::Path::new(bundle).canonicalize()?.to_string_lossy().into_owned();
+                        let output = ctx.run("git", vec!["ls-remote".into(), "--".into(), source, "HEAD".into()], &format!("{key}:resolve-head"), "Resolve the exact task source revision from a local bundle.", 60000)?.text()?;
+                        let revision = output.split_whitespace().next().context("Source bundle has no HEAD; supply --revision with an exact commit")?;
+                        if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|c| c.is_ascii_hexdigit()) { bail!("Source bundle returned an invalid HEAD revision"); }
+                        request["revision"] = revision.into();
                     } else {
-                        let project = request["project"].as_str().context("Project is required")?;
-                        let repository = ctx.fleet["projects"][project]["repository"].as_str().context("Unknown project; choose a project from fleet.json")?;
-                        if repository.split('/').count() != 2 || !repository.bytes().all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)) { bail!("Invalid configured repository"); }
-                        format!("git@github.com:{repository}.git")
-                    };
-                    let output = ctx.run("git", vec!["ls-remote".into(), "--".into(), source, "HEAD".into()], &format!("{key}:resolve-head"), "Resolve the exact task source revision.", 60000)?.text()?;
-                    let revision = output.split_whitespace().next().context("Repository has no HEAD; supply --revision with an exact commit")?;
-                    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|c| c.is_ascii_hexdigit()) { bail!("Repository returned an invalid HEAD revision"); }
-                    request["revision"] = revision.into();
+                        tasks::resolve_claim_revision(&ctx, &mut request, key)?;
+                    }
                 }
                 tasks::claim(&ctx, request, key)
             })
@@ -529,6 +650,7 @@ pub fn build() -> Cli {
         .command("services", services)
         .command("collect", collect)
         .command("release", release)
+        .group(profile_commands())
 }
 
 #[cfg(test)]

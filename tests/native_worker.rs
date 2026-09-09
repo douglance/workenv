@@ -6,7 +6,7 @@ use flate2::read::GzDecoder;
 use serde_json::{json, Value};
 use tar::Archive;
 use tempfile::TempDir;
-use workenv::{worker, CommandOutput, CommandSpec, Context, Runtime};
+use workenv::{profiles, worker, CommandOutput, CommandSpec, Context, Runtime};
 
 #[derive(Default)]
 struct FakeRuntime {
@@ -95,7 +95,19 @@ fn use_temp_source_root(ctx: &mut Context, root: &Path) {
     std::fs::write(root.join("tools.json"), "{}").unwrap();
     std::fs::write(root.join("devenv.nix"), "").unwrap();
     std::fs::write(root.join("remote/tool_health.py"), "").unwrap();
+    std::fs::write(root.join("remote/profile.py"), "").unwrap();
     ctx.root = root.to_path_buf();
+}
+
+fn assign_profile(ctx: &mut Context) {
+    ctx.fleet["workers"][0]["profile"] = json!("personal");
+    let profiles = ctx.root.join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join("personal.json"),
+        r#"{"schema_version":1,"name":"personal","github_login":"example-user","git_name":"Example User","git_email":"example@example.invalid"}"#,
+    )
+    .unwrap();
 }
 
 fn add_space_attention_plugin(root: &Path) {
@@ -189,6 +201,7 @@ fn up_initializes_a_verified_empty_worker_without_an_existing_workspace_helper()
     runtime.push_text("installed\n");
     runtime.push(bootstrap_health());
     runtime.push(tool_health());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.push(json!([]));
@@ -226,6 +239,7 @@ fn up_uses_configured_ssh_host_for_managed_transport_but_not_provider_recovery()
     runtime.push_text("installed\n");
     runtime.push(bootstrap_health());
     runtime.push(tool_health());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.push(json!([]));
@@ -301,6 +315,7 @@ fn sync_archive_includes_herdr_sources_when_plugin_exists() {
     runtime.push_text("installed\n");
     runtime.push(bootstrap_health());
     runtime.push(tool_health());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.push_text("linked\n");
@@ -381,6 +396,28 @@ fn tailscale_not_ready() -> Value {
     json!({"BackendState": "NeedsLogin"})
 }
 
+fn profile_runtime_unassigned() -> Value {
+    json!({"ok": true, "status": "profile_runtime_unassigned"})
+}
+
+fn profile_runtime_recorded() -> Value {
+    json!({"ok": true, "status": "profile_runtime_recorded"})
+}
+
+fn herdr_profile_runtime_list() -> Value {
+    json!({"executions": [{"id":"herdr-exec", "status":"running"}]})
+}
+
+fn herdr_profile_runtime(ctx: &Context) -> Value {
+    let profile = profiles::binding(ctx, "workenv-01").unwrap();
+    json!({"data": {"id":"herdr-exec", "status":"running", "outcome":"pending", "spec": {"labels": {
+        "workenv.component":"herdr-server",
+        "herdr.session":"workenv",
+        "workenv.profile": profile["name"].clone(),
+        "workenv.profile.digest": profile["digest"].clone()
+    }}}})
+}
+
 #[test]
 fn up_syncs_bootstraps_tools_and_herdr_before_returning_partial_auth_state() {
     let temp = TempDir::new().unwrap();
@@ -394,6 +431,7 @@ fn up_syncs_bootstraps_tools_and_herdr_before_returning_partial_auth_state() {
     runtime.push_text("installed\n");
     runtime.push(bootstrap_health());
     runtime.push(tool_health());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.push(json!([]));
@@ -477,6 +515,7 @@ fn up_syncs_bootstraps_tools_and_herdr_before_returning_partial_auth_state() {
 fn start_worker_herdr_skips_sidebar_setup_when_plugin_manifest_is_absent() {
     let temp = TempDir::new().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
@@ -497,6 +536,7 @@ fn start_worker_herdr_skips_sidebar_setup_when_plugin_manifest_is_absent() {
 fn start_worker_herdr_links_configured_sidebar_plugin_after_server_readiness() {
     let temp = TempDir::new().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.push_text("linked\n");
@@ -563,6 +603,7 @@ fn start_worker_herdr_links_configured_sidebar_plugin_after_server_readiness() {
 fn start_worker_herdr_fails_when_configured_sidebar_plugin_link_fails() {
     let temp = TempDir::new().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.outputs.lock().unwrap().push(CommandOutput {
@@ -588,6 +629,7 @@ fn start_worker_herdr_fails_when_configured_sidebar_plugin_link_fails() {
 fn start_worker_herdr_fails_when_sidebar_refresh_log_fails() {
     let temp = TempDir::new().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(profile_runtime_unassigned());
     runtime.push_text("started\n");
     runtime.push(herdr_ready());
     runtime.push_text("linked\n");
@@ -606,6 +648,148 @@ fn start_worker_herdr_fails_when_sidebar_refresh_log_fails() {
     assert_eq!(result["refresh"]["result"]["log"]["log_id"], "plugin-log-1");
     assert_eq!(result["log"]["status"], "succeeded");
     assert_eq!(result["log"]["exit_code"], 1);
+}
+
+#[test]
+fn start_worker_herdr_passes_profile_env_to_bootstrap() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+    assign_profile(&mut ctx);
+    runtime.push(profile_runtime_recorded());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.push(herdr_profile_runtime_list());
+    runtime.push(herdr_profile_runtime(&ctx));
+
+    let result = worker::start_worker_herdr(&ctx, "workenv-01", "herdr-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_ready");
+    assert_eq!(result["worker_profile"]["name"], "personal");
+    let command = runtime
+        .specs()
+        .into_iter()
+        .find(|spec| spec.key == "herdr-key:herdr-boot:workenv-01")
+        .unwrap()
+        .args
+        .last()
+        .cloned()
+        .unwrap();
+    assert!(command.contains("WORKENV_IDENTITY_PROFILE="));
+    assert!(command.contains("personal"));
+    assert!(command.contains("WORKENV_IDENTITY_DIGEST="));
+    assert!(command.contains("/opt/workenv/bin/workenv-herdr-bootstrap"));
+}
+
+#[test]
+fn start_worker_herdr_stops_when_profile_bootstrap_fails() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(profile_runtime_recorded());
+    runtime.outputs.lock().unwrap().push(CommandOutput {
+        stdout: Vec::new(),
+        stderr: b"workenv Herdr server is running without the expected APoC profile labels"
+            .to_vec(),
+        exit_code: Some(1),
+        execution_id: "boot-failed".into(),
+    });
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+    assign_profile(&mut ctx);
+
+    let result = worker::start_worker_herdr(&ctx, "workenv-01", "herdr-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_boot_failed");
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["herdr_ready"], false);
+    assert_eq!(result["boot"]["status"], "remote_failed");
+    assert_eq!(result["boot"]["execution_id"], "boot-failed");
+    assert_eq!(runtime.specs().len(), 2);
+    assert!(runtime
+        .specs()
+        .iter()
+        .all(|spec| !spec.key.starts_with("read:herdr-status")));
+}
+
+#[test]
+fn up_prepares_profile_after_bootstrap_before_herdr_and_auth() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+    assign_profile(&mut ctx);
+    runtime.push(provider_present());
+    runtime.push(workspace_available());
+    runtime.push(json!([]));
+    runtime.push(json!([]));
+    runtime.push(json!({"executions":[]}));
+    runtime.push_text("workenv-source-sync-v1\n");
+    runtime.push_text("installed\n");
+    runtime.push(json!({"ok":true,"status":"profile_runtime_installed"}));
+    runtime.push(json!({"ok":true,"status":"profile_prepared","prepared":true}));
+    runtime.push(bootstrap_health());
+    runtime.push(tool_health());
+    runtime.push(profile_runtime_recorded());
+    runtime.push_text("started\n");
+    runtime.push(herdr_ready());
+    runtime.push(herdr_profile_runtime_list());
+    runtime.push(herdr_profile_runtime(&ctx));
+    runtime.push(json!([]));
+    runtime.push_text("registered\n");
+    runtime.push(tailscale_not_ready());
+
+    let result = worker::up(&ctx, Some("workenv-01"), "up-key").unwrap();
+
+    assert_eq!(result["workers"][0]["status"], "auth_required");
+    assert_eq!(
+        result["workers"][0]["profile_prepare"]["status"],
+        "profile_prepared"
+    );
+    let specs = runtime.specs();
+    let bootstrap_index = specs
+        .iter()
+        .position(|spec| spec.key == "up-key:bootstrap:workenv-01")
+        .unwrap();
+    let prepare_index = specs
+        .iter()
+        .position(|spec| spec.key == "up-key:profile-prepare")
+        .unwrap();
+    let herdr_index = specs
+        .iter()
+        .position(|spec| spec.key == "up-key:herdr-boot:workenv-01")
+        .unwrap();
+    assert!(bootstrap_index < prepare_index);
+    assert!(prepare_index < herdr_index);
+}
+
+#[test]
+fn begin_profile_change_refuses_mismatched_live_profile_runtime_and_releases() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    runtime.push(workspace_available());
+    runtime.push(json!([]));
+    runtime.push(json!([]));
+    runtime.push(json!({"executions": [{"id":"herdr-exec", "status":"running"}]}));
+    runtime.push(json!({"data": {"id":"herdr-exec", "status":"running", "outcome":"pending", "spec": {"labels": {"workenv.component":"herdr-server", "herdr.session":"workenv", "workenv.profile":"other", "workenv.profile.digest":"stale"}}}}));
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+    assign_profile(&mut ctx);
+
+    let result = worker::begin_profile_change(&ctx, "workenv-01", "profile-change").unwrap();
+
+    assert_eq!(result["status"], "runtime_profile_mismatch");
+    let methods = runtime
+        .apoc_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        vec!["session_open", "reservation_acquire", "reservation_release"]
+    );
 }
 
 #[test]
@@ -643,6 +827,47 @@ fn worker_herdr_status_requires_detached_server_daemon_capability() {
 
     assert_eq!(result["status"], "herdr_not_ready");
     assert_eq!(result["herdr_ready"], false);
+}
+
+#[test]
+fn worker_herdr_status_accepts_configured_profile_with_matching_runtime_labels() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+    assign_profile(&mut ctx);
+    runtime.push(herdr_ready());
+    runtime.push(herdr_profile_runtime_list());
+    runtime.push(herdr_profile_runtime(&ctx));
+
+    let result = worker::worker_herdr_status(&ctx, "workenv-01", "status-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_ready");
+    assert_eq!(result["herdr_ready"], true);
+    assert_eq!(result["runtime"]["status"], "herdr_profile_ready");
+}
+
+#[test]
+fn worker_herdr_status_rejects_configured_profile_with_wrong_runtime_labels() {
+    let temp = TempDir::new().unwrap();
+    let runtime = Arc::new(FakeRuntime::default());
+    let mut ctx = ctx(runtime.clone(), temp.path().join(".state/controller"));
+    use_temp_source_root(&mut ctx, &temp.path().join("root"));
+    assign_profile(&mut ctx);
+    runtime.push(herdr_ready());
+    runtime.push(herdr_profile_runtime_list());
+    runtime.push(json!({"data": {"id":"herdr-exec", "status":"running", "outcome":"pending", "spec": {"labels": {
+        "workenv.component":"herdr-server",
+        "herdr.session":"workenv",
+        "workenv.profile":"other",
+        "workenv.profile.digest":"b"
+    }}}}));
+
+    let result = worker::worker_herdr_status(&ctx, "workenv-01", "status-key").unwrap();
+
+    assert_eq!(result["status"], "herdr_profile_mismatch");
+    assert_eq!(result["herdr_ready"], false);
+    assert_eq!(result["labels"]["workenv.profile"], "other");
 }
 
 #[test]

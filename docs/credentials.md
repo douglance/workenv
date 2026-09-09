@@ -3,6 +3,11 @@
 The fleet uses personal subscription authentication. Routine task commands must
 report missing or expired authentication instead of switching to API billing.
 
+For separate identities, use [worker profiles](profiles.md). Each assigned
+profile has its own GitHub, Codex, Claude, Wrangler, and Kubernetes paths on
+the worker. The commands below without a profile use the worker's normal
+home configuration; use `workenv profile login` for a profile-specific login.
+
 ## Tailscale
 
 Sign in to the existing `example.ts.net` tailnet's admin console. Inspect the

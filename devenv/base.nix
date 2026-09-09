@@ -6,7 +6,9 @@
     cacert
     coreutils
     curl
+    direnv
     git
+    gh
     jq
     openssh
     ripgrep

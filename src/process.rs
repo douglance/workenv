@@ -247,11 +247,29 @@ fn validate_fleet(fleet: &Value) -> Result<()> {
                 bail!("{name}.{field} must be a positive integer");
             }
         }
+        if let Some(profile) = worker.get("profile") {
+            let profile = profile
+                .as_str()
+                .with_context(|| format!("{name}.profile must be a string"))?;
+            crate::profiles::validate_name(profile)
+                .with_context(|| format!("{name}.profile is invalid"))?;
+        }
         if let Some(host) = worker.get("ssh_host") {
             let host = host
                 .as_str()
                 .with_context(|| format!("{name}.ssh_host must be a string"))?;
             validate_ssh_host(host).with_context(|| format!("{name}.ssh_host is invalid"))?;
+        }
+    }
+    if let Some(projects) = fleet.get("projects").and_then(Value::as_object) {
+        for (name, project) in projects {
+            if let Some(profile) = project.get("worker_profile") {
+                let profile = profile
+                    .as_str()
+                    .with_context(|| format!("projects.{name}.worker_profile must be a string"))?;
+                crate::profiles::validate_name(profile)
+                    .with_context(|| format!("projects.{name}.worker_profile is invalid"))?;
+            }
         }
     }
     let user = fleet["remote_user"].as_str().unwrap_or("exedev");

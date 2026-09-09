@@ -48,6 +48,23 @@ worker. Active agents/builds and unknown state remain blockers. Explicit
 See [operating instructions](docs/operate.md) and
 [authentication setup](docs/credentials.md).
 
+## Worker profiles
+
+Use named profiles for separate GitHub accounts, Git authors, and tool login
+directories. Definitions contain no credentials; each worker logs in locally.
+
+```sh
+workenv profile create personal --github-login YOUR_GITHUB_USERNAME
+workenv profile assign 2 personal
+workenv profile login 2 github
+workenv profile status 2
+workenv claim PROJECT TASK --profile personal
+```
+
+Assignment refuses active work. Herdr terminals and background task commands
+use the same profile environment. See [worker profiles](docs/profiles.md) for
+Git identity, other tool logins, and directory mappings.
+
 ## CLI and MCP
 
 ```sh

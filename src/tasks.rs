@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::process::{read_json, shell_join, shell_quote, write_json};
+use crate::profiles;
 use crate::CommandSpec;
 use crate::Context;
 
@@ -28,6 +29,74 @@ const AMBIGUOUS_REMOTE_STATUSES: &[&str] = &[
 const RUNNABLE_TASK_STATUSES: &[&str] = &["claimed", "runtime_recorded"];
 const TERMINAL_TASK_STATUSES: &[&str] = &["released"];
 
+pub fn resolve_claim_revision(ctx: &Context, request: &mut Value, key: &str) -> Result<()> {
+    if request.get("revision").and_then(Value::as_str).is_some() {
+        let revision = required_str(request, "revision")?;
+        if !is_full_sha(revision) {
+            bail!("revision must be an exact full lowercase SHA");
+        }
+        return Ok(());
+    }
+    if request
+        .get("source_bundle")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let project = required_str(request, "project")?;
+    let task_id = required_str(request, "task_id")?;
+    validate_task_id(task_id)?;
+    let project_spec = project_config(&ctx.fleet, project)?;
+    let requested_profile = task_requested_profile(request, &project_spec)?;
+    let worker = match request.get("worker").and_then(Value::as_str) {
+        Some(selector) => {
+            let worker = ctx.worker_name(selector)?;
+            ensure_worker_matches_profile(ctx, &worker, requested_profile.as_deref())?;
+            ensure_worker_matches_class(ctx, &worker, project_spec.class.as_deref())?;
+            worker
+        }
+        None => select_available_worker(
+            ctx,
+            project_spec.class.as_deref(),
+            requested_profile.as_deref(),
+        )?,
+    };
+    if !open_task_records_for_worker(&ctx.state, &worker)?.is_empty() {
+        bail!("worker {worker} already has an open task");
+    }
+    let command = format!(
+        "cd {} && /usr/local/bin/devenv shell -- git ls-remote -- {} HEAD",
+        shell_quote(&remote_root(&ctx.fleet)),
+        shell_quote(&project_spec.remote_url)
+    );
+    let argv = profiles::wrap(
+        ctx,
+        &worker,
+        vec!["bash".to_string(), "-lc".to_string(), command],
+        true,
+    )?;
+    let output = ctx.ssh(
+        &worker,
+        argv,
+        &format!("{key}:resolve-head:{worker}"),
+        "Resolve the exact task source revision on the selected worker profile.",
+        60_000,
+    )?;
+    output.success()?;
+    let stdout = String::from_utf8(output.stdout).context("git ls-remote output was not UTF-8")?;
+    let revision = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("Repository has no HEAD; supply revision with an exact commit"))?;
+    if !is_full_sha(revision) {
+        bail!("Repository returned an invalid HEAD revision");
+    }
+    request["revision"] = json!(revision);
+    request["worker"] = json!(worker);
+    Ok(())
+}
+
 pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
     let project = required_str(&request, "project")?;
     let task_id = required_str(&request, "task_id")?;
@@ -37,6 +106,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
     }
     validate_task_id(task_id)?;
     let project_spec = project_config(&ctx.fleet, project)?;
+    let requested_profile = task_requested_profile(&request, &project_spec)?;
     let requested_worker = request
         .get("worker")
         .and_then(Value::as_str)
@@ -58,12 +128,16 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
             && existing.get("source").and_then(Value::as_str) == Some(source)
             && requested_worker.as_deref().is_none_or(|worker| {
                 existing.get("worker").and_then(Value::as_str) == Some(worker)
-            });
+            })
+            && requested_profile
+                .as_deref()
+                .is_none_or(|profile| record_profile_name(&existing) == Some(profile));
         if matches_request && RUNNABLE_TASK_STATUSES.contains(&status) {
             let worker = existing
                 .get("worker")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("central task record missing worker"))?;
+            profiles::validate_task_binding(ctx, &existing)?;
             let reservation_id = required_record_str(&existing, "reservation_id")?;
             let reservation = validate_reservation(ctx, worker, reservation_id)?;
             if !truthy(&reservation, "ok") {
@@ -79,6 +153,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                     "worktree": existing.get("worktree"),
                     "reservation": reservation,
                     "task_record": { "status": "recorded", "ok": true, "task": existing },
+                    "worker_profile": existing.get("worker_profile").cloned().unwrap_or(Value::Null),
                     "replayed": true
                 }),
             ));
@@ -88,6 +163,11 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                 .get("worker")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("central task record missing worker"))?;
+            profiles::validate_task_binding(ctx, &existing)?;
+            let worker_profile = existing
+                .get("worker_profile")
+                .cloned()
+                .unwrap_or(Value::Null);
             let reservation_id = required_record_str(&existing, "reservation_id")?;
             let reservation = validate_reservation(ctx, worker, reservation_id)?;
             if !truthy(&reservation, "ok") {
@@ -115,9 +195,11 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                 worker,
                 remote_request,
                 &format!("{key}:claim:{worker}"),
+                true,
                 180_000,
             )?;
             remote["worker"] = json!(worker);
+            remote["worker_profile"] = worker_profile.clone();
             remote["reservation"] = reservation;
             remote["replayed"] = json!(true);
             if should_record_claim(remote.get("status").and_then(Value::as_str)) {
@@ -141,6 +223,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                             .and_then(Value::as_str)
                             .unwrap_or("unknown"),
                         worktree: worktree.as_deref(),
+                        worker_profile,
                         controller_execution_id: None,
                     },
                 )?;
@@ -152,8 +235,15 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
         }
     }
     let worker = match requested_worker {
-        Some(worker) => worker,
-        None => select_available_worker(ctx, project_spec.class.as_deref())?,
+        Some(worker) => {
+            ensure_worker_matches_profile(ctx, &worker, requested_profile.as_deref())?;
+            worker
+        }
+        None => select_available_worker(
+            ctx,
+            project_spec.class.as_deref(),
+            requested_profile.as_deref(),
+        )?,
     };
     let worker_spec = ctx.worker(&worker)?;
     if let Some(class) = project_spec.class.as_deref() {
@@ -173,6 +263,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
             json!({ "worker": worker, "tasks": summaries(&open) }),
         ));
     }
+    let worker_profile = profile_binding_for_worker(ctx, &worker)?;
 
     let staged_source_bundle = match request.get("source_bundle").and_then(Value::as_str) {
         Some(path) => Some(stage_source_bundle(ctx, &worker, path, key)?),
@@ -224,9 +315,11 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
         &worker,
         remote_request,
         &format!("{key}:claim:{worker}"),
+        true,
         180_000,
     )?;
     remote["worker"] = json!(worker);
+    remote["worker_profile"] = worker_profile.clone();
     if should_record_claim(remote.get("status").and_then(Value::as_str)) {
         let worktree = remote
             .get("worktree")
@@ -248,6 +341,7 @@ pub fn claim(ctx: &Context, request: Value, key: &str) -> Result<Value> {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown"),
                 worktree: worktree.as_deref(),
+                worker_profile,
                 controller_execution_id: None,
             },
         )?;
@@ -286,6 +380,7 @@ pub fn down(ctx: &Context, task: &str, key: &str) -> Result<Value> {
     let record = read_task_record(&ctx.state, task)?
         .ok_or_else(|| anyhow!("central task record is missing"))?;
     require_worker_bound(ctx, &record)?;
+    profiles::validate_task_binding(ctx, &record)?;
     let worker = required_record_str(&record, "worker")?;
     let reservation_id = required_record_str(&record, "reservation_id")?;
     let reservation = validate_reservation(ctx, worker, reservation_id)?;
@@ -336,6 +431,7 @@ fn run_with_kind(
     let record = read_task_record(&ctx.state, task)?
         .ok_or_else(|| anyhow!("central task record is missing"))?;
     require_worker_bound(ctx, &record)?;
+    profiles::validate_task_binding(ctx, &record)?;
     require_runnable_task(&record)?;
     let worker = required_record_str(&record, "worker")?;
     let reservation_id = required_record_str(&record, "reservation_id")?;
@@ -345,10 +441,15 @@ fn run_with_kind(
     }
     let revision = required_record_str(&record, "revision")?;
     let worktree = required_record_str(&record, "worktree")?;
+    let profile = record.get("worker_profile").cloned().unwrap_or(Value::Null);
+    let child_argv = profiles::wrap(ctx, worker, argv, true)?;
+    if child_argv.is_empty() {
+        bail!("profile wrapper returned no command");
+    }
     let mut args = vec![
         "execution".to_string(),
         "start".to_string(),
-        argv[0].clone(),
+        child_argv[0].clone(),
         "--cwd".to_string(),
         worktree.to_string(),
         "--idempotency-key".to_string(),
@@ -361,11 +462,20 @@ fn run_with_kind(
         format!("workenv.worker={worker}"),
         "--label".to_string(),
         format!("workenv.kind={kind}"),
-        "--format".to_string(),
-        "json".to_string(),
-        "--".to_string(),
     ];
-    args.extend(argv.into_iter().skip(1));
+    if let Some(name) = profile.get("name").and_then(Value::as_str) {
+        args.extend([
+            "--label".to_string(),
+            format!("workenv.profile={name}"),
+            "--label".to_string(),
+            format!(
+                "workenv.profile.digest={}",
+                profile.get("digest").and_then(Value::as_str).unwrap_or("")
+            ),
+        ]);
+    }
+    args.extend(["--format".to_string(), "json".to_string(), "--".to_string()]);
+    args.extend(child_argv.into_iter().skip(1));
     let remote = ssh_json(
         ctx,
         worker,
@@ -398,6 +508,7 @@ fn run_with_kind(
             "task_id": task,
             "execution_id": execution_id,
             "kind": kind,
+            "worker_profile": profile,
             "remote": remote,
             "runtime_recorded": runtime_recorded
         }),
@@ -408,6 +519,7 @@ pub fn collect(ctx: &Context, task: &str, key: &str) -> Result<Value> {
     let record = read_task_record(&ctx.state, task)?
         .ok_or_else(|| anyhow!("central task record is missing"))?;
     require_worker_bound(ctx, &record)?;
+    profiles::validate_task_binding(ctx, &record)?;
     require_runnable_task(&record)?;
     let worker = required_record_str(&record, "worker")?;
     let reservation_id = required_record_str(&record, "reservation_id")?;
@@ -429,6 +541,7 @@ pub fn collect(ctx: &Context, task: &str, key: &str) -> Result<Value> {
             "evidence_paths": []
         }),
         &format!("{key}:collect"),
+        false,
         180_000,
     )?;
     if remote.get("status").and_then(Value::as_str) != Some("collected") {
@@ -462,6 +575,7 @@ pub fn release(ctx: &Context, task: &str, key: &str) -> Result<Value> {
     let record = read_task_record(&ctx.state, task)?
         .ok_or_else(|| anyhow!("central task record is missing"))?;
     require_worker_bound(ctx, &record)?;
+    profiles::validate_task_binding(ctx, &record)?;
     let worker = required_record_str(&record, "worker")?;
     let reservation_id = required_record_str(&record, "reservation_id")?;
     let reservation = validate_reservation(ctx, worker, reservation_id)?;
@@ -510,6 +624,7 @@ pub fn release(ctx: &Context, task: &str, key: &str) -> Result<Value> {
             "collection_digest": digest
         }),
         &format!("{key}:release"),
+        false,
         120_000,
     )?;
     if remote.get("status").and_then(Value::as_str) == Some("released") {
@@ -592,6 +707,7 @@ fn record_runtime(
 ) -> Result<Value> {
     let mut record = read_task_record(&ctx.state, task)?
         .ok_or_else(|| anyhow!("central task record is missing"))?;
+    profiles::validate_task_binding(ctx, &record)?;
     if required_record_str(&record, "worker")? != worker {
         return Ok(failed(
             "task_worker_mismatch",
@@ -618,6 +734,7 @@ fn record_runtime(
             "runtime": runtime
         }),
         key,
+        false,
         120_000,
     )?;
     if remote.get("status").and_then(Value::as_str) == Some("runtime_recorded") {
@@ -637,11 +754,13 @@ fn workspace_request(
     worker: &str,
     request: Value,
     key: &str,
+    check_github: bool,
     timeout_ms: u64,
 ) -> Result<Value> {
     let encoded = BASE64.encode(canonical_json(&request).as_bytes());
     let remote_root = remote_root(&ctx.fleet);
-    let output = ctx.ssh(
+    let argv = profiles::wrap(
+        ctx,
         worker,
         vec![
             "python3".to_string(),
@@ -651,6 +770,11 @@ fn workspace_request(
             "--request-base64".to_string(),
             encoded,
         ],
+        check_github,
+    )?;
+    let output = ctx.ssh(
+        worker,
+        argv,
         key,
         "Run remote workenv workspace helper.",
         timeout_ms,
@@ -1463,7 +1587,60 @@ fn require_runnable_task(record: &Value) -> Result<()> {
     Ok(())
 }
 
-fn select_available_worker(ctx: &Context, class: Option<&str>) -> Result<String> {
+fn task_requested_profile(request: &Value, project_spec: &ProjectSpec) -> Result<Option<String>> {
+    let requested = request.get("profile").and_then(Value::as_str);
+    if let Some(name) = requested {
+        profiles::validate_name(name)?;
+        if let Some(project_profile) = project_spec.worker_profile.as_deref() {
+            if project_profile != name {
+                bail!("task profile request conflicts with the project worker_profile");
+            }
+        }
+        return Ok(Some(name.to_string()));
+    }
+    Ok(project_spec.worker_profile.clone())
+}
+
+fn profile_binding_for_worker(ctx: &Context, worker: &str) -> Result<Value> {
+    profiles::binding(ctx, worker)
+}
+
+fn record_profile_name(record: &Value) -> Option<&str> {
+    record
+        .pointer("/worker_profile/name")
+        .and_then(Value::as_str)
+}
+
+fn worker_matches_profile(ctx: &Context, worker: &str, profile: Option<&str>) -> Result<bool> {
+    match (profile, profiles::resolve(ctx, worker)?) {
+        (None, _) => Ok(true),
+        (Some(expected), Some(actual)) => Ok(actual.name == expected),
+        (Some(_), None) => Ok(false),
+    }
+}
+
+fn ensure_worker_matches_profile(ctx: &Context, worker: &str, profile: Option<&str>) -> Result<()> {
+    if !worker_matches_profile(ctx, worker, profile)? {
+        let expected = profile.unwrap_or("");
+        bail!("worker {worker} is not assigned to profile {expected}");
+    }
+    Ok(())
+}
+
+fn ensure_worker_matches_class(ctx: &Context, worker: &str, class: Option<&str>) -> Result<()> {
+    if let Some(class) = class {
+        if ctx.worker(worker)?.get("class").and_then(Value::as_str) != Some(class) {
+            bail!("worker {worker} is not class {class}");
+        }
+    }
+    Ok(())
+}
+
+fn select_available_worker(
+    ctx: &Context,
+    class: Option<&str>,
+    profile: Option<&str>,
+) -> Result<String> {
     let workers = ctx
         .fleet
         .get("workers")
@@ -1477,6 +1654,9 @@ fn select_available_worker(ctx: &Context, class: Option<&str>) -> Result<String>
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("worker has no name"))?;
+        if !worker_matches_profile(ctx, name, profile)? {
+            continue;
+        }
         if open_task_records_for_worker(&ctx.state, name)?.is_empty() {
             return Ok(name.to_string());
         }
@@ -1488,6 +1668,7 @@ struct ProjectSpec {
     repo: Value,
     remote_url: String,
     class: Option<String>,
+    worker_profile: Option<String>,
 }
 
 fn project_config(fleet: &Value, project: &str) -> Result<ProjectSpec> {
@@ -1510,6 +1691,10 @@ fn project_config(fleet: &Value, project: &str) -> Result<ProjectSpec> {
         repo: json!({ "owner": owner, "name": name }),
         remote_url: format!("https://github.com/{owner}/{name}.git"),
         class: spec.get("class").and_then(Value::as_str).map(str::to_owned),
+        worker_profile: spec
+            .get("worker_profile")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -1524,6 +1709,7 @@ struct TaskRecordUpdate<'a> {
     source: &'a str,
     status: &'a str,
     worktree: Option<&'a str>,
+    worker_profile: Value,
     controller_execution_id: Option<&'a str>,
 }
 
@@ -1558,6 +1744,7 @@ fn upsert_task_record(state: &Path, update: TaskRecordUpdate<'_>) -> Result<Valu
     if let Some(worktree) = update.worktree {
         existing["worktree"] = json!(worktree);
     }
+    existing["worker_profile"] = update.worker_profile;
     existing["controller_execution_ids"] = Value::Array(controller_ids);
     existing["remote_execution_ids"] = remote_ids;
     existing["updated_at"] = json!(now_ms());
@@ -1668,7 +1855,8 @@ fn summary(record: &Value) -> Value {
         "revision": record.get("revision"),
         "status": record.get("status"),
         "reservation_id": record.get("reservation_id"),
-        "session_id": record.get("session_id")
+        "session_id": record.get("session_id"),
+        "worker_profile": record.get("worker_profile").cloned().unwrap_or(Value::Null)
     })
 }
 

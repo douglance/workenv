@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+from pathlib import Path
 
 from scripts import workenv_controller as controller
 
@@ -9,6 +12,9 @@ FLEET = {
     "remote_user": "exedev",
     "workers": [{"name": "workenv-01", "class": "linux"}],
 }
+
+DIGEST = "a" * 64
+MISSING = object()
 
 
 def completed(stdout="", stderr="", returncode=0):
@@ -21,11 +27,246 @@ def herdr_payload(**overrides):
         "compatible": True,
         "version": "0.9.0",
         "protocol_version": 22,
+        "restart_needed": False,
         "server_binary_stale": False,
         "capabilities": {"detached_server_daemon": True},
     }
     payload.update(overrides)
     return payload
+
+
+def write_executable(path, text):
+    path.write_text(text)
+    path.chmod(path.stat().st_mode | 0o111)
+
+
+def run_bootstrap(
+    tmp_path,
+    *,
+    profile=None,
+    digest=None,
+    persisted=MISSING,
+    herdr_status=None,
+    apoc_list=None,
+    apoc_get=None,
+):
+    root = tmp_path / "root"
+    bin_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    root.joinpath("remote").mkdir(parents=True)
+    root.joinpath("remote/profile.py").write_text("")
+    bin_dir.mkdir()
+    home.mkdir()
+    captured = tmp_path / "apoc-argv.json"
+    write_executable(
+        bin_dir / "herdr",
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"print({json.dumps(json.dumps(herdr_status or herdr_payload(running=False)))})\n",
+    )
+    write_executable(
+        bin_dir / "apoc",
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        f"path = pathlib.Path({str(captured)!r})\n"
+        f"list_payload = {json.dumps(apoc_list or {'executions': []})}\n"
+        f"get_payloads = {json.dumps(apoc_get or {})}\n"
+        "argv = sys.argv[1:]\n"
+        "if argv[:2] == ['execution', 'list']:\n"
+        "    print(json.dumps(list_payload))\n"
+        "    raise SystemExit(0)\n"
+        "if argv[:2] == ['execution', 'get']:\n"
+        "    print(json.dumps(get_payloads.get(argv[2], {})))\n"
+        "    raise SystemExit(0)\n"
+        "path.write_text(json.dumps(argv))\n",
+    )
+    write_executable(
+        bin_dir / "sudo",
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "raise SystemExit(0)\n",
+    )
+    if persisted is not MISSING:
+        state = root / ".state"
+        state.mkdir()
+        (state / "identity-profile.json").write_text(json.dumps(persisted))
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        "WORKENV_BOOTSTRAP_SHELL": "1",
+        "WORKENV_ROOT": str(root),
+        "WORKENV_HERDR_SESSION": "workenv",
+        "WORKENV_BOOT_ID": "boot-id",
+        "APOC_BIN": "apoc",
+        "HERDR_BIN": "herdr",
+        "HOME": str(home),
+    }
+    if profile is not None:
+        env["WORKENV_IDENTITY_PROFILE"] = profile
+    if digest is not None:
+        env["WORKENV_IDENTITY_DIGEST"] = digest
+    script = Path(__file__).resolve().parents[1] / "bootstrap" / "workenv-herdr-bootstrap.sh"
+    result = subprocess.run([str(script)], env=env, text=True, capture_output=True, check=False)
+    argv = json.loads(captured.read_text()) if captured.exists() else None
+    return result, argv
+
+
+def test_bootstrap_wraps_profile_env_inside_apoc_child_argv(tmp_path):
+    result, argv = run_bootstrap(tmp_path, profile="personal", digest=DIGEST)
+
+    assert result.returncode == 0, result.stderr
+    assert argv[:3] == ["execution", "start", "python3"]
+    assert "--label" in argv
+    assert "workenv.profile=personal" in argv
+    delimiter = argv.index("--")
+    child = argv[delimiter + 1 :]
+    assert child[:7] == [
+        str(tmp_path / "root" / "remote/profile.py"),
+        "--root",
+        str(tmp_path / "root"),
+        "exec",
+        "--name",
+        "personal",
+        "--digest",
+    ]
+    assert "herdr" in child
+    assert "server" in child
+
+
+def test_bootstrap_loads_persisted_profile_when_env_is_absent(tmp_path):
+    result, argv = run_bootstrap(
+        tmp_path,
+        persisted={"name": "personal", "digest": DIGEST},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "workenv.profile=personal" in argv
+    assert f"workenv.profile.digest={DIGEST}" in argv
+
+
+def test_bootstrap_accepts_persisted_null_profile_as_unprofiled(tmp_path):
+    result, argv = run_bootstrap(tmp_path, persisted=None)
+
+    assert result.returncode == 0, result.stderr
+    assert argv[:3] == ["execution", "start", "herdr"]
+    assert "workenv.profile=personal" not in argv
+
+
+def test_bootstrap_fails_closed_for_malformed_persisted_profile(tmp_path):
+    root = tmp_path / "root"
+    state = root / ".state"
+    state.mkdir(parents=True)
+    (state / "identity-profile.json").write_text("{not-json")
+
+    result, argv = run_bootstrap(tmp_path)
+
+    assert result.returncode != 0
+    assert argv is None
+    assert "invalid workenv identity profile descriptor" in result.stderr
+
+
+def test_bootstrap_fails_closed_for_partial_persisted_profile(tmp_path):
+    result, argv = run_bootstrap(tmp_path, persisted={"name": "personal"})
+
+    assert result.returncode != 0
+    assert argv is None
+    assert "invalid workenv identity profile descriptor" in result.stderr
+
+
+def test_bootstrap_rejects_invalid_env_profile_pair_before_start(tmp_path):
+    result, argv = run_bootstrap(tmp_path, profile="Personal", digest=DIGEST)
+
+    assert result.returncode != 0
+    assert argv is None
+    assert "WORKENV_IDENTITY_PROFILE and WORKENV_IDENTITY_DIGEST" in result.stderr
+
+
+def test_bootstrap_unprofiled_server_keeps_plain_herdr_child_argv(tmp_path):
+    result, argv = run_bootstrap(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert argv[:3] == ["execution", "start", "herdr"]
+    assert "workenv.profile=personal" not in argv
+    delimiter = argv.index("--")
+    assert argv[delimiter + 1 :] == ["--session", "workenv", "server"]
+
+
+def test_bootstrap_matches_healthy_profile_from_execution_get_not_list_summary(tmp_path):
+    result, argv = run_bootstrap(
+        tmp_path,
+        profile="personal",
+        digest=DIGEST,
+        herdr_status=herdr_payload(),
+        apoc_list={
+            "executions": [
+                {
+                    "id": "exec-1",
+                    "name": "workenv-herdr-server-workenv",
+                    "status": "running",
+                    "program": "python3",
+                    "cwd": str(tmp_path / "root"),
+                }
+            ]
+        },
+        apoc_get={
+            "exec-1": {
+                "execution": {
+                    "status": "running",
+                    "spec": {
+                        "labels": [
+                            "workenv.component=herdr-server",
+                            "herdr.session=workenv",
+                            "workenv.profile=personal",
+                            f"workenv.profile.digest={DIGEST}",
+                        ]
+                    },
+                }
+            }
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert argv is None
+    assert "workenv Herdr server is already healthy" in result.stdout
+
+
+def test_bootstrap_refuses_healthy_server_when_execution_get_profile_mismatches(tmp_path):
+    result, argv = run_bootstrap(
+        tmp_path,
+        profile="personal",
+        digest=DIGEST,
+        herdr_status=herdr_payload(),
+        apoc_list={
+            "executions": [
+                {
+                    "id": "exec-1",
+                    "name": "workenv-herdr-server-workenv",
+                    "status": "running",
+                    "program": "python3",
+                    "cwd": str(tmp_path / "root"),
+                }
+            ]
+        },
+        apoc_get={
+            "exec-1": {
+                "execution": {
+                    "status": "running",
+                    "spec": {
+                        "labels": {
+                            "workenv.component": "herdr-server",
+                            "herdr.session": "workenv",
+                            "workenv.profile": "other",
+                            "workenv.profile.digest": DIGEST,
+                        }
+                    },
+                }
+            }
+        },
+    )
+
+    assert result.returncode != 0
+    assert argv is None
+    assert "without the expected APoC profile labels" in result.stderr
 
 
 def test_worker_herdr_status_requires_running_compatible_protocol_and_detached_capability(monkeypatch):
