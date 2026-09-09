@@ -104,26 +104,24 @@ fn protected_prefix_still_requires_privilege() -> Result<()> {
 #[test]
 fn seed_install_creates_new_user_link_dir_when_devenv_is_ready() -> Result<()> {
     let root = temp_path("bootstrap-seed-link-dir");
-    let path_dir = root.join("path");
     let prefix = root.join("prefix");
     let link_dir = root.join("nested").join("bin");
     let seed = root.join("seed-source");
-    fs::create_dir_all(&path_dir)?;
+    fs::create_dir_all(&root)?;
     fs::write(&seed, b"canary\n")?;
-    fs::write(path_dir.join("nix"), "#!/bin/sh\necho 'nix (Nix) 2.35.2'\n")?;
-    fs::write(path_dir.join("devenv"), "#!/bin/sh\necho 'devenv 2.3.0'\n")?;
-    fs::set_permissions(path_dir.join("nix"), Permissions::from_mode(0o755))?;
-    fs::set_permissions(path_dir.join("devenv"), Permissions::from_mode(0o755))?;
     let mut request = request("bootstrap")?;
     request.config = json!({"prefix":prefix,"link_dir":link_dir,"seed_tools":[{
         "name":"workenv-canary-seed","path":seed,"sha256":digest("canary\n")}]});
-    let script = scripts::install_script(&BootstrapConfig::from_request(&request)?);
+    let script = format!(
+        "nix() {{ echo 'nix (Nix) 2.35.2'; }}\n\
+         devenv() {{ echo 'devenv 2.3.0'; }}\n{}",
+        scripts::install_script(&BootstrapConfig::from_request(&request)?)
+    );
 
     assert!(
         Command::new("bash")
             .arg("-lc")
             .arg(script)
-            .env("PATH", format!("{}:/bin:/usr/bin", path_dir.display()))
             .status()?
             .success()
     );

@@ -140,7 +140,7 @@ their accompanying SHA-256 files (APoC `01a085d8-946d-7dc2-8c5a-357aaad64639`).
 These are CI artifacts, not a published release or installed fleet update.
 Quality run `34341724174` exhausted the Linux runner disk while building upstream
 devenv dependencies. Commit `719e245` enables the official upstream binary caches;
-replacement Quality run `34343120731` is pending at this record's last update.
+replacement Quality run `34343120731` passed on Linux and macOS.
 
 ## Bootstrap follow-up
 
@@ -164,3 +164,32 @@ and the installed seed retained the expected SHA-256. Build execution:
 `01a085db-f5c6-7400-a423-171f71694ed0`; live smoke:
 `01a085dd-e10e-7d50-be22-0e473715acf0`. Its isolated install location is
 `/home/exedev/workenv-rewrite-user-bootstrap-20260909/nested/bin/workenv-canary-seed`.
+
+## Final production revision
+
+Production revision `7aa68da366a1aeff0e274111d51899fdd9c91878` passed both hosted
+Quality jobs in run `34344341077` and all four release builds in run
+`34344341085`. All final downloaded archives matched their checksums
+(`01a085e9-22bc-7933-9227-e99fa103394d`). The final macOS ARM64 CLI ran locally
+(`01a085e9-8b17-71d1-bf53-8b097bc4ef47`), and the Linux x86-64 CLI ran outside
+Nix on worker 02 (`01a085e9-e516-7502-a7d9-dcb64d8f4956`).
+
+| Final Nix artifact | Value |
+| --- | --- |
+| Package | `/nix/store/5k2xmvd6gbzi2csdpbg0anzlplxlb023-workenv-0.2.0` |
+| CLI SHA-256 | `50ca9f5681f40ee12148929d4aca95dfa25243ec0029c6ea3079315af2b2fb59` |
+| Bootstrap SHA-256 | `9a3434544ac6d317d798305678cbe17bdfb2a0b0cbdad09cb3c66d0a251cf83f` |
+| Filtered source NAR hash | `sha256-T7sHJKjLBv6FOfKxuKdortL/Vk/lJFj4FKchFYOUVpw=` |
+| Nix build | `01a085e0-0252-7520-829c-c1756c37c69f` |
+| Artifact validation | `01a085e4-032d-7ab1-b21d-5732c37fce08` |
+| Canary apply: changed | `01a085e5-7b1a-7060-9b84-1cc682da0a62` |
+| Canary repeat: ready | `01a085e6-9732-70b1-aec8-1b0c1a5a9d5c` |
+| Canary status: ready | `01a085e6-9732-70b1-aec8-1b1da91fb6e7` |
+
+A later test-only correction replaces PATH-based Nix/devenv doubles with shell
+functions, preventing the host's Nix profile from overriding them. Its seven Mac
+tests passed (`01a085ee-8547-7c61-8291-a1e239052b0f`), as did Clippy
+(`01a085ee-85bc-7130-86ad-caa41b64c902`) and formatting
+(`01a085ee-8613-7ab2-86e0-da4c3faaeed3`). The same seven tests passed through
+devenv on Linux (`01a085f0-055b-7b40-a445-b3cc03fb3dc6`). Production sources are
+unchanged by this test correction and documentation update.
