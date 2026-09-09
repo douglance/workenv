@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "personal",
+  "github_login": "operator",
+  "git_name": "Operator",
+  "git_email": "operator@example.com",
+  "anthropic_profile": "personal"
+}

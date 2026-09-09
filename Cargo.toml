@@ -1,15 +1,21 @@
-[package]
-name = "workenv"
-version = "0.1.0"
-edition = "2021"
-description = "Personal development workers through one CLI and MCP command graph"
+[workspace]
+members = ["crates/*", "adapters/*", "xtask"]
+resolver = "3"
 
-[dependencies]
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+repository = "https://github.com/douglance/workenv"
+
+[workspace.dependencies]
 anyhow = "1"
 base64 = "0.22"
 flate2 = "1"
 fs2 = "0.4"
 incurs = { version = "=0.5.3", features = ["mcp"] }
+jsonschema = { version = "0.55.1", default-features = false }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,3 +24,25 @@ tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+toml = "0.8"
+workenv-protocol = { path = "crates/workenv-protocol" }
+workenv-platform = { path = "crates/workenv-platform" }
+workenv-core = { path = "crates/workenv-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+excessive_nesting = "warn"
+too_many_arguments = "warn"
+too_many_lines = "warn"
+cognitive_complexity = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "deny"
+unimplemented = "deny"

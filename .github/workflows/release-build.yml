@@ -1,0 +1,89 @@
+name: Release Build
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: workenv-x86_64-unknown-linux-gnu
+            use-cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: workenv-aarch64-unknown-linux-gnu
+            use-cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: workenv-x86_64-apple-darwin
+            use-cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: workenv-aarch64-apple-darwin
+            use-cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - name: Artifact Scope
+        run: echo "This workflow proves compiled release artifacts only; it is not physical installation, launch, or runtime proof."
+      - name: Install Cross
+        if: matrix.use-cross
+        run: cargo install cross --locked
+      - name: Build
+        run: |
+          packages=(
+            -p workenv
+            -p workenv-adapter-bootstrap
+            -p workenv-adapter-clipboard
+            -p workenv-adapter-exedev
+            -p workenv-adapter-herdr
+            -p workenv-adapter-identity
+            -p workenv-adapter-ssh
+            -p workenv-adapter-tailscale
+          )
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --locked --release --target "${{ matrix.target }}" "${packages[@]}"
+          else
+            cargo build --locked --release --target "${{ matrix.target }}" "${packages[@]}"
+          fi
+      - name: Package
+        run: |
+          artifact_dir="dist/${{ matrix.artifact }}"
+          binary_dir="target/${{ matrix.target }}/release"
+          binaries=(
+            workenv
+            workenv-adapter-bootstrap
+            workenv-adapter-clipboard
+            workenv-adapter-exedev
+            workenv-adapter-herdr
+            workenv-adapter-identity
+            workenv-adapter-ssh
+            workenv-adapter-tailscale
+          )
+
+          mkdir -p "$artifact_dir/bin"
+          for binary in "${binaries[@]}"; do
+            cp "$binary_dir/$binary" "$artifact_dir/bin/$binary"
+          done
+
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+          shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256

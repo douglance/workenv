@@ -1,0 +1,74 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v17
+      - name: Workenv Check
+        run: nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- shell -- workenv-check
+      - name: Evaluate Devenv Modules
+        run: |
+          check_dir="$(mktemp -d)"
+          cp "${GITHUB_WORKSPACE}/devenv.yaml" "$check_dir/devenv.yaml"
+          cp "${GITHUB_WORKSPACE}/devenv.lock" "$check_dir/devenv.lock"
+          cat > "$check_dir/devenv.nix" <<EOF
+          { config, ... }:
+          {
+            imports = [
+              ${GITHUB_WORKSPACE}/modules/default.nix
+              ${GITHUB_WORKSPACE}/examples/external-extension/module.nix
+            ];
+
+            workenv = {
+              base.enable = true;
+              apoc.enable = true;
+              bootstrap.enable = true;
+              clipboard.enable = true;
+              exedev.enable = true;
+              herdr.enable = true;
+              identity.enable = true;
+              lima.enable = true;
+              rust.enable = false;
+              rust.rustPackage = config.languages.rust.toolchainPackage;
+              ssh.enable = true;
+              tailscale.enable = true;
+              tools.enable = true;
+            };
+            exampleExtension.enable = true;
+          }
+          EOF
+          nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- eval --from "path:$check_dir" workenv.manifestJSON > "$check_dir/manifest.json"
+          nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- shell -- jq -e '
+            ."workenv.manifestJSON" | fromjson | .extensions as $extensions |
+            [
+              "example.independent",
+              "workenv.bootstrap",
+              "workenv.clipboard",
+              "workenv.exedev",
+              "workenv.herdr",
+              "workenv.identity",
+              "workenv.lima",
+              "workenv.ssh",
+              "workenv.tailscale"
+            ] as $expected |
+            ($expected - ($extensions | keys)) as $missing |
+            if ($missing | length) == 0 then
+              ($extensions["example.independent"].version == "1.0.0") and
+              ($expected | map(select(. != "example.independent")) |
+                all(. as $name | $extensions[$name].version == "0.2.0"))
+            else
+              "missing extensions: \($missing | join(", "))" | halt_error(1)
+            end
+          ' "$check_dir/manifest.json"
