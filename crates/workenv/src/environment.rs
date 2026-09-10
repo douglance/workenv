@@ -17,7 +17,7 @@ struct EnvironmentArgs {
 
 #[derive(Deserialize, incurs::Options)]
 struct Options {
-    /// Stable operation key; required for create, apply, and destroy.
+    /// Stable operation key; required for create, apply, destroy, up, and down.
     idempotency_key: Option<String>,
 }
 
@@ -48,6 +48,16 @@ pub(crate) fn commands() -> Cli {
             "Destroy an explicitly owned disposable environment resource.",
             true,
         ),
+        (
+            "up",
+            "Provision, apply, and register the configured environment lifecycle.",
+            true,
+        ),
+        (
+            "down",
+            "Destroy and clean up the configured owned disposable environment lifecycle.",
+            true,
+        ),
     ] {
         group = group.command(name, operation(name, description, mutating));
     }
@@ -76,7 +86,7 @@ fn operation(name: &'static str, description: &'static str, mutating: bool) -> C
         },
     )
     .description(description)
-    .mcp(mcp(!mutating, name == "destroy"))
+    .mcp(mcp(!mutating, matches!(name, "destroy" | "down")))
     .done()
 }
 

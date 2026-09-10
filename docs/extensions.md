@@ -83,6 +83,18 @@ references to an appropriate credential store instead.
 
 ## Clean up a destroyed environment
 
+`environment up` runs provider `create`, environment `apply`, then each declared
+integration's `register` operation. `environment down` uses the same destruction
+and cleanup path as `environment destroy`. Failed or pending stages prevent a
+successful lifecycle result.
+
+During `apply`, declared `prepare` operations run after prerequisite bootstrap
+and directory creation, before devenv realization. A target `prepare` runs
+outside devenv: local targets use the declared executable directly; remote
+targets resolve its basename on the target's PATH. Bootstrap must install that
+native adapter first. This lets a project adapter clone the repository before
+its devenv configuration exists. Other target operations run inside devenv.
+
 An integration can declare a mutating `cleanup` operation. Workenv invokes it on
 the controller after the provider confirms destruction, including when the
 previously owned provider resource is already absent. Declare

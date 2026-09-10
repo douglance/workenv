@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::path::Path;
 use workenv_protocol::AdapterRequest;
 
 const DEFAULT_NIX_VERSION: &str = "2.35.2";
@@ -9,6 +10,7 @@ const DEFAULT_NIX_INSTALL_SHA256: &str =
 const DEFAULT_DEVENV_VERSION: &str = "2.3.0";
 const DEFAULT_DEVENV_FLAKE: &str = "github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2";
 
+#[derive(Clone)]
 pub(crate) struct BootstrapConfig {
     pub(crate) prefix: String,
     pub(crate) link_dir: String,
@@ -66,18 +68,25 @@ pub(crate) struct SeedTool {
     pub(crate) name: String,
     pub(crate) source: String,
     pub(crate) sha256: String,
+    pub(crate) controller_path: Option<String>,
 }
 
 impl SeedTool {
     fn from_value(value: &Value) -> Result<Self> {
+        let name = required(value, "name", "seed_tools[].name")?;
+        let sha256 = required(value, "sha256", "seed_tools[].sha256")?;
+        validate_seed_name(name)?;
+        validate_seed_sha(sha256)?;
         Ok(Self {
-            name: required(value, "name", "seed_tools[].name")?.to_owned(),
+            name: name.to_owned(),
             source: string(value, "path")
                 .or_else(|| string(value, "install_url"))
                 .or_else(|| string(value, "url"))
-                .context("seed_tools[] requires path, install_url, or url")?
+                .or_else(|| string(value, "controller_path"))
+                .context("seed_tools[] requires path, install_url, url, or controller_path")?
                 .to_owned(),
-            sha256: required(value, "sha256", "seed_tools[].sha256")?.to_owned(),
+            sha256: sha256.to_owned(),
+            controller_path: string(value, "controller_path").map(ToOwned::to_owned),
         })
     }
 }
@@ -88,4 +97,24 @@ fn required<'a>(value: &'a Value, key: &str, label: &str) -> Result<&'a str> {
 
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+fn validate_seed_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.starts_with('-') {
+        bail!("seed_tools[].name must be a safe basename");
+    }
+    let path = Path::new(name);
+    if path.components().count() != 1
+        || path.file_name().and_then(|part| part.to_str()) != Some(name)
+    {
+        bail!("seed_tools[].name must be a safe basename");
+    }
+    Ok(())
+}
+
+fn validate_seed_sha(sha: &str) -> Result<()> {
+    if sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    bail!("seed_tools[].sha256 must be 64 hex characters")
 }

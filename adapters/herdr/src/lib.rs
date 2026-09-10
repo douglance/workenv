@@ -5,7 +5,9 @@ use serde_json::{Map, Value, json};
 use workenv_platform::{ApocExecutor, ExecutionSpec, Executor};
 
 mod cleanup;
+mod configuration;
 mod machines;
+mod server;
 mod util;
 
 use util::{
@@ -37,7 +39,8 @@ pub fn handle_with(request: &AdapterRequest, runner: &impl Executor) -> Result<A
         "register" => register(request, runner),
         "cleanup" => cleanup::run(request, runner),
         "connect" => Ok(connect(request)),
-        "config" | "apply" => configure(request),
+        "config" => configure(request),
+        "apply" => server::apply(request, runner),
         operation => bail!("unsupported Herdr operation {operation}"),
     }
 }
@@ -55,7 +58,11 @@ fn inspect(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterRe
         ],
         cwd: Some(request.target.directory.clone()),
         stdin: None,
-        idempotency_key: format!("{}:herdr-status", request.request_id),
+        idempotency_key: format!(
+            "{}:herdr-status:{}",
+            request.request_id,
+            uuid::Uuid::new_v4()
+        ),
         purpose: "Inspect scoped Herdr server status.".to_string(),
         timeout_ms: 60_000,
     })?;
@@ -100,7 +107,9 @@ fn register(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterR
     {
         return Ok(response);
     }
-    let existing = machines::find(&machines, &request.target.host, &target, &session);
+    let label = optional_string(&request.config, "label")
+        .unwrap_or_else(|| request.target.environment.clone());
+    let existing = machines::find(&machines, &label, &target, &session);
     if let Some(machine) = existing {
         return Ok(machines::registered_response(
             request, machine, &target, &session,
@@ -113,7 +122,7 @@ fn register(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterR
             "add".to_string(),
             target.clone(),
             "--label".to_string(),
-            request.target.host.clone(),
+            label,
             "--remote-session".to_string(),
             session.clone(),
         ],
@@ -203,11 +212,13 @@ fn configure(request: &AdapterRequest) -> Result<AdapterResponse> {
         "profile_digest": digest,
     });
     let changed = atomic_json(&path, &payload)?;
+    let runtime = configuration::write(request)?;
     let mut data = Map::new();
     data.insert("status".to_string(), json!("herdr_configured"));
     data.insert("path".to_string(), json!(path));
     data.insert("profile".to_string(), payload["profile"].clone());
-    Ok(response_status(request, changed, data))
+    data.insert("config_path".to_string(), json!(runtime.path));
+    Ok(response_status(request, changed || runtime.changed, data))
 }
 
 fn herdr_ready(server: &Value) -> bool {

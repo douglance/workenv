@@ -2,6 +2,7 @@
 mod config;
 mod privilege;
 mod scripts;
+mod seed_stage;
 #[cfg(test)]
 mod tests;
 
@@ -11,6 +12,7 @@ use anyhow::Result;
 use config::BootstrapConfig;
 use privilege::{can_install_without_privilege, has_privilege, privilege_required};
 use scripts::{install_script, probe_script};
+use seed_stage::{SeedStage, stage_controller_seed_tools};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workenv_platform::{ApocExecutor, ExecutionOutput, ExecutionSpec, Executor};
@@ -67,10 +69,22 @@ fn bootstrap(request: &AdapterRequest) -> Result<AdapterResponse> {
             Some("bootstrap requires passwordless sudo or root"),
         ));
     }
+    install_and_verify(request, &config)
+}
+
+fn install_and_verify(
+    request: &AdapterRequest,
+    config: &BootstrapConfig,
+) -> Result<AdapterResponse> {
+    let staged = match stage_controller_seed_tools(request, config) {
+        Ok(SeedStage::Ready(config)) => config,
+        Ok(SeedStage::Pending(response) | SeedStage::Failed(response)) => return Ok(response),
+        Err(error) => return Ok(seed_staging_failed(request, &error.to_string())),
+    };
     let output = run_target(
         request,
-        &install_script(&config),
-        Duration::from_millis(config.timeout_ms),
+        &install_script(&staged),
+        Duration::from_millis(staged.timeout_ms),
         "install",
     )?;
     if output.exit_code.is_none() {
@@ -87,7 +101,14 @@ fn bootstrap(request: &AdapterRequest) -> Result<AdapterResponse> {
             Some("bootstrap install command failed"),
         ));
     }
-    let (after, pending_id) = probe(request, &config, "probe-after")?;
+    probe_after_install(request, &staged)
+}
+
+fn probe_after_install(
+    request: &AdapterRequest,
+    config: &BootstrapConfig,
+) -> Result<AdapterResponse> {
+    let (after, pending_id) = probe(request, config, "probe-after")?;
     if pending_id.is_some() {
         return Ok(with_execution_id(
             AdapterResponse::new(request, ResponseStatus::Pending, after),
@@ -103,6 +124,15 @@ fn bootstrap(request: &AdapterRequest) -> Result<AdapterResponse> {
         )
     };
     Ok(response(request, status, after, error))
+}
+
+fn seed_staging_failed(request: &AdapterRequest, error: &str) -> AdapterResponse {
+    response(
+        request,
+        ResponseStatus::Failed,
+        json!({"ready":false,"status":"seed_staging_failed"}),
+        Some(error),
+    )
 }
 
 fn probe(
@@ -181,7 +211,7 @@ pub(crate) fn run_target(
     })
 }
 
-fn ssh_args(address: &str, script: &str) -> Vec<String> {
+pub(crate) fn ssh_args(address: &str, script: &str) -> Vec<String> {
     [
         "-o",
         "BatchMode=yes",
@@ -222,7 +252,7 @@ fn observation_nonce() -> String {
     )
 }
 
-fn output_data(output: &ExecutionOutput) -> Value {
+pub(crate) fn output_data(output: &ExecutionOutput) -> Value {
     json!({"stdout":output.stdout.trim(),"stderr":output.stderr.trim(),
         "exit_code":output.exit_code,"execution_id":output.execution_id})
 }
@@ -243,7 +273,7 @@ fn seed_tool_report(rows: &serde_json::Map<String, Value>, config: &BootstrapCon
         .collect()
 }
 
-fn response(
+pub(crate) fn response(
     request: &AdapterRequest,
     status: ResponseStatus,
     data: Value,

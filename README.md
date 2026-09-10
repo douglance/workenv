@@ -29,6 +29,8 @@ also accepts an exported manifest for a machine that does not yet have devenv.
 | `environment list` | List declared environments |
 | `environment status NAME` | Inspect readiness |
 | `environment plan NAME` | Inspect proposed setup operations |
+| `environment up NAME` | Provision, prepare the project, apply devenv, and register access |
+| `environment down NAME` | Destroy an owned ephemeral resource and remove access registrations |
 | `environment create NAME` | Provision a declared resource |
 | `environment apply NAME` | Apply devenv and enabled setup integrations |
 | `environment connect NAME` | Enter the configured shell or access client |
@@ -45,8 +47,9 @@ or authorize a second provider resource.
 ```sh
 workenv environment list --format json
 workenv environment plan dev --format json
-workenv environment apply dev --idempotency-key dev-setup-1 --format json
+workenv environment up dev --idempotency-key dev-up-1 --format json
 workenv environment connect dev
+workenv environment down dev --idempotency-key dev-down-1 --format json
 workenv extension inspect example.independent --format json
 workenv extension call example.independent inspect --environment dev --input '{}'
 workenv --root /path/to/config --mcp
@@ -77,6 +80,12 @@ An environment names its host, target directory, configuration source, devenv
 profiles, integrations, and optional connection adapter. Static environments
 persist across connections. `ephemeral = true` permits explicit destruction
 only when a provider receipt proves that Workenv owns the resource.
+
+The optional project adapter prepares an editable Git checkout before devenv
+starts. Herdr's apply operation starts a compatible session whose panes enter
+the project's devenv shell; `up` then registers that session on the controller.
+Include the same Herdr binding in `integrations` and `connection` so `down` can
+remove its exact registration. See [the setup procedure](docs/operate.md).
 
 ## Extensions
 

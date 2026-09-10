@@ -3544,6 +3544,7 @@ dependencies = [
  "anyhow",
  "serde_json",
  "tempfile",
+ "toml",
  "uuid",
  "workenv-platform",
  "workenv-protocol",
@@ -3568,6 +3569,17 @@ dependencies = [
  "anyhow",
  "serde_json",
  "sha2",
+ "tempfile",
+ "workenv-platform",
+ "workenv-protocol",
+]
+
+[[package]]
+name = "workenv-adapter-project"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
  "tempfile",
  "workenv-platform",
  "workenv-protocol",

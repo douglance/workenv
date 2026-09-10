@@ -209,7 +209,7 @@ fn request(path: &std::path::Path, operation: &str) -> AdapterRequest {
             source: ".".to_string(),
             profiles: Vec::new(),
         },
-        config: json!({"session":"workenv"}),
+        config: json!({"session":"workenv","label":"workenv-01"}),
         input: json!({}),
         previous: None,
     }

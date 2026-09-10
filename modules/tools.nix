@@ -14,7 +14,17 @@ let
       { };
 
   hostSystem = pkgs.stdenv.hostPlatform.system;
-  defaultPlatforms = spec: spec.platforms or [ "x86_64-linux" ];
+
+  # A tool may carry per-system artifacts under `by_system`. Merge the entry for
+  # the evaluating system over the base spec so every builder below stays
+  # unchanged, and derive the supported platforms from the declared keys.
+  resolveSpec = spec: spec // ((spec.by_system or { }).${hostSystem} or { });
+  defaultPlatforms =
+    spec:
+    if spec ? by_system then
+      builtins.attrNames spec.by_system
+    else
+      spec.platforms or [ "x86_64-linux" ];
   platformAvailable = platforms: platforms == [ ] || lib.elem hostSystem platforms;
   isAvailable = package: platformAvailable (package.meta.platforms or lib.platforms.all);
 
@@ -198,9 +208,12 @@ let
     };
 
   buildPinnedPackage =
-    name: spec:
-    if !(platformAvailable (defaultPlatforms spec)) then
-      unsupportedPackage name spec
+    name: rawSpec:
+    let
+      spec = resolveSpec rawSpec;
+    in
+    if !(platformAvailable (defaultPlatforms rawSpec)) then
+      unsupportedPackage name rawSpec
     else if spec.kind or "" == "direct-binary" then
       directBinary name spec
     else if spec.kind or "" == "tar-xz-member" then
@@ -215,17 +228,29 @@ let
       throw "Unsupported pinned Workenv tool kind for ${name}: ${spec.kind or "missing"}";
 
   buildLocalPackage =
-    name: spec:
-    if !(platformAvailable (defaultPlatforms spec)) then
-      unsupportedPackage name spec
+    name: rawSpec:
+    let
+      spec = resolveSpec rawSpec;
+    in
+    if !(platformAvailable (defaultPlatforms rawSpec)) then
+      unsupportedPackage name rawSpec
     else if name == "nib" then
       nibPackage spec
     else
       localArchiveMember name spec;
 
   nativeTools = toolsManifest.native_tools or { };
-  nativePinned = lib.filterAttrs (_: spec: spec ? url) nativeTools;
-  nativeLocal = lib.filterAttrs (_: spec: spec ? archive_path) nativeTools;
+
+  # An artifact field may live on the entry itself or inside `by_system`, so a
+  # tool must be classified on whether any variant declares it. Filtering on the
+  # resolved spec alone would make a tool vanish on systems it does not support
+  # instead of surfacing as unsupported.
+  declaresAnywhere =
+    field: spec:
+    (spec ? ${field})
+    || builtins.any (variant: variant ? ${field}) (builtins.attrValues (spec.by_system or { }));
+  nativePinned = lib.filterAttrs (_: declaresAnywhere "url") nativeTools;
+  nativeLocal = lib.filterAttrs (_: declaresAnywhere "archive_path") nativeTools;
 
   knownPinned = nativePinned // (toolsManifest.npm_tools or { }) // cfg.pinnedBinaries;
 

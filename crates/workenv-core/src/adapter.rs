@@ -19,7 +19,7 @@ mod adapter_target;
 #[path = "adapter_transport.rs"]
 mod adapter_transport;
 
-use adapter_target::{target_argv, target_command};
+use adapter_target::{local_target_command, target_command};
 use adapter_transport::{pending_transport, request_for_transport, transport_response};
 
 pub(crate) struct Invocation<'a> {
@@ -187,9 +187,10 @@ fn invoke_local_target(
     extension: &Extension,
     request: &AdapterRequest,
 ) -> Result<AdapterResponse> {
+    let (executable, arg) = local_target_command(extension, request)?;
     let spec = ExecutionSpec {
-        executable: "devenv".to_owned(),
-        arg: target_argv(extension, request)?,
+        executable,
+        arg,
         cwd: Some(request.target.directory.clone()),
         stdin: Some(serde_json::to_vec(request)?),
         timeout_ms: 300_000,
@@ -270,6 +271,10 @@ mod tests;
 #[cfg(test)]
 #[path = "adapter_remote_tests.rs"]
 mod remote_tests;
+
+#[cfg(test)]
+#[path = "adapter_prepare_tests.rs"]
+mod prepare_tests;
 
 #[cfg(test)]
 #[path = "adapter_controller_tests.rs"]

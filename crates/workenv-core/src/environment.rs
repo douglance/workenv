@@ -14,14 +14,15 @@ impl Controller {
         let environment = self.environment_ref(name)?;
         let host = self.host_for(environment)?;
         let integrations: Vec<_> = environment.integrations.iter().map(|binding| {
-            let operations: Vec<_> = ["bootstrap","apply"].into_iter()
+            let operations: Vec<_> = ["bootstrap","prepare","apply","register"].into_iter()
                 .filter(|operation|self.supports(&binding.extension,operation)).collect();
             json!({"extension":binding.extension,"operations":operations,"config":binding.config})
         }).collect();
         Ok(json!({"ok":true,"status":"planned","environment":name,
             "host":environment.host,"directory":environment.directory,"source":environment.source,
             "provider":host.provider,"integrations":integrations,"profiles":environment.profiles,
-            "apply_stages":["bootstrap","prepare_directory","devenv_shell","integrations"],
+            "up_stages":["create","apply","register"],
+            "apply_stages":["bootstrap","prepare_directory","prepare","devenv_shell","integrations"],
             "ephemeral":environment.ephemeral}))
     }
 
@@ -61,6 +62,9 @@ impl Controller {
         let prepared = self.prepare_directory(name, key)?;
         results.push(outcome::step("directory", &prepared));
         if !prepared.complete() {
+            return Ok(outcome::aggregate(name, "apply", &results));
+        }
+        if !apply_prepare_integrations(self, name, key, &mut results)? {
             return Ok(outcome::aggregate(name, "apply", &results));
         }
         let realized = self.realize(name, key)?;
@@ -214,6 +218,27 @@ impl Controller {
         results.push(outcome::step(&binding.extension, &response));
         Ok(response.complete())
     }
+}
+
+fn apply_prepare_integrations(
+    controller: &Controller,
+    name: &str,
+    key: Option<&str>,
+    results: &mut Vec<Value>,
+) -> Result<bool> {
+    let environment = controller.environment_ref(name)?;
+    for binding in environment
+        .integrations
+        .iter()
+        .filter(|binding| controller.supports(&binding.extension, "prepare"))
+    {
+        let response = controller.setup_binding(binding, "prepare", name, key)?;
+        results.push(outcome::step(&binding.extension, &response));
+        if !response.complete() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn is_bootstrap(controller: &Controller, binding: &Binding) -> bool {

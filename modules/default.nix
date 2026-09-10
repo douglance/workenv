@@ -12,5 +12,6 @@
     ./lima.nix
     ./ssh.nix
     ./bootstrap.nix
+    ./project.nix
   ];
 }

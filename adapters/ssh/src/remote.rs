@@ -1,9 +1,25 @@
+use std::{
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+mod argv;
+
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use workenv_platform::{ApocExecutor, ExecutionSpec, Executor};
 use workenv_protocol::AdapterRequest;
+
+pub(crate) use argv::ssh_argv;
+#[cfg(test)]
+use argv::stdin_wrapper_args;
+use argv::{logs_argv, ssh_args, start_argv, wait_argv};
+
+const OUTER_SSH_TIMEOUT_MS: u64 = 30_000;
+const REMOTE_WAIT_TIMEOUT_MS: u64 = 25_000;
+static OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct ExecuteResult {
     pub(crate) data: Value,
@@ -21,40 +37,98 @@ pub(crate) struct RemoteExecute<'a> {
 }
 
 pub(crate) fn execute_remote(input: RemoteExecute<'_>) -> Result<ExecuteResult> {
-    let start_argv = start_argv(input.request, input.argv, input.cwd, input.purpose)?;
-    let start = remote_json(RemoteCommand {
-        address: input.address,
-        remote: &start_argv,
-        timeout_ms: input.timeout.min(30_000),
-        request_id: &input.request.request_id,
-        phase: "start",
-        purpose: input.purpose,
-    })?;
-    let id = execution_id(&start).context("remote APoC start returned no execution ID")?;
-    let wait_argv = wait_argv(&id, input.purpose, input.timeout);
-    let Ok(waited) = remote_json(RemoteCommand {
-        address: input.address,
-        remote: &wait_argv,
-        timeout_ms: input.timeout.min(30_000),
-        request_id: &input.request.request_id,
-        phase: "wait",
-        purpose: input.purpose,
-    }) else {
+    let cwd = std::env::current_dir()?;
+    let executor = ApocExecutor::new(cwd.clone());
+    execute_remote_with(input, &executor, &cwd)
+}
+
+fn execute_remote_with(
+    input: RemoteExecute<'_>,
+    executor: &dyn Executor,
+    local_cwd: &Path,
+) -> Result<ExecuteResult> {
+    let id = start_remote(input, executor, local_cwd)?;
+    let Some(waited) = wait_remote(input, executor, local_cwd, &id) else {
         return Ok(pending(id));
     };
-    if waited["outcome"] == "pending" || waited["status"] == "pending" {
-        return Ok(pending(id));
+    if outcome(&waited).is_none() {
+        return Ok(remote_error(&id, &waited));
     }
-    let logs_argv = logs_argv(&id, input.purpose);
-    let logs = remote_json(RemoteCommand {
-        address: input.address,
-        remote: &logs_argv,
-        timeout_ms: 30_000,
-        request_id: &input.request.request_id,
-        phase: "logs",
-        purpose: input.purpose,
-    })?;
-    let code = exit_code(&waited).unwrap_or_else(|| i64::from(waited["outcome"] != "passed"));
+    completed_result(input, executor, local_cwd, &id, &waited)
+}
+
+fn start_remote(
+    input: RemoteExecute<'_>,
+    executor: &dyn Executor,
+    local_cwd: &Path,
+) -> Result<String> {
+    let start_argv = start_argv(input.request, input.argv, input.cwd, input.purpose)?;
+    let start = remote_json(
+        RemoteCommand {
+            address: input.address,
+            remote: &start_argv,
+            timeout_ms: input.timeout.min(OUTER_SSH_TIMEOUT_MS),
+            request_id: &input.request.request_id,
+            phase: "start",
+            purpose: input.purpose,
+            key: RemoteKey::Stable,
+        },
+        executor,
+        local_cwd,
+    )?;
+    execution_id(&start).context("remote APoC start returned no execution ID")
+}
+
+fn wait_remote(
+    input: RemoteExecute<'_>,
+    executor: &dyn Executor,
+    local_cwd: &Path,
+    id: &str,
+) -> Option<Value> {
+    let wait_argv = wait_argv(id, input.purpose, remote_wait_timeout(input.timeout));
+    let Ok(waited) = remote_json(
+        RemoteCommand {
+            address: input.address,
+            remote: &wait_argv,
+            timeout_ms: OUTER_SSH_TIMEOUT_MS,
+            request_id: &input.request.request_id,
+            phase: "wait",
+            purpose: input.purpose,
+            key: RemoteKey::Fresh,
+        },
+        executor,
+        local_cwd,
+    ) else {
+        return None;
+    };
+    if observation_waits(&waited) {
+        return None;
+    }
+    Some(waited)
+}
+
+fn completed_result(
+    input: RemoteExecute<'_>,
+    executor: &dyn Executor,
+    local_cwd: &Path,
+    id: &str,
+    waited: &Value,
+) -> Result<ExecuteResult> {
+    let logs_argv = logs_argv(id, input.purpose);
+    let logs = remote_json(
+        RemoteCommand {
+            address: input.address,
+            remote: &logs_argv,
+            timeout_ms: OUTER_SSH_TIMEOUT_MS,
+            request_id: &input.request.request_id,
+            phase: "logs",
+            purpose: input.purpose,
+            key: RemoteKey::Fresh,
+        },
+        executor,
+        local_cwd,
+    )?;
+    let code = exit_code(waited).unwrap_or_else(|| i64::from(outcome(waited) != Some("passed")));
     Ok(ExecuteResult {
         data: json!({"stdout":logs["stdout"].as_str().unwrap_or_default(),
             "stderr":logs["stderr"].as_str().unwrap_or_default(),
@@ -70,88 +144,23 @@ fn pending(id: String) -> ExecuteResult {
     }
 }
 
-fn start_argv(
-    request: &AdapterRequest,
-    argv: &[String],
-    cwd: &str,
-    purpose: &str,
-) -> Result<Vec<String>> {
-    let executable = argv.first().context("execute argv must not be empty")?;
-    let mut remote = vec!["apoc".into(), "execution".into(), "start".into()];
-    let child_args = if let Some(stdin) = request.input["stdin"].as_str() {
-        remote.push("/bin/bash".into());
-        stdin_wrapper_args(stdin, executable, &argv[1..], cwd)
-    } else {
-        remote.push(executable.clone());
-        argv.iter().skip(1).cloned().collect()
-    };
-    remote.extend(apoc_start_options(cwd, purpose, &request.request_id));
-    remote.extend(child_args);
-    Ok(remote)
+fn remote_error(id: &str, error: &Value) -> ExecuteResult {
+    ExecuteResult {
+        data: json!({"stdout":"","stderr":error.to_string(),"exit_code":1,"execution_id":id}),
+        execution_id: None,
+    }
 }
 
-fn apoc_start_options(cwd: &str, purpose: &str, key: &str) -> Vec<String> {
-    [
-        "--cwd",
-        cwd,
-        "--purpose",
-        purpose,
-        "--idempotency-key",
-        key,
-        "--format",
-        "json",
-        "--verbosity",
-        "trace",
-        "--expect-exit-code",
-        "0",
-        "--",
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect()
+fn observation_waits(value: &Value) -> bool {
+    value["outcome"] == "pending" || value["status"] == "pending" || value["code"] == "TIMEOUT"
 }
 
-fn stdin_wrapper_args(stdin: &str, executable: &str, args: &[String], cwd: &str) -> Vec<String> {
-    let encoded = BASE64.encode(stdin.as_bytes());
-    let script = format!(
-        "p=$(mktemp) || exit; trap 'rm -f \"$p\"' EXIT; printf %s {} | base64 -d > \"$p\" || exit; cd {} || exit; exec \"$@\" < \"$p\"",
-        shell_quote(&encoded),
-        shell_quote(cwd)
-    );
-    let mut out = vec!["-lc".into(), script];
-    out.extend(["workenv-stdin".into(), executable.into()]);
-    out.extend(args.iter().cloned());
-    out
+fn outcome(value: &Value) -> Option<&str> {
+    value.get("outcome").and_then(Value::as_str)
 }
 
-fn wait_argv(id: &str, purpose: &str, timeout: u64) -> Vec<String> {
-    vec![
-        "apoc".into(),
-        "execution".into(),
-        "wait".into(),
-        id.into(),
-        "--timeout-ms".into(),
-        timeout.to_string(),
-        "--purpose".into(),
-        purpose.into(),
-        "--format".into(),
-        "json".into(),
-    ]
-}
-
-fn logs_argv(id: &str, purpose: &str) -> Vec<String> {
-    vec![
-        "apoc".into(),
-        "execution".into(),
-        "logs".into(),
-        id.into(),
-        "--tail-bytes".into(),
-        "16777216".into(),
-        "--purpose".into(),
-        purpose.into(),
-        "--format".into(),
-        "json".into(),
-    ]
+fn remote_wait_timeout(timeout: u64) -> u64 {
+    timeout.min(REMOTE_WAIT_TIMEOUT_MS)
 }
 
 #[derive(Clone, Copy)]
@@ -162,62 +171,56 @@ struct RemoteCommand<'a> {
     request_id: &'a str,
     phase: &'a str,
     purpose: &'a str,
+    key: RemoteKey,
 }
 
-fn remote_json(command: RemoteCommand<'_>) -> Result<Value> {
-    let output = ApocExecutor::new(std::env::current_dir()?).execute(ExecutionSpec {
+#[derive(Clone, Copy)]
+enum RemoteKey {
+    Stable,
+    Fresh,
+}
+
+fn remote_json(
+    command: RemoteCommand<'_>,
+    executor: &dyn Executor,
+    local_cwd: &Path,
+) -> Result<Value> {
+    let output = executor.execute(ExecutionSpec {
         executable: "ssh".into(),
         arg: ssh_args(command.address, command.remote),
-        cwd: std::env::current_dir().ok(),
+        cwd: Some(local_cwd.to_owned()),
         stdin: None,
         timeout_ms: command.timeout_ms,
-        idempotency_key: format!(
-            "{}:ssh:{}:{}",
-            command.request_id,
-            command.phase,
-            digest(command.remote)
-        ),
+        idempotency_key: idempotency_key(command),
         purpose: command.purpose.into(),
     })?;
     serde_json::from_str(&output.stdout)
         .with_context(|| format!("remote command returned invalid JSON: {}", output.stderr))
 }
 
-pub(crate) fn ssh_argv(address: &str) -> Vec<&str> {
-    vec![
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        address,
-    ]
+fn idempotency_key(command: RemoteCommand<'_>) -> String {
+    match command.key {
+        RemoteKey::Stable => format!(
+            "{}:ssh:{}:{}",
+            command.request_id,
+            command.phase,
+            digest(command.remote)
+        ),
+        RemoteKey::Fresh => fresh_observation_key(command),
+    }
 }
 
-fn ssh_args(address: &str, remote: &[String]) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=15".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=yes".into(),
-        address.into(),
-        shell_join(remote),
-    ]
-}
-
-fn shell_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+fn fresh_observation_key(command: RemoteCommand<'_>) -> String {
+    let sequence = OBSERVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!(
+        "{}:ssh:{}:{}:{now}:{sequence}",
+        command.request_id,
+        command.phase,
+        digest(command.remote)
+    )
 }
 
 fn digest(argv: &[String]) -> String {
@@ -242,15 +245,5 @@ fn exit_code(value: &Value) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stdin_wrapper_preserves_executable_argument() -> Result<()> {
-        let args = stdin_wrapper_args("hello", "cat", &[], ".");
-        let output = std::process::Command::new("bash").args(args).output()?;
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
-        Ok(())
-    }
-}
+#[path = "remote_tests.rs"]
+mod tests;

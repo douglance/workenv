@@ -1,4 +1,6 @@
 use super::*;
+mod cache_setup;
+mod controller_seed;
 use std::{
     fs::{self, Permissions},
     os::unix::fs::PermissionsExt,
@@ -162,6 +164,16 @@ fn config_with_paths(
 
 fn run_bash(script: &str) -> Result<std::process::ExitStatus> {
     Ok(Command::new("bash").arg("-lc").arg(script).status()?)
+}
+
+fn write_helper(path: &std::path::Path, body: &str) -> Result<()> {
+    fs::write(path, body)?;
+    fs::set_permissions(path, Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+fn shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn temp_path(name: &str) -> std::path::PathBuf {

@@ -8,6 +8,7 @@ use crate::{
     config::BootstrapConfig,
     run_target,
     scripts::{can_install_without_privilege_script, install_script},
+    seed_stage,
 };
 
 pub(crate) fn can_install_without_privilege(
@@ -58,6 +59,6 @@ fn seed_tool_data(config: &BootstrapConfig) -> Vec<Value> {
     config
         .seed_tools
         .iter()
-        .map(|tool| json!({"name":tool.name,"source":tool.source,"sha256":tool.sha256}))
+        .map(seed_stage::seed_tool_data)
         .collect()
 }

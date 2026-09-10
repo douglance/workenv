@@ -9,7 +9,38 @@ Run the commands from the directory containing your `devenv.nix`, or supply
 `--root /path/to/configuration`. In these examples, `dev` is a declared environment
 name. Replace it with a name from `environment list`.
 
-## Apply configuration
+## Spin a project up and down
+
+Declare the provider, bootstrap, project, and Herdr integrations in your
+configuration. The project integration requires `config.repository` and accepts
+an optional `config.ref`. Set the environment's `directory` to the editable
+checkout and `source` to its devenv configuration. Use the same Herdr binding in
+`integrations` and `connection` so Workenv records its registration for cleanup.
+
+1. Run `workenv environment plan dev --format json` to inspect the declared host,
+   project directory, and setup stages.
+2. Run `workenv environment up dev --idempotency-key dev-up-1 --format json`.
+   It provisions the resource, bootstraps prerequisites, prepares the checkout,
+   applies devenv, starts Herdr, and registers the machine on the controller.
+3. If the result is `pending`, repeat the same command and key until it completes.
+   A successful result has `ok = true` and status `ready` or `changed`.
+4. Run `workenv environment connect dev` to enter the project through Herdr.
+5. When finished, run
+   `workenv environment down dev --idempotency-key dev-down-1 --format json`.
+   This deletes the owned disposable machine, including its checkout, and removes
+   its recorded Herdr registration. Save project changes before running it.
+
+Use new up and down keys for the next machine incarnation. Reusing a completed
+key replays its result. Disconnecting from Herdr leaves the machine running.
+
+Bootstrap `seed_tools` can reference a target-local `path`, a download `url`, or
+a `controller_path`. Each entry requires a safe binary `name` and its `sha256`.
+For SSH targets, Workenv verifies controller files before streaming them to a
+private target cache and verifies their bytes again before installation. Seed
+APoC and the project adapter before the first clone; target `prepare` runs before
+the project's Nix environment exists. Keep credentials out of seed files.
+
+## Apply configuration on an existing host
 
 1. Run `workenv environment list --format json` to confirm the target host,
    directory, source, and integrations.
@@ -22,7 +53,7 @@ name. Replace it with a name from `environment list`.
 5. Run `workenv environment status dev --format json` to inspect the applied
    configuration and enabled integration diagnostics.
 
-Apply prepares the target directory, realizes its selected devenv shell and
+Apply prepares the target directory and declared project checkout, realizes its selected devenv shell and
 profiles, and invokes configured setup integrations. The bootstrap stage runs
 first when a controller bootstrap integration is declared. Devenv owns packages
 and services throughout this process.

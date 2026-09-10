@@ -51,6 +51,7 @@ jobs:
             -p workenv-adapter-exedev
             -p workenv-adapter-herdr
             -p workenv-adapter-identity
+            -p workenv-adapter-project
             -p workenv-adapter-ssh
             -p workenv-adapter-tailscale
           )
@@ -70,6 +71,7 @@ jobs:
             workenv-adapter-exedev
             workenv-adapter-herdr
             workenv-adapter-identity
+            workenv-adapter-project
             workenv-adapter-ssh
             workenv-adapter-tailscale
           )

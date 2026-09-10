@@ -30,25 +30,32 @@ async fn catalog_has_environment_commands_and_no_workflow_commands() -> Result<(
 async fn mutation_key_is_checked_before_configuration_or_host_access() -> Result<()> {
     let catalog = workenv::build().tool_catalog();
     let root = tempfile::tempdir()?;
-    let tool = catalog
-        .get("environment_create")
-        .context("missing environment_create tool")?;
+    for tool_name in ["environment_create", "environment_up", "environment_down"] {
+        let tool = catalog.get(tool_name).context("missing environment tool")?;
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(false)
+        );
+        let response = catalog
+            .call(
+                tool_name,
+                BTreeMap::from([("environment".into(), json!("example"))]),
+                ToolCallOptions {
+                    globals: Some(json!({"root":root.path()})),
+                    ..ToolCallOptions::isolated()
+                },
+            )
+            .await;
+        let text = serde_json::to_value(response)?.to_string();
+        assert!(text.contains("idempotency-key is required"), "{text}");
+    }
+    let down = catalog
+        .get("environment_down")
+        .context("missing environment_down tool")?;
     assert_eq!(
-        tool.annotations.as_ref().and_then(|a| a.read_only_hint),
-        Some(false)
+        down.annotations.as_ref().and_then(|a| a.destructive_hint),
+        Some(true)
     );
-    let response = catalog
-        .call(
-            "environment_create",
-            BTreeMap::from([("environment".into(), json!("example"))]),
-            ToolCallOptions {
-                globals: Some(json!({"root":root.path()})),
-                ..ToolCallOptions::isolated()
-            },
-        )
-        .await;
-    let text = serde_json::to_value(response)?.to_string();
-    assert!(text.contains("idempotency-key is required"), "{text}");
     assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
     Ok(())
 }

@@ -65,7 +65,10 @@ impl Controller {
     /// # Errors
     /// Returns invalid input, setup, adapter, or receipt errors.
     pub fn environment(&self, operation: &str, name: &str, key: Option<&str>) -> Result<Value> {
-        if matches!(operation, "bootstrap" | "create" | "apply" | "destroy") {
+        if matches!(
+            operation,
+            "bootstrap" | "create" | "apply" | "destroy" | "up" | "down"
+        ) {
             crate::dispatch::mutation_key(key)?;
         }
         match operation {
@@ -77,6 +80,8 @@ impl Controller {
             "apply" => self.apply(name, key),
             "connect" => self.connect(name),
             "destroy" => self.destroy(name, key),
+            "up" => self.up(name, key),
+            "down" => self.down(name, key),
             _ => bail!("unsupported environment operation {operation}"),
         }
     }

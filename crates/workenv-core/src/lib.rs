@@ -8,6 +8,7 @@ mod devenv;
 mod dispatch;
 mod environment;
 mod environment_cleanup;
+mod environment_lifecycle;
 mod outcome;
 mod readiness;
 mod receipts;
@@ -22,6 +23,8 @@ mod controller_tests;
 mod environment_cleanup_tests;
 #[cfg(test)]
 mod environment_cleanup_validation_tests;
+#[cfg(test)]
+mod environment_lifecycle_tests;
 #[cfg(test)]
 mod environment_tests;
 #[cfg(test)]
