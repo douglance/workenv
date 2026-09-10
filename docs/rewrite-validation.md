@@ -1,5 +1,50 @@
 # Workenv 0.2 acceptance record
 
+## September 10 project lifecycle
+
+The Mac controller completed a fresh exe.dev project lifecycle: provision,
+bootstrap, clone a private repository from a verified Git bundle, build the
+project's devenv shell, start Herdr, register its profile, attach from the installed
+CLI, and remove both the VM and profile with `environment down`.
+
+The test used `workenv-project-0910`, created at
+`2026-09-10T03:49:54Z`, and checked out
+`77d2a02826da54ff1d12be93cbe89e9e1414cc3f`. Bootstrap verified Nix 2.35.2,
+devenv 2.3.0, APoC, Herdr 0.9.0, both seed adapters, and the source bundle.
+The Herdr pane entered `/home/exedev/projects/workenv` through devenv, reported
+Rust 1.97.1, and printed the expected Git revision and
+`WORKENV_PROJECT_SHELL_OK`.
+
+| Acceptance | Result | APoC execution |
+| --- | --- | --- |
+| Up with key `project-0910-up-4` | All stages complete; Herdr profile registered | `01a08976-76a2-7f73-b0c7-b7c9c0088453` |
+| Installed CLI attachment | Interactive Herdr client reached the project prompt | `01a08978-6aec-7a21-81d5-c83ea157aa66` |
+| Command inside Herdr pane | Directory, devenv context, Rust, and Git revision verified | `01a08979-2acd-77b0-9639-c67e52958c24` |
+| Down with key `project-0910-down-4` | VM deleted and recorded Herdr profile removed | `01a08979-6654-7043-bbd4-93296ba9e9d8` |
+| Independent provider inventory | `{"vms":[]}` | `01a0897a-5622-7c81-a588-61ebb1383779` |
+| Independent Herdr inventory | Canary absent; four other profiles preserved | `01a0897a-5636-7f11-9b50-880329a5d4d6` |
+
+The live shell build exposed an SSH observation bug: APoC returned
+`EXECUTION_WAIT_FAILED` while the remote build was still running. Resuming the
+same request completed that retained build. Commit `a67e09c` classifies this
+observation error as pending and preserves its execution ID. Its regression
+failed before the fix (`01a08974-1cee-75d3-9453-296e14031a63`) and passed
+afterward (`01a08974-a1f8-7680-ab46-c8706038ef7b`). The correction passed
+workspace tests, Clippy, Rust documentation, source policy, external-extension
+checks, Nix fixtures, and formatting. The local native SSH adapter includes it;
+the live project's checkout was the earlier commit identified above.
+
+The installed controller CLI is `~/.local/bin/workenv`. The local canary
+configuration is `.state/project-lifecycle/controller`; use `--root` to select
+it and new mutation keys for another lifecycle. Its seed files contain committed
+source and verified binaries, not Git credentials. The original CLI and tested
+configuration are retained under `.state/project-lifecycle/previous`.
+
+This scenario used exe.dev SSH directly. It does not establish live Tailscale
+cleanup; the retired fleet's administrator-access blocker below remains open.
+
+## Retired persistent fleet
+
 On September 10, 2026, the owner requested retirement of the persistent exe.dev
 fleet. All six machines (`workenv-01` through `workenv-06`) were deleted. A fresh
 provider inventory returned `{"vms":[]}` (APoC
