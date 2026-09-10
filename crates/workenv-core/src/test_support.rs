@@ -208,6 +208,7 @@ pub(super) fn transport_extension() -> Extension {
                 "connect".to_owned(),
                 Operation {
                     description: "connect".to_owned(),
+                    location: None,
                     mutating: false,
                     internal: false,
                     input_schema: json!(true),
@@ -218,6 +219,7 @@ pub(super) fn transport_extension() -> Extension {
                 "execute".to_owned(),
                 Operation {
                     description: "execute".to_owned(),
+                    location: None,
                     mutating: true,
                     internal: true,
                     input_schema: json!({"type":"object"}),
@@ -232,6 +234,7 @@ pub(super) fn transport_extension() -> Extension {
 pub(super) fn operation(mutating: bool, input_schema: Value) -> Operation {
     Operation {
         description: "operation".to_owned(),
+        location: None,
         mutating,
         internal: false,
         input_schema,

@@ -30,6 +30,13 @@ let
       input_schema = object { } [ ];
       output_schema = output;
     };
+    cleanup = {
+      description = "Delete the exact Tailscale device registration from the controller.";
+      mutating = true;
+      location = "controller";
+      input_schema = object { } [ ];
+      output_schema = output;
+    };
     connect = {
       description = "Connect Tailscale using the enrollment contract.";
       mutating = true;

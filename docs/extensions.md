@@ -29,7 +29,10 @@ Each `workenv.extensions.<id>` declaration supplies these fields:
 | `operations` | Operation descriptions, schemas, and behavior metadata |
 
 Each operation declares `description`, `mutating`, `internal`, `input_schema`,
-and `output_schema`. Input and output schemas describe the operation's `input`
+and `output_schema`. Optional `location` overrides the extension's execution
+location for that operation. For example, Herdr's `register` runs on the
+controller while its target configuration operations run on the target.
+Input and output schemas describe the operation's `input`
 and response `data`, respectively. Internal transport operations are unavailable
 through public `extension call`.
 
@@ -77,6 +80,25 @@ the declared output schema before accepting the response.
 Adapters are trusted programs running with normal user privileges. Keep secret
 values out of manifests, requests, responses, arguments, and receipts. Pass
 references to an appropriate credential store instead.
+
+## Clean up a destroyed environment
+
+An integration can declare a mutating `cleanup` operation. Workenv invokes it on
+the controller after the provider confirms destruction, including when the
+previously owned provider resource is already absent. Declare
+`location = "controller"` for operations that must run after the target is gone.
+
+Cleanup input contains `provider_create`, `provider_destroy`, and
+`integration_receipts`. Each integration receipt includes its `operation` and
+`response`; only receipts recorded during that provider lifecycle are included.
+Record exact registration IDs in successful setup responses. Do not identify
+resources for deletion by hostname alone.
+
+Return `ready` when an exact registration is already absent, `changed` when its
+deletion is verified, and `failed` when credentials or other prerequisites need
+repair. Return `pending` only with a durable execution ID that can be observed.
+Incomplete cleanup prevents a successful destroy result. Independent cleanup
+stages still run when another stage returns a failure.
 
 ## Change an extension
 

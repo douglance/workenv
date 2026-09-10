@@ -1,5 +1,47 @@
 # Workenv 0.2 acceptance record
 
+On September 10, 2026, the owner requested retirement of the persistent exe.dev
+fleet. All six machines (`workenv-01` through `workenv-06`) were deleted. A fresh
+provider inventory returned `{"vms":[]}` (APoC
+`01a088e5-1007-7961-86a4-97b37ae67218`). The eight Herdr profiles pointing to
+those machines were also removed; registry verification is
+`01a088ec-3c6c-7051-8157-1e4d618ce1d9`. The Linux paths and resource-capacity
+blocker below describe the earlier validation snapshot, not current machines.
+
+The ephemeral provider change passed two live create/destroy cycles for the
+temporary name `we-ephemeral-0910`. Recreating the name produced a different
+provider creation timestamp. Reusing the old destroy receipt was rejected before
+deleting the replacement. This verifies the provider lifecycle; it does not
+establish live Tailscale device cleanup.
+
+The available Tailscale OAuth credential returned HTTP 403 when listing devices.
+Removal of the six retired machines' Tailscale registrations remains blocked on
+an authenticated administrator session or a credential with device permissions.
+No device deletion was reported as successful.
+
+| Scenario | Observed result | APoC execution |
+| --- | --- | --- |
+| First create | Owned resource, created at `2026-09-10T01:40:13Z` | `01a088f8-d0e0-7181-b6db-7448021d0516` |
+| First destroy | Resource deleted | `01a088f9-b720-7012-a2c7-288dd9fe4b47` |
+| Recreate same name | New owned resource, created at `2026-09-10T01:42:00Z` | `01a088fa-6b94-73b1-b626-91f6330c6993` |
+| Replay old destroy receipt | Rejected for mismatched instance identity | `01a088fb-55cc-7c01-8a2e-491669401b84` |
+| Destroy replacement | Resource deleted | `01a088fb-a79b-75b0-9d36-8306e6b4b140` |
+| Final provider inventory | Zero machines | `01a088fc-653d-74d1-bbfe-c3f42f871597` |
+
+The cleanup implementation passed the following local verification. The three
+opt-in live tests are excluded from the ordinary workspace test command.
+
+| Gate | APoC execution |
+| --- | --- |
+| Workspace tests | `01a0890e-6fa5-7141-9093-b760c933d480` |
+| Workspace Clippy | `01a0890f-20bd-79a3-b53d-75862021e374` |
+| Workspace formatting | `01a0890f-1ef8-75f3-b374-1e7b6a00a25a` |
+| Rust documentation | `01a0890e-d098-7063-82fb-3c224959cc9f` |
+| Source policy | `01a0890e-e170-7ee0-b317-ad9189c06d09` |
+| Nix ephemeral policy | `01a08908-6423-7ae0-aa20-b0e8a1970eb3` |
+
+## September 9 validation snapshot
+
 This record is for maintainers deciding whether to roll out the environment-only
 rewrite. Evidence was collected on September 9, 2026 (UTC). Implementation gates
 and the existing-Linux canary pass. Full rollout remains blocked by the local Mac

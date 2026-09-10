@@ -98,6 +98,10 @@ Keep the previous binary and configuration available until canary setup succeeds
 
 ## Destroy a disposable provider resource
 
+The exe.dev module defaults every environment bound to its provider to
+`ephemeral = true` and rejects persistent declarations. Create exe.dev machines
+when needed and destroy them explicitly when finished.
+
 `environment destroy` requires `ephemeral = true` and a matching creation receipt
 that establishes resource ownership. It refuses adopted resources and existing
 hosts without an owned disposable provider resource. Disconnecting never destroys
@@ -109,3 +113,29 @@ workenv environment destroy dev --idempotency-key dev-destroy-1 --format json
 
 Review the named environment before running this command. Provider destruction
 removes the backing resource and its files.
+
+After the provider confirms deletion, Workenv runs each declared integration's
+`cleanup` operation on the controller. Herdr cleanup uses the saved profile ID,
+SSH target, and session. Tailscale cleanup uses the device ID recorded during
+setup. Cleanup receipts are scoped to the provider's create-to-destroy interval.
+An old receipt cannot select registrations recorded for a replacement machine.
+
+Register a Herdr connection through Workenv so its identity is recorded for
+cleanup. The environment must include the Herdr integration binding.
+
+```sh
+workenv extension call workenv.herdr register --environment dev \
+  --input '{}' --idempotency-key dev-herdr-register-1 --format json
+```
+
+For Tailscale, set the integration's `config.api_oauth_file` to a controller-local
+JSON file containing `client_id` and `client_secret`, with file mode `0600`.
+The OAuth client needs the `devices:core` scope. Keep that file outside the Nix
+store and version control. An enrollment-only credential cannot delete devices.
+
+All cleanup integrations are attempted even when another reports a failure.
+Destroy reports `failed` or `pending` until every required cleanup completes.
+After resolving a known cleanup failure, retry the same destroy key; Workenv
+replays the completed provider deletion and retries incomplete cleanup stages.
+This command also handles a previously owned VM that is already absent. There
+is no background scan for machines deleted outside Workenv.

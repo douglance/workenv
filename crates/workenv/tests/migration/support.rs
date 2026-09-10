@@ -154,6 +154,7 @@ fn extension<const N: usize>(location: Location, operations: [(&str, bool); N]) 
 fn operation(internal: bool) -> Operation {
     Operation {
         description: "test operation".to_owned(),
+        location: None,
         mutating: false,
         internal,
         input_schema: json!(true),

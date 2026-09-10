@@ -1,7 +1,7 @@
 //! Manifest validation for controller startup.
 use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
-use workenv_protocol::{Binding, Extension, Location, Manifest, PROTOCOL_VERSION};
+use workenv_protocol::{Binding, Extension, Location, Manifest, Operation, PROTOCOL_VERSION};
 
 /// Validate a complete manifest before controller use.
 pub(crate) fn manifest(manifest: &Manifest) -> Result<()> {
@@ -43,11 +43,15 @@ pub(crate) fn supports_system(extension: &Extension, system: &str) -> bool {
     extension.systems.is_empty() || extension.systems.iter().any(|entry| entry == system)
 }
 
-pub(crate) fn execution_system(extension: &Extension, target_system: &str) -> Result<String> {
-    match extension.location {
+pub(crate) fn execution_system_for(location: Location, target_system: &str) -> Result<String> {
+    match location {
         Location::Controller => controller_system(),
         Location::Target => Ok(target_system.to_owned()),
     }
+}
+
+pub(crate) fn operation_location(extension: &Extension, operation: &Operation) -> Location {
+    operation.location.unwrap_or(extension.location)
 }
 
 fn validate_hosts(manifest: &Manifest) -> Result<()> {
@@ -137,10 +141,10 @@ fn check_transport(manifest: &Manifest, host: &str, transport: Option<&str>) -> 
     let Some(operation) = extension.operations.get("execute") else {
         bail!("hosts.{host}.transport extension has no execute operation");
     };
-    if operation.internal {
+    if operation.internal && operation_location(extension, operation) == Location::Controller {
         Ok(())
     } else {
-        bail!("hosts.{host}.transport execute operation must be internal");
+        bail!("hosts.{host}.transport execute operation must be internal controller operation");
     }
 }
 
@@ -154,12 +158,14 @@ fn binding_supported(
         .extensions
         .get(&binding.extension)
         .with_context(|| format!("environments.{environment} references unknown extension"))?;
-    let execution_system = execution_system(extension, system)?;
-    if supports_system(extension, &execution_system) {
-        Ok(())
-    } else {
-        bail!("{} does not support {execution_system}", binding.extension);
+    for operation in extension.operations.values() {
+        let execution_system =
+            execution_system_for(operation_location(extension, operation), system)?;
+        if !supports_system(extension, &execution_system) {
+            bail!("{} does not support {execution_system}", binding.extension);
+        }
     }
+    Ok(())
 }
 
 fn controller_system() -> Result<String> {
@@ -182,9 +188,8 @@ mod tests {
 
     #[test]
     fn controller_location_uses_controller_system() -> Result<()> {
-        let extension = extension(Location::Controller);
         assert_eq!(
-            execution_system(&extension, "definitely-not-the-controller")?,
+            execution_system_for(Location::Controller, "definitely-not-the-controller")?,
             controller_system()?
         );
         Ok(())
@@ -192,10 +197,28 @@ mod tests {
 
     #[test]
     fn target_location_uses_target_system() -> Result<()> {
-        let extension = extension(Location::Target);
         assert_eq!(
-            execution_system(&extension, "x86_64-linux")?,
+            execution_system_for(Location::Target, "x86_64-linux")?,
             "x86_64-linux"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_location_overrides_extension_location() -> Result<()> {
+        let mut extension = extension(Location::Target);
+        let operation = extension
+            .operations
+            .get_mut("status")
+            .context("missing operation")?;
+        operation.location = Some(Location::Controller);
+        let operation = extension
+            .operations
+            .get("status")
+            .context("missing operation")?;
+        assert_eq!(
+            execution_system_for(operation_location(&extension, operation), "x86_64-linux")?,
+            controller_system()?
         );
         Ok(())
     }
@@ -211,6 +234,7 @@ mod tests {
                 "status".to_owned(),
                 Operation {
                     description: "status".to_owned(),
+                    location: None,
                     mutating: false,
                     internal: false,
                     input_schema: serde_json::json!(true),

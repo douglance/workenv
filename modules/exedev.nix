@@ -2,6 +2,13 @@
 
 let
   cfg = config.workenv.exedev;
+  rootConfig = config;
+  isExeEnvironment =
+    environment:
+    let
+      provider = (rootConfig.workenv.hosts.${environment.host} or { }).provider or null;
+    in
+    provider != null && provider.extension == cfg.extensionId;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
   object = properties: required: {
     type = "object";
@@ -53,6 +60,16 @@ in
 {
   imports = [ ./rust.nix ];
 
+  options.workenv.environments = lib.mkOption {
+    type = lib.types.attrsOf (
+      lib.types.submodule (
+        { config, ... }: {
+          config.ephemeral = lib.mkIf (cfg.enable && isExeEnvironment config) (lib.mkDefault true);
+        }
+      )
+    );
+  };
+
   options.workenv.exedev = {
     enable = lib.mkEnableOption "exe.dev provider adapter";
 
@@ -83,6 +100,11 @@ in
 
   config = lib.mkIf cfg.enable {
     workenv.rust.enable = lib.mkDefault true;
+
+    assertions = lib.mapAttrsToList (name: environment: {
+      assertion = !isExeEnvironment environment || environment.ephemeral;
+      message = "exe.dev environment ${name} must be ephemeral; create and destroy it explicitly.";
+    }) config.workenv.environments;
 
     workenv.extensions = {
       ${cfg.extensionId} = {

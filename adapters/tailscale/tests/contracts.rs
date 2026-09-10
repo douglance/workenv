@@ -46,6 +46,7 @@ fn enroll_uses_secret_stdin_without_secret_argv() -> Result<()> {
     ]);
     let result = handle_with(&request, &runner)?;
     assert_eq!(result.status, ResponseStatus::Ready);
+    assert_eq!(result.data["device_id"], "node-1");
     let calls = runner
         .calls
         .lock()
@@ -97,7 +98,7 @@ fn enroll_propagates_pending_execution() -> Result<()> {
 fn ready_status() -> Value {
     json!({
         "BackendState":"Running",
-        "Self":{"DNSName":"workenv-01.tail.example.ts.net.","Tags":["tag:workenv"]},
+        "Self":{"ID":"node-1","DNSName":"workenv-01.tail.example.ts.net.","Tags":["tag:workenv"]},
         "CurrentTailnet":{"MagicDNSSuffix":"tail.example.ts.net"}
     })
 }

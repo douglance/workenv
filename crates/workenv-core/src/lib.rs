@@ -7,6 +7,7 @@ mod controller;
 mod devenv;
 mod dispatch;
 mod environment;
+mod environment_cleanup;
 mod outcome;
 mod readiness;
 mod receipts;
@@ -17,6 +18,10 @@ pub use controller::{CallOptions, Controller};
 
 #[cfg(test)]
 mod controller_tests;
+#[cfg(test)]
+mod environment_cleanup_tests;
+#[cfg(test)]
+mod environment_cleanup_validation_tests;
 #[cfg(test)]
 mod environment_tests;
 #[cfg(test)]

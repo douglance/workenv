@@ -18,7 +18,8 @@ use model::{
 use runner::{ProviderResult, Runner, SshRunner};
 
 pub(crate) fn handle(request: &AdapterRequest) -> Result<AdapterResponse> {
-    let mut provider = Provider::new(SshRunner);
+    let cwd = std::env::current_dir()?;
+    let mut provider = Provider::new(SshRunner::new(cwd));
     match request.operation.as_str() {
         "inventory" => Ok(provider.inventory_response(request)),
         "create" => provider.create_response(request),
@@ -125,7 +126,7 @@ impl<R: Runner> Provider<R> {
             state.path,
             &receipt_value(request, spec, "creating", state.digest, &json!({})),
         )?;
-        let create_error = self.create_vm(spec).err();
+        let create_error = self.create_vm(request, spec).err();
         let mut after = self
             .observe(spec)
             .unwrap_or_else(|e| json!({"status":"unknown","error":e}));
@@ -211,7 +212,10 @@ impl<R: Runner> Provider<R> {
         )?;
         let remove_error = self
             .runner
-            .run(&["rm".into(), spec.name.clone(), "--json".into()])
+            .mutate(
+                request.request_id.as_str(),
+                &["rm".into(), spec.name.clone(), "--json".into()],
+            )
             .err();
         let after = self
             .observe(spec)
@@ -238,7 +242,7 @@ impl<R: Runner> Provider<R> {
     }
 
     fn inventory(&mut self) -> ProviderResult<Vec<Value>> {
-        let value = self.runner.run(&["ls".into(), "--json".into()])?;
+        let value = self.runner.observe(&["ls".into(), "--json".into()])?;
         value
             .get("vms")
             .and_then(Value::as_array)
@@ -253,27 +257,30 @@ impl<R: Runner> Provider<R> {
     fn capacity(&mut self, spec: &Spec) -> ProviderResult<Value> {
         let plan = self
             .runner
-            .run(&["billing".into(), "plan".into(), "--json".into()])?;
+            .observe(&["billing".into(), "plan".into(), "--json".into()])?;
         let inventory = self.inventory()?;
         Ok(capacity_report(spec, &plan, &inventory))
     }
 
-    fn create_vm(&mut self, spec: &Spec) -> ProviderResult<Value> {
-        self.runner.run(&[
-            "new".into(),
-            "--name".into(),
-            spec.name.clone(),
-            "--cpu".into(),
-            spec.cpus.to_string(),
-            "--memory".into(),
-            format!("{}GB", spec.memory_gb),
-            "--disk".into(),
-            format!("{}GB", spec.disk_gb),
-            "--tag".into(),
-            "workenv".into(),
-            "--no-email".into(),
-            "--json".into(),
-        ])
+    fn create_vm(&mut self, request: &AdapterRequest, spec: &Spec) -> ProviderResult<Value> {
+        self.runner.mutate(
+            request.request_id.as_str(),
+            &[
+                "new".into(),
+                "--name".into(),
+                spec.name.clone(),
+                "--cpu".into(),
+                spec.cpus.to_string(),
+                "--memory".into(),
+                format!("{}GB", spec.memory_gb),
+                "--disk".into(),
+                format!("{}GB", spec.disk_gb),
+                "--tag".into(),
+                "workenv".into(),
+                "--no-email".into(),
+                "--json".into(),
+            ],
+        )
     }
 }
 

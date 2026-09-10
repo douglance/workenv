@@ -22,9 +22,11 @@
     cargo fmt --manifest-path examples/external-extension/Cargo.toml --check
     cargo clippy --manifest-path examples/external-extension/Cargo.toml --all-targets -- -D warnings
     cargo test --manifest-path examples/external-extension/Cargo.toml --all-targets
+    nix-instantiate --eval --strict --json --expr 'import ./modules/tests/exedev-ephemeral.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nixfmt --check \
       devenv.nix \
       modules/*.nix \
+      modules/tests/*.nix \
       presets/*.nix \
       examples/external-extension/module.nix
   '';

@@ -214,7 +214,7 @@ fn host() -> Host {
         address: None,
         transport: None,
         provider: None,
-        system: crate::validate::execution_system(&extension(Location::Controller), "unused")
+        system: crate::validate::execution_system_for(Location::Controller, "unused")
             .unwrap_or_else(|_| "x86_64-linux".to_owned()),
     }
 }
@@ -242,6 +242,7 @@ fn extension(location: Location) -> Extension {
             "status".to_owned(),
             Operation {
                 description: "status".to_owned(),
+                location: None,
                 mutating: false,
                 internal: false,
                 input_schema: json!(true),

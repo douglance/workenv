@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use workenv_platform::{ApocExecutor, ExecutionSpec, Executor};
 
+mod cleanup;
 mod machines;
 mod util;
 
@@ -34,6 +35,7 @@ pub fn handle_with(request: &AdapterRequest, runner: &impl Executor) -> Result<A
     match request.operation.as_str() {
         "inspect" => inspect(request, runner),
         "register" => register(request, runner),
+        "cleanup" => cleanup::run(request, runner),
         "connect" => Ok(connect(request)),
         "config" | "apply" => configure(request),
         operation => bail!("unsupported Herdr operation {operation}"),
@@ -93,7 +95,7 @@ fn inspect(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterRe
 fn register(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterResponse> {
     let target = target(request)?;
     let session = session(request);
-    let machines = machines::list(request, runner)?;
+    let machines = machines::list_from_controller(request, runner)?;
     if let Some(response) = machines::response_for_state(request, &machines, "registration_lookup")
     {
         return Ok(response);
@@ -115,7 +117,7 @@ fn register(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterR
             "--remote-session".to_string(),
             session.clone(),
         ],
-        cwd: Some(request.target.directory.clone()),
+        cwd: None,
         stdin: None,
         idempotency_key: format!("{}:herdr-register", request.request_id),
         purpose: "Register scoped Herdr machine connection.".to_string(),
@@ -142,12 +144,26 @@ fn register(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterR
         return Ok(response);
     }
     if let Some(machine) = machines::find_exact(&machines, &target, &session) {
-        data.insert("status".to_string(), json!("registered"));
-        data.insert("machine".to_string(), machine);
-        return Ok(response(request, ResponseStatus::Changed, data));
+        return Ok(registered_changed_response(request, machine, data));
     }
     data.insert("status".to_string(), json!("registration_unverified"));
     Ok(response(request, ResponseStatus::Failed, data))
+}
+
+fn registered_changed_response(
+    request: &AdapterRequest,
+    machine: Value,
+    mut data: Map<String, Value>,
+) -> AdapterResponse {
+    let Some(profile_id) = machines::profile_id(&machine) else {
+        data.insert("status".to_string(), json!("herdr_profile_id_missing"));
+        data.insert("machine".to_string(), machine);
+        return response(request, ResponseStatus::Failed, data);
+    };
+    data.insert("status".to_string(), json!("registered"));
+    data.insert("profile_id".to_string(), json!(profile_id));
+    data.insert("machine".to_string(), machine);
+    response(request, ResponseStatus::Changed, data)
 }
 
 fn connect(request: &AdapterRequest) -> AdapterResponse {

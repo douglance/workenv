@@ -37,6 +37,17 @@ let
         description = "Whether the operation can change host or account state.";
       };
 
+      location = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.enum [
+            "controller"
+            "target"
+          ]
+        );
+        default = null;
+        description = "Optional execution location overriding the extension default.";
+      };
+
       internal = lib.mkOption {
         type = lib.types.bool;
         default = false;

@@ -1,11 +1,13 @@
 use crate::{
     Controller,
-    dispatch::{BindingCall, identity},
+    dispatch::{BindingCall, binding_request_id, identity},
+    environment_cleanup::{ProviderLifecycle, cleanup_integrations},
     outcome,
+    receipts::RecordedResponse,
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use workenv_protocol::{Binding, Environment, Location};
+use workenv_protocol::{AdapterResponse, Binding, Environment, Location};
 
 impl Controller {
     pub(crate) fn plan(&self, name: &str) -> Result<Value> {
@@ -96,38 +98,67 @@ impl Controller {
             .ok_or_else(|| {
                 anyhow::anyhow!("environment {name} has no disposable resource provider")
             })?;
-        let expected = self.create_fingerprint(binding, name)?;
-        let receipt = self
-            .receipts
-            .latest_response_for(&identity(name, &binding.extension, "create"), &expected)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("environment {name} has no recorded resource creation")
-            })?;
+        let created = self.created_provider_resource(name, binding)?;
+        let receipt = &created.response;
         if !receipt.complete() {
             return Ok(outcome::aggregate(
                 name,
                 "destroy",
-                &[outcome::step(&binding.extension, &receipt)],
+                &[outcome::step(&binding.extension, receipt)],
             ));
         }
         if receipt.data["owned"] != true || receipt.data["resource_id"].as_str().is_none() {
             bail!("environment {name} was adopted or has no verified owned resource");
         }
-        let response = self.call_binding(BindingCall {
+        let destroyed = self.destroy_provider_resource(name, key, binding, receipt)?;
+        let mut results = vec![outcome::step(&binding.extension, &destroyed.response)];
+        if destroyed.response.complete() {
+            cleanup_integrations(
+                self,
+                name,
+                key,
+                &ProviderLifecycle {
+                    provider_create: &created,
+                    provider_destroy: &destroyed,
+                },
+                &mut results,
+            )?;
+        }
+        Ok(outcome::aggregate(name, "destroy", &results))
+    }
+
+    fn created_provider_resource(&self, name: &str, binding: &Binding) -> Result<RecordedResponse> {
+        let expected = self.create_fingerprint(binding, name)?;
+        self.receipts
+            .latest_recorded_response_for(&identity(name, &binding.extension, "create"), &expected)?
+            .ok_or_else(|| anyhow::anyhow!("environment {name} has no recorded resource creation"))
+    }
+
+    fn destroy_provider_resource(
+        &self,
+        name: &str,
+        key: Option<&str>,
+        binding: &Binding,
+        create: &AdapterResponse,
+    ) -> Result<RecordedResponse> {
+        let input = json!({"create":create.data});
+        let fingerprint = self.binding_fingerprint(binding, "destroy", name, input.clone())?;
+        self.call_binding(BindingCall {
             binding,
             operation: "destroy",
             name,
             key,
             index: 0,
-            input: json!({"create":receipt.data}),
+            input,
             previous: None,
             internal: false,
         })?;
-        Ok(outcome::aggregate(
-            name,
-            "destroy",
-            &[outcome::step(&binding.extension, &response)],
-        ))
+        let request_id = binding_request_id(key, name, "destroy", 0, &binding.extension)?;
+        self.receipts.recorded_response_for(
+            &identity(name, &binding.extension, "destroy"),
+            &request_id,
+            &fingerprint,
+        )
     }
 
     pub(crate) fn setup_binding(

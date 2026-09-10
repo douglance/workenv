@@ -22,19 +22,17 @@ pub(crate) struct BindingCall<'a> {
 
 impl Controller {
     pub(crate) fn create_fingerprint(&self, binding: &Binding, name: &str) -> Result<String> {
-        fingerprint(
-            &self.manifest,
-            &Invocation {
-                extension_id: &binding.extension,
-                operation: "create",
-                environment: name,
-                config: binding.config.clone(),
-                input: json!({}),
-                key: String::new(),
-                previous: None,
-                allow_internal: false,
-            },
-        )
+        self.binding_fingerprint(binding, "create", name, json!({}))
+    }
+
+    pub(crate) fn binding_fingerprint(
+        &self,
+        binding: &Binding,
+        operation: &str,
+        name: &str,
+        input: Value,
+    ) -> Result<String> {
+        fingerprint(&self.manifest, &invocation(binding, operation, name, input))
     }
 
     pub(crate) fn direct_call(
@@ -66,14 +64,13 @@ impl Controller {
             .operation(&call.binding.extension, call.operation)?
             .mutating;
         let key = if mutating {
-            format!(
-                "{}:{}:{}:{}:{}",
-                mutation_key(call.key)?,
+            binding_request_id(
+                call.key,
                 call.name,
                 call.operation,
                 call.index,
-                call.binding.extension
-            )
+                &call.binding.extension,
+            )?
         } else {
             format!("observation:{}", Uuid::new_v4())
         };
@@ -130,9 +127,38 @@ impl Controller {
     }
 }
 
+fn invocation<'a>(
+    binding: &'a Binding,
+    operation: &'a str,
+    environment: &'a str,
+    input: Value,
+) -> Invocation<'a> {
+    binding_call(BindingInvocation {
+        binding,
+        operation,
+        environment,
+        input,
+        key: String::new(),
+        previous: None,
+    })
+}
+
 pub(crate) fn mutation_key(key: Option<&str>) -> Result<&str> {
     key.filter(|key| !key.trim().is_empty())
         .context("idempotency key is required")
+}
+
+pub(crate) fn binding_request_id(
+    key: Option<&str>,
+    environment: &str,
+    operation: &str,
+    index: usize,
+    extension: &str,
+) -> Result<String> {
+    Ok(format!(
+        "{}:{environment}:{operation}:{index}:{extension}",
+        mutation_key(key)?
+    ))
 }
 
 pub(crate) fn identity(environment: &str, extension: &str, operation: &str) -> ReceiptIdentity {

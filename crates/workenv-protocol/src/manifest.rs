@@ -104,6 +104,9 @@ pub enum Location {
 pub struct Operation {
     /// Human and agent-facing description.
     pub description: String,
+    /// Operation-specific execution location; defaults to the extension location.
+    #[serde(default)]
+    pub location: Option<Location>,
     /// Whether the operation can change host or account state.
     pub mutating: bool,
     /// Internal transport operations are not exposed by extension call.

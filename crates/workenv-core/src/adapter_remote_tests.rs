@@ -203,6 +203,7 @@ fn extension(operation: &str, location: Location, internal: bool) -> Extension {
             operation.to_owned(),
             Operation {
                 description: operation.to_owned(),
+                location: None,
                 mutating: false,
                 internal,
                 input_schema: json!(true),

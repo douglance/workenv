@@ -27,6 +27,14 @@ let
     register = {
       description = "Register a scoped Herdr machine connection.";
       mutating = true;
+      location = "controller";
+      input_schema = object { } [ ];
+      output_schema = output;
+    };
+    cleanup = {
+      description = "Remove the exact scoped Herdr machine registration from the controller.";
+      mutating = true;
+      location = "controller";
       input_schema = object { } [ ];
       output_schema = output;
     };

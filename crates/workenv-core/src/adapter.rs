@@ -69,8 +69,27 @@ pub(crate) fn invoke(
     let env = environment(manifest, call.environment)?;
     let host = host(manifest, &env.host)?;
     let extension = extension_by_id(manifest, call.extension_id)?;
-    let request = request(manifest, env, host, extension, call)?;
-    let response = match extension.location {
+    let operation = operation(extension, call.operation)?;
+    let location = validate::operation_location(extension, operation);
+    if operation.internal && !call.allow_internal {
+        bail!("operation {} is internal", call.operation);
+    }
+    validate::instance(&operation.input_schema, &call.input, "adapter input")?;
+    let system = validate::execution_system_for(location, &host.system)?;
+    if !validate::supports_system(extension, &system) {
+        bail!("{} does not support {system}", call.extension_id);
+    }
+    let request = AdapterRequest {
+        protocol_version: manifest.schema_version,
+        request_id: call.key.clone(),
+        extension: call.extension_id.to_owned(),
+        operation: call.operation.to_owned(),
+        target: target(call.environment, env, host),
+        config: call.config.clone(),
+        input: call.input.clone(),
+        previous: call.previous.clone(),
+    };
+    let response = match location {
         Location::Controller => invoke_controller(&runtime, extension, &request)?,
         Location::Target => invoke_target(&runtime, host, extension, &request)?,
     };
@@ -81,37 +100,6 @@ struct Runtime<'a> {
     root: &'a Path,
     manifest: &'a Manifest,
     executor: &'a dyn Executor,
-}
-
-fn request(
-    manifest: &Manifest,
-    env: &Environment,
-    host: &Host,
-    extension: &Extension,
-    call: &Invocation<'_>,
-) -> Result<AdapterRequest> {
-    let operation = extension
-        .operations
-        .get(call.operation)
-        .with_context(|| format!("unknown operation {}", call.operation))?;
-    if operation.internal && !call.allow_internal {
-        bail!("operation {} is internal", call.operation);
-    }
-    validate::instance(&operation.input_schema, &call.input, "adapter input")?;
-    let system = validate::execution_system(extension, &host.system)?;
-    if !validate::supports_system(extension, &system) {
-        bail!("{} does not support {system}", call.extension_id);
-    }
-    Ok(AdapterRequest {
-        protocol_version: manifest.schema_version,
-        request_id: call.key.clone(),
-        extension: call.extension_id.to_owned(),
-        operation: call.operation.to_owned(),
-        target: target(call.environment, env, host),
-        config: call.config.clone(),
-        input: call.input.clone(),
-        previous: call.previous.clone(),
-    })
 }
 
 fn target(environment: &str, env: &Environment, host: &Host) -> Target {
@@ -266,6 +254,13 @@ fn extension_by_id<'a>(manifest: &'a Manifest, id: &str) -> Result<&'a Extension
         .extensions
         .get(id)
         .with_context(|| format!("unknown extension {id}"))
+}
+
+fn operation<'a>(extension: &'a Extension, name: &str) -> Result<&'a workenv_protocol::Operation> {
+    extension
+        .operations
+        .get(name)
+        .with_context(|| format!("unknown operation {name}"))
 }
 
 #[cfg(test)]

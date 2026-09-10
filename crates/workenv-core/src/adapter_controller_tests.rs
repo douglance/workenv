@@ -124,6 +124,7 @@ fn extension(executable: &str) -> Extension {
             "inspect".to_owned(),
             Operation {
                 description: "inspect".to_owned(),
+                location: None,
                 mutating: false,
                 internal: false,
                 input_schema: json!(true),

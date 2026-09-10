@@ -4,17 +4,19 @@ use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 use workenv_platform::{ApocExecutor, ExecutionSpec, Executor};
 
+mod cleanup;
 mod enroll;
+mod status;
 mod util;
 
+use status::Report;
 use util::{optional_string, output_json, pending_response, redacted, response};
 use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 
 /// Handle one Tailscale request using `APoC` for command execution.
 ///
 /// # Errors
-///
-/// Returns an error when the current directory or adapter operation fails.
+/// Returns an error when the working directory, request, execution, or API call fails.
 pub fn handle(request: &AdapterRequest) -> Result<AdapterResponse> {
     let runner = ApocExecutor::new(std::env::current_dir()?);
     handle_with(request, &runner)
@@ -23,12 +25,12 @@ pub fn handle(request: &AdapterRequest) -> Result<AdapterResponse> {
 /// Handle one Tailscale request with an injected runner.
 ///
 /// # Errors
-///
-/// Returns an error when inspection, enrollment, or request validation fails.
+/// Returns an error when the request, execution, or API call fails.
 pub fn handle_with(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterResponse> {
     match request.operation.as_str() {
         "inspect" => inspect(request, runner),
         "enroll" | "connect" | "apply" => enroll(request, runner),
+        "cleanup" => cleanup::run(request, runner),
         operation => bail!("unsupported Tailscale operation {operation}"),
     }
 }
@@ -151,6 +153,7 @@ fn evaluate(request: &AdapterRequest, status: &Value, prefs: Option<&Value>) -> 
     let expected_dns = expected_dns(request);
     let dns = dns_name(status);
     let tailnet = tailnet(status);
+    let device_id = device_id(status);
     let required_tag =
         optional_string(&request.config, "tag").unwrap_or_else(|| "tag:workenv".to_string());
     if status.get("BackendState") != Some(&json!("Running")) {
@@ -191,13 +194,7 @@ fn evaluate(request: &AdapterRequest, status: &Value, prefs: Option<&Value>) -> 
             data,
         };
     }
-    data.insert("status".to_string(), json!("tailscale_ready"));
-    data.insert("dns_name".to_string(), json!(dns));
-    data.insert("tailnet".to_string(), json!(tailnet));
-    Report {
-        status: ResponseStatus::Ready,
-        data,
-    }
+    status::ready(data, device_id, &dns, &tailnet)
 }
 
 fn prefs_ready(prefs: Option<&Value>) -> bool {
@@ -227,6 +224,13 @@ fn dns_name(status: &Value) -> String {
         .to_string()
 }
 
+fn device_id(status: &Value) -> Option<String> {
+    status
+        .pointer("/Self/ID")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn tailnet(status: &Value) -> String {
     status
         .pointer("/CurrentTailnet/MagicDNSSuffix")
@@ -245,11 +249,6 @@ fn tags(status: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
         .collect()
-}
-
-struct Report {
-    status: ResponseStatus,
-    data: Map<String, Value>,
 }
 
 enum CommandJson {

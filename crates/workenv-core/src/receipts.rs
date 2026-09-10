@@ -1,5 +1,8 @@
 //! Idempotent mutation receipts.
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -29,6 +32,12 @@ pub(crate) struct ReceiptStore {
     dir: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedResponse {
+    pub(crate) response: AdapterResponse,
+    pub(crate) modified: SystemTime,
+}
+
 impl ReceiptStore {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
@@ -50,19 +59,47 @@ impl ReceiptStore {
         })
     }
 
-    pub(crate) fn latest_response_for(
+    pub(crate) fn latest_recorded_response_for(
         &self,
         id: &ReceiptIdentity,
         expected_fingerprint: &str,
-    ) -> Result<Option<AdapterResponse>> {
+    ) -> Result<Option<RecordedResponse>> {
         if !self.dir.is_dir() {
             return Ok(None);
         }
-        let Some(record) = latest_matching_record(&self.dir, id)? else {
+        let Some((record, modified)) = latest_matching_record(&self.dir, id)? else {
             return Ok(None);
         };
         ensure_fingerprint(&record, expected_fingerprint)?;
-        response_from_record(record).map(Some)
+        recorded_response(&record, modified).map(Some)
+    }
+
+    pub(crate) fn recorded_response_for(
+        &self,
+        id: &ReceiptIdentity,
+        request_id: &str,
+        expected_fingerprint: &str,
+    ) -> Result<RecordedResponse> {
+        let path = self.receipt_path(request_id);
+        let modified = std::fs::metadata(&path)?.modified()?;
+        let record: ReceiptRecord = read_json(&path)?;
+        if record.identity != *id {
+            bail!("receipt identity does not match current operation");
+        }
+        ensure_fingerprint(&record, expected_fingerprint)?;
+        recorded_response(&record, modified)
+    }
+
+    pub(crate) fn latest_recorded_response_between(
+        &self,
+        id: &ReceiptIdentity,
+        start: SystemTime,
+        end: SystemTime,
+    ) -> Result<Option<RecordedResponse>> {
+        if !self.dir.is_dir() {
+            return Ok(None);
+        }
+        first_recorded_between(receipt_paths_newest_first(&self.dir)?, id, start, end)
     }
 
     fn apply_locked(
@@ -159,10 +196,13 @@ fn matching_record(path: &Path, id: &ReceiptIdentity) -> Result<Option<ReceiptRe
     }
 }
 
-fn latest_matching_record(dir: &Path, id: &ReceiptIdentity) -> Result<Option<ReceiptRecord>> {
-    for path in receipt_paths_newest_first(dir)? {
+fn latest_matching_record(
+    dir: &Path,
+    id: &ReceiptIdentity,
+) -> Result<Option<(ReceiptRecord, SystemTime)>> {
+    for (modified, path) in receipt_paths_newest_first(dir)? {
         if let Some(record) = matching_record(&path, id)? {
-            return Ok(Some(record));
+            return Ok(Some((record, modified)));
         }
     }
     Ok(None)
@@ -176,13 +216,52 @@ fn ensure_fingerprint(record: &ReceiptRecord, expected_fingerprint: &str) -> Res
     }
 }
 
-fn response_from_record(record: ReceiptRecord) -> Result<AdapterResponse> {
+fn recorded_response(record: &ReceiptRecord, modified: SystemTime) -> Result<RecordedResponse> {
+    Ok(RecordedResponse {
+        response: response_from_record(record)?,
+        modified,
+    })
+}
+
+fn response_from_record(record: &ReceiptRecord) -> Result<AdapterResponse> {
     record
         .response
+        .clone()
         .context("latest matching receipt has no response; inspect before retrying")
 }
 
-fn receipt_paths_newest_first(dir: &Path) -> Result<Vec<PathBuf>> {
+fn recorded_between(
+    entry: (SystemTime, PathBuf),
+    id: &ReceiptIdentity,
+    start: SystemTime,
+    end: SystemTime,
+) -> Result<Option<RecordedResponse>> {
+    let (modified, path) = entry;
+    if modified < start || modified > end {
+        return Ok(None);
+    }
+    let Some(record) = matching_record(&path, id)? else {
+        return Ok(None);
+    };
+    recorded_response(&record, modified).map(Some)
+}
+
+fn first_recorded_between(
+    entries: Vec<(SystemTime, PathBuf)>,
+    id: &ReceiptIdentity,
+    start: SystemTime,
+    end: SystemTime,
+) -> Result<Option<RecordedResponse>> {
+    for entry in entries {
+        let recorded = recorded_between(entry, id, start, end)?;
+        if recorded.is_some() {
+            return Ok(recorded);
+        }
+    }
+    Ok(None)
+}
+
+fn receipt_paths_newest_first(dir: &Path) -> Result<Vec<(SystemTime, PathBuf)>> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -192,7 +271,7 @@ fn receipt_paths_newest_first(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    Ok(paths.into_iter().map(|(_, path)| path).collect())
+    Ok(paths)
 }
 
 #[cfg(test)]

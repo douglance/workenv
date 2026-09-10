@@ -33,8 +33,9 @@ fn latest_response_for_returns_pending_receipt() -> Result<()> {
     })?;
     assert_eq!(
         store
-            .latest_response_for(&id, "fingerprint")?
+            .latest_recorded_response_for(&id, "fingerprint")?
             .context("missing latest response")?
+            .response
             .status,
         ResponseStatus::Pending
     );
@@ -50,8 +51,9 @@ fn latest_response_for_returns_matching_fingerprint() -> Result<()> {
         Ok(response("request-1", ResponseStatus::Changed))
     })?;
     let response = store
-        .latest_response_for(&id, "fingerprint")?
-        .context("missing latest response")?;
+        .latest_recorded_response_for(&id, "fingerprint")?
+        .context("missing latest response")?
+        .response;
     assert_eq!(response.request_id, "request-1");
     Ok(())
 }
@@ -69,7 +71,7 @@ fn latest_response_for_rejects_newest_matching_identity_fingerprint_mismatch() -
         Ok(response("request-2", ResponseStatus::Changed))
     })?;
     let error = store
-        .latest_response_for(&id, "old-fingerprint")
+        .latest_recorded_response_for(&id, "old-fingerprint")
         .err()
         .context("fingerprint mismatch unexpectedly succeeded")?;
     assert!(error.to_string().contains("fingerprint"));

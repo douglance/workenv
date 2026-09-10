@@ -1,7 +1,7 @@
 //! Protocol compatibility regressions shared by external adapter authors.
 use anyhow::Result;
 use serde_json::json;
-use workenv_protocol::{AdapterRequest, AdapterResponse, Manifest, ResponseStatus};
+use workenv_protocol::{AdapterRequest, AdapterResponse, Location, Manifest, ResponseStatus};
 
 fn request() -> serde_json::Value {
     json!({
@@ -49,6 +49,36 @@ fn unknown_extensions_need_no_provider_enum() -> Result<()> {
         }}
     }))?;
     assert!(manifest.extensions.contains_key("external-example"));
+    Ok(())
+}
+
+#[test]
+fn operation_location_is_optional_and_decoded_when_present() -> Result<()> {
+    let manifest: Manifest = serde_json::from_value(json!({
+        "schema_version":1,"hosts":{},"environments":{},
+        "extensions":{"external-example":{
+            "version":"1.0.0","protocol_version":1,
+            "executable":"/nix/store/example/bin/external-adapter",
+            "location":"target","systems":[],"operations":{
+                "inspect":{
+                    "description":"Inspect from default location.",
+                    "mutating":false,
+                    "input_schema":true,
+                    "output_schema":true
+                },
+                "cleanup":{
+                    "description":"Clean up from the controller.",
+                    "location":"controller",
+                    "mutating":true,
+                    "input_schema":true,
+                    "output_schema":true
+                }
+            }
+        }}
+    }))?;
+    let operations = &manifest.extensions["external-example"].operations;
+    assert_eq!(operations["inspect"].location, None);
+    assert_eq!(operations["cleanup"].location, Some(Location::Controller));
     Ok(())
 }
 

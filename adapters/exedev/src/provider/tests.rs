@@ -8,7 +8,17 @@ struct FakeRunner {
 }
 
 impl Runner for FakeRunner {
-    fn run(&mut self, args: &[String]) -> ProviderResult<Value> {
+    fn observe(&mut self, args: &[String]) -> ProviderResult<Value> {
+        self.next(args)
+    }
+
+    fn mutate(&mut self, _request_id: &str, args: &[String]) -> ProviderResult<Value> {
+        self.next(args)
+    }
+}
+
+impl FakeRunner {
+    fn next(&mut self, args: &[String]) -> ProviderResult<Value> {
         self.calls.push(args.to_vec());
         self.values.remove(0)
     }
