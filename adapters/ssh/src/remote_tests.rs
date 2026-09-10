@@ -89,6 +89,24 @@ fn wait_timeout_returns_pending_and_retry_uses_fresh_wait_key() -> Result<()> {
 }
 
 #[test]
+fn daemon_wait_failure_preserves_remote_execution_for_resume() -> Result<()> {
+    let request = request("remote-wait-failure");
+    let argv = vec!["devenv".into(), "shell".into()];
+    let executor = RecordingExecutor::new(vec![
+        json!({"id":"remote-1"}),
+        json!({"code":"EXECUTION_WAIT_FAILED",
+            "message":"DAEMON_REQUEST_FAILED: Timed out waiting for run remote-1"}),
+    ])?;
+
+    let result = execute_remote_with(remote_execute(&request, &argv), &executor, ".".as_ref())?;
+
+    assert_eq!(result.execution_id.as_deref(), Some("remote-1"));
+    assert!(result.data.get("exit_code").is_none());
+    assert_eq!(executor.specs()?.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn completed_retries_keep_start_stable_and_refresh_wait_and_logs() -> Result<()> {
     let request = request("remote-req");
     let argv = vec!["true".into()];

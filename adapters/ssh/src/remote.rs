@@ -152,7 +152,12 @@ fn remote_error(id: &str, error: &Value) -> ExecuteResult {
 }
 
 fn observation_waits(value: &Value) -> bool {
-    value["outcome"] == "pending" || value["status"] == "pending" || value["code"] == "TIMEOUT"
+    value["outcome"] == "pending"
+        || value["status"] == "pending"
+        || matches!(
+            value["code"].as_str(),
+            Some("TIMEOUT" | "EXECUTION_WAIT_FAILED")
+        )
 }
 
 fn outcome(value: &Value) -> Option<&str> {
