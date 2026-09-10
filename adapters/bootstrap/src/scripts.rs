@@ -73,9 +73,11 @@ if [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
 fi
 if ! devenv version 2>/dev/null | grep -F "$devenv_version" >/dev/null; then
   maybe_configure_devenv_cachix /etc/nix/nix.conf
+  nix_executable="$(command -v nix)"
+  case "$nix_executable" in /*) ;; *) echo "nix executable is not an absolute path" >&2; exit 1 ;; esac
   $prefix_sudo install -d -m 0755 "$prefix"
   $link_sudo install -d -m 0755 "$link_dir"
-  $prefix_sudo nix --extra-experimental-features "nix-command flakes" profile install --accept-flake-config --profile "$prefix/nix-profile" "$devenv_flake"
+  $prefix_sudo "$nix_executable" --extra-experimental-features "nix-command flakes" profile install --accept-flake-config --profile "$prefix/nix-profile" "$devenv_flake"
   $link_sudo ln -sfn "$prefix/nix-profile/bin/devenv" "$link_dir/devenv"
 fi
 {tool_installs}

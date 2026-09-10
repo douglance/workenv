@@ -132,6 +132,57 @@ fn seed_install_creates_new_user_link_dir_when_devenv_is_ready() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn install_invokes_nix_by_absolute_path_when_sudo_resets_path() -> Result<()> {
+    let root = temp_path("bootstrap-sudo-nix-path");
+    let fake_bin = root.join("fake-bin");
+    let prefix_parent = root.join("protected");
+    let prefix = prefix_parent.join("prefix");
+    let link_dir = root.join("bin");
+    let nix_log = root.join("nix.log");
+    fs::create_dir_all(&fake_bin)?;
+    fs::create_dir_all(&prefix_parent)?;
+    fs::create_dir_all(&link_dir)?;
+    fs::set_permissions(&prefix_parent, Permissions::from_mode(0o555))?;
+    write_helper(
+        &fake_bin.join("sudo"),
+        r#"#!/bin/sh
+if [ "$1" = -n ]; then shift; fi
+last=
+for arg do last=$arg; done
+parent=$(dirname "$last")
+chmod u+w "$parent" 2>/dev/null || true
+PATH=/usr/bin:/bin exec "$@"
+"#,
+    )?;
+    write_helper(
+        &fake_bin.join("nix"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'nix (Nix) 2.35.2'; exit 0; fi
+printf '%s\n' "$0 $*" >> {}
+while [ "$#" -gt 0 ]; do if [ "$1" = --profile ]; then profile=$2; mkdir -p "$profile/bin"; printf '#!/bin/sh\necho devenv 2.3.0\n' > "$profile/bin/devenv"; chmod 755 "$profile/bin/devenv"; fi; shift; done
+"#,
+            shell_arg(&path_arg(&nix_log)?)
+        ),
+    )?;
+    let config = config_with_paths(&prefix, &link_dir)?;
+    let script = scripts::install_script(&config)
+        .replace("maybe_configure_devenv_cachix /etc/nix/nix.conf", ":")
+        .replace(
+            r#"PATH="/nix/var/nix/profiles/default/bin:$link_dir:$PATH""#,
+            &format!("PATH={}:$link_dir:$PATH", shell_arg(&path_arg(&fake_bin)?)),
+        );
+
+    let status = Command::new("bash").arg("-lc").arg(script).status()?;
+
+    fs::set_permissions(&prefix_parent, Permissions::from_mode(0o755))?;
+    assert!(status.success());
+    assert!(fs::read_to_string(nix_log)?.starts_with(&path_arg(&fake_bin.join("nix"))?));
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 fn request(operation: &str) -> Result<AdapterRequest> {
     Ok(AdapterRequest {
         protocol_version: PROTOCOL_VERSION,
@@ -170,6 +221,12 @@ fn write_helper(path: &std::path::Path, body: &str) -> Result<()> {
     fs::write(path, body)?;
     fs::set_permissions(path, Permissions::from_mode(0o755))?;
     Ok(())
+}
+
+fn path_arg(path: &std::path::Path) -> Result<String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("path is not UTF-8"))
 }
 
 fn shell_arg(value: &str) -> String {

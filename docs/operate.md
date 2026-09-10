@@ -5,6 +5,14 @@ The controller needs Workenv, APoC, and devenv on PATH. SSH targets also need a
 trusted host key and working noninteractive authentication. The bootstrap
 integration prepares target prerequisites before target shell setup.
 
+For exe.dev, configure the registered SSH identity for both `exe.dev` and the
+declared machine hostname. Nix's OpenSSH can select a local SSH certificate that
+the macOS client does not select. If the account uses the plain key and one
+client unexpectedly asks you to register, set `IdentityFile`, `IdentitiesOnly
+yes`, and `CertificateFile none` for those hosts in your SSH configuration.
+Verify the [published exe.dev host fingerprint](https://exe.dev/docs/faq/host-key)
+before trusting a new hostname.
+
 Run the commands from the directory containing your `devenv.nix`, or supply
 `--root /path/to/configuration`. In these examples, `dev` is a declared environment
 name. Replace it with a name from `environment list`.

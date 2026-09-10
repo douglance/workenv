@@ -10,6 +10,11 @@ use crate::{
 
 pub(crate) fn run(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterResponse> {
     let Some(profile) = previous_profile(request) else {
+        if lifecycle_never_registered(request) {
+            let mut data = Map::new();
+            data.insert("status".to_string(), json!("herdr_cleanup_not_registered"));
+            return Ok(response(request, ResponseStatus::Ready, data));
+        }
         let mut data = Map::new();
         data.insert("status".to_string(), json!("herdr_cleanup_blocked"));
         return Ok(response(request, ResponseStatus::Failed, data));
@@ -151,6 +156,37 @@ fn previous_values(request: &AdapterRequest) -> Vec<&Value> {
         );
     }
     values
+}
+
+fn lifecycle_never_registered(request: &AdapterRequest) -> bool {
+    provider_create_owned(&request.input)
+        && provider_destroy_completed(&request.input)
+        && receipts_exclude_register(&request.input)
+}
+
+fn provider_create_owned(input: &Value) -> bool {
+    input.pointer("/provider_create/data/owned") == Some(&json!(true))
+}
+
+fn provider_destroy_completed(input: &Value) -> bool {
+    matches!(
+        input
+            .pointer("/provider_destroy/status")
+            .and_then(Value::as_str),
+        Some("ready" | "changed")
+    )
+}
+
+fn receipts_exclude_register(input: &Value) -> bool {
+    let Some(receipts) = input.get("integration_receipts").and_then(Value::as_array) else {
+        return false;
+    };
+    receipts.iter().all(|receipt| {
+        matches!(
+            receipt.get("operation").and_then(Value::as_str),
+            Some(operation) if operation != "register"
+        )
+    })
 }
 
 struct PreviousProfile {
