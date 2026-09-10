@@ -28,6 +28,9 @@ pub(crate) fn pending(
     data.insert("status".to_string(), json!(name));
     data.insert("repository".to_string(), json!(spec.repository));
     data.insert("ref".to_string(), json!(spec.reference));
+    if let Some(clone_from) = &spec.clone_from {
+        data.insert("clone_from".to_string(), json!(clone_from));
+    }
     data.insert("path".to_string(), json!(spec.path));
     data.insert("execution_id".to_string(), json!(execution_id.clone()));
     let mut response = response(request, ResponseStatus::Pending, data);

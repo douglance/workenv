@@ -107,6 +107,32 @@ fn remote_controller_path_upload_uses_stdin_and_safe_argv() -> Result<()> {
 }
 
 #[test]
+fn remote_controller_path_upload_accepts_uppercase_sha_and_normalizes_key() -> Result<()> {
+    let bytes = b"bootstrap binary bytes with uppercase config hash";
+    let sha = sha256_hex(bytes);
+    let root = temp_path("bootstrap-controller-seed-uppercase");
+    fs::create_dir_all(&root)?;
+    let seed = root.join("workenv-project");
+    fs::write(&seed, bytes)?;
+    let request = remote_request(seed_tool_config(&seed, &sha.to_ascii_uppercase())?)?;
+    let config = BootstrapConfig::from_request(&request)?;
+    let target_path = format!("/home/test/.cache/workenv/seeds/{sha}");
+    let executor = RecordingExecutor::with_response(output(Some(0), &target_path));
+
+    let SeedStage::Ready(staged) = stage_controller_seed_tools_with(&request, &config, &executor)?
+    else {
+        bail!("expected staged config");
+    };
+
+    assert_eq!(config.seed_tools[0].sha256, sha);
+    assert_eq!(staged.seed_tools[0].source, target_path);
+    assert_eq!(staged.seed_tools[0].sha256, sha);
+    assert_safe_upload_spec(&executor.calls()?[0], bytes, &sha);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn pending_remote_seed_stage_returns_execution_id_with_stable_key() -> Result<()> {
     let bytes = b"pending bootstrap binary";
     let sha = sha256_hex(bytes);
@@ -169,10 +195,23 @@ fn target_seed_stage_script_validates_sha_before_atomic_rename() -> Result<()> {
 
 #[test]
 fn invalid_seed_identity_fails_config_parse() -> Result<()> {
-    let bad_name = seed_tool_json("../workenv-project", "/tmp/seed", &sha256_hex(b"x"));
+    for name in [
+        "../workenv-project",
+        ".hidden",
+        "-dash",
+        "workenv'project",
+        "workenv\nproject",
+        "workenv%project",
+        "workenv project",
+    ] {
+        let bad_name = seed_tool_json(name, "/tmp/seed", &sha256_hex(b"x"));
+        assert!(
+            BootstrapConfig::from_request(&remote_request(bad_name)?).is_err(),
+            "expected {name:?} to be rejected"
+        );
+    }
     let bad_sha = seed_tool_json("workenv-project", "/tmp/seed", "not-a-sha");
 
-    assert!(BootstrapConfig::from_request(&remote_request(bad_name)?).is_err());
     assert!(BootstrapConfig::from_request(&remote_request(bad_sha)?).is_err());
     Ok(())
 }

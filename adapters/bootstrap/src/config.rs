@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::path::Path;
 use workenv_protocol::AdapterRequest;
 
 const DEFAULT_NIX_VERSION: &str = "2.35.2";
@@ -85,7 +84,7 @@ impl SeedTool {
                 .or_else(|| string(value, "controller_path"))
                 .context("seed_tools[] requires path, install_url, url, or controller_path")?
                 .to_owned(),
-            sha256: sha256.to_owned(),
+            sha256: sha256.to_ascii_lowercase(),
             controller_path: string(value, "controller_path").map(ToOwned::to_owned),
         })
     }
@@ -100,16 +99,16 @@ fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn validate_seed_name(name: &str) -> Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.starts_with('-') {
+    if name.is_empty() || name.starts_with('-') || name.starts_with('.') {
         bail!("seed_tools[].name must be a safe basename");
     }
-    let path = Path::new(name);
-    if path.components().count() != 1
-        || path.file_name().and_then(|part| part.to_str()) != Some(name)
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        bail!("seed_tools[].name must be a safe basename");
+        return Ok(());
     }
-    Ok(())
+    bail!("seed_tools[].name must be a safe basename")
 }
 
 fn validate_seed_sha(sha: &str) -> Result<()> {

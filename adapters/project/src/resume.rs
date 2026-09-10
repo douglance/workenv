@@ -16,6 +16,15 @@ struct PendingOperation<'a> {
     execution_id: &'a str,
 }
 
+fn clone_from_matches(data: &serde_json::Value, spec: &ProjectSpec) -> bool {
+    match &spec.clone_from {
+        Some(clone_from) => data["clone_from"].as_str() == Some(clone_from.as_str()),
+        None => data
+            .get("clone_from")
+            .is_none_or(serde_json::Value::is_null),
+    }
+}
+
 impl PendingPhase {
     const fn status(self) -> &'static str {
         match self {
@@ -55,6 +64,7 @@ impl<'a> PendingOperation<'a> {
             .context("pending project response is missing data")?;
         if data["repository"].as_str() != Some(spec.repository.as_str())
             || data.get("ref") != Some(&json!(spec.reference))
+            || !clone_from_matches(data, spec)
             || data["path"].as_str() != Some(spec.path.to_string_lossy().as_ref())
         {
             return Ok(Some(Self::unobservable()?));

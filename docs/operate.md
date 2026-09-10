@@ -40,6 +40,14 @@ private target cache and verifies their bytes again before installation. Seed
 APoC and the project adapter before the first clone; target `prepare` runs before
 the project's Nix environment exists. Keep credentials out of seed files.
 
+For a private repository without target-side Git credentials, create a Git bundle
+from the desired committed branch on the controller. Stage it with bootstrap's
+`controller_path` and SHA-256 check, then set the project integration's
+`config.clone_from` to the installed bundle path. Keep `config.repository` set
+to the permanent repository URL. Workenv uses the bundle only for the initial
+clone and retains that URL as `origin`. Uncommitted controller changes are not
+included. Future authenticated fetches and pushes require a target login.
+
 ## Apply configuration on an existing host
 
 1. Run `workenv environment list --format json` to confirm the target host,

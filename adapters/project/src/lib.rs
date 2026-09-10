@@ -184,6 +184,9 @@ fn base_data(name: &str, spec: &ProjectSpec) -> Map<String, serde_json::Value> {
     data.insert("status".to_string(), json!(name));
     data.insert("repository".to_string(), json!(spec.repository));
     data.insert("ref".to_string(), json!(spec.reference));
+    if let Some(clone_from) = &spec.clone_from {
+        data.insert("clone_from".to_string(), json!(clone_from));
+    }
     data.insert("path".to_string(), json!(spec.path));
     data
 }
@@ -195,3 +198,7 @@ mod tests;
 #[cfg(test)]
 #[path = "pending_tests.rs"]
 mod pending_tests;
+
+#[cfg(test)]
+#[path = "clone_from_tests.rs"]
+mod clone_from_tests;

@@ -50,17 +50,7 @@ impl<'a> Git<'a> {
         if let Some(parent) = spec.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        self.run(
-            vec![
-                "clone".to_string(),
-                "--".to_string(),
-                spec.repository.clone(),
-                spec.path.to_string_lossy().into_owned(),
-            ],
-            None,
-            "clone",
-            true,
-        )
+        self.run(clone_args(spec), None, "clone", true)
     }
 
     pub(crate) fn checkout_ref(
@@ -135,6 +125,21 @@ impl<'a> Git<'a> {
         }
         key
     }
+}
+
+fn clone_args(spec: &ProjectSpec) -> Vec<String> {
+    let mut arg = Vec::new();
+    if let Some(clone_from) = &spec.clone_from {
+        arg.push("-c".to_string());
+        arg.push(format!("url.{clone_from}.insteadOf={}", spec.repository));
+    }
+    arg.extend([
+        "clone".to_string(),
+        "--".to_string(),
+        spec.repository.clone(),
+        spec.path.to_string_lossy().into_owned(),
+    ]);
+    arg
 }
 
 fn is_empty(path: &Path) -> Result<bool> {
