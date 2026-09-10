@@ -25,6 +25,18 @@ impl FakeRunner {
 }
 
 fn request(dir: &TempDir, operation: &str, config: Value) -> AdapterRequest {
+    request_with_target_dir(
+        operation,
+        config_with_state_dir(config, dir),
+        dir.path().into(),
+    )
+}
+
+fn request_with_target_dir(
+    operation: &str,
+    config: Value,
+    directory: std::path::PathBuf,
+) -> AdapterRequest {
     AdapterRequest {
         protocol_version: PROTOCOL_VERSION,
         request_id: "key".into(),
@@ -37,12 +49,17 @@ fn request(dir: &TempDir, operation: &str, config: Value) -> AdapterRequest {
             environment: "env".into(),
             host: "host".into(),
             address: None,
-            directory: dir.path().into(),
+            directory,
             system: "x86_64-linux".into(),
             source: ".".into(),
             profiles: vec![],
         },
     }
+}
+
+fn config_with_state_dir(mut config: Value, dir: &TempDir) -> Value {
+    config["state_dir"] = json!(dir.path().join("exedev-state"));
+    config
 }
 
 fn vm() -> Value {
@@ -65,6 +82,37 @@ fn identity() -> Value {
 
 fn plan() -> Value {
     json!({"max_cpus":16,"max_memory_gb":64,"max_disk_gb":100,"max_vms":50})
+}
+
+#[test]
+fn default_state_dir_uses_controller_cwd_not_remote_target_directory() -> Result<()> {
+    let req = request_with_target_dir(
+        "create",
+        json!({"name":"workenv-01"}),
+        "/home/exedev/projects/workenv".into(),
+    );
+
+    let dir = state_dir(&req);
+
+    assert_eq!(
+        dir,
+        std::env::current_dir()?.join(".state/workenv-adapters/exedev")
+    );
+    assert!(!dir.starts_with("/home/exedev/projects/workenv"));
+    Ok(())
+}
+
+#[test]
+fn explicit_state_dir_is_preserved() -> Result<()> {
+    let dir = TempDir::new()?;
+    let req = request_with_target_dir(
+        "create",
+        json!({"state_dir":dir.path()}),
+        "/home/exedev/projects/workenv".into(),
+    );
+
+    assert_eq!(state_dir(&req), dir.path());
+    Ok(())
 }
 
 #[test]

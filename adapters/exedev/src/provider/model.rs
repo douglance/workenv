@@ -119,14 +119,13 @@ pub(super) fn previous_identity(request: &AdapterRequest) -> Option<Value> {
 
 pub(super) fn state_dir(request: &AdapterRequest) -> PathBuf {
     str_field(&request.config, "state_dir").map_or_else(
-        || {
-            request
-                .target
-                .directory
-                .join(".state/workenv-adapters/exedev")
-        },
+        || controller_state_dir().join(".state/workenv-adapters/exedev"),
         PathBuf::from,
     )
+}
+
+fn controller_state_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 pub(super) fn receipt_path(dir: &std::path::Path, key: &str) -> PathBuf {
