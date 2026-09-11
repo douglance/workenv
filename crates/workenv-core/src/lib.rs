@@ -18,6 +18,11 @@ mod validate;
 pub use controller::{CallOptions, Controller};
 
 #[cfg(test)]
+// Test-only, and only these: a failure-reporting test that cannot unwrap its
+// own fixture says less than one that panics loudly when the fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod adapter_failure_tests;
+#[cfg(test)]
 mod controller_tests;
 #[cfg(test)]
 mod environment_cleanup_tests;

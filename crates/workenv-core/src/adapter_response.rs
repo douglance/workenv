@@ -21,7 +21,16 @@ pub(super) fn response_from_output(
             pending.execution_id = Some(output.execution_id.clone());
             return Ok(pending);
         }
-        bail!("adapter exited unsuccessfully: {}", output.stderr);
+        bail!(
+            "adapter {} {} exited with {}{}; execution {}",
+            request.extension,
+            request.operation,
+            output
+                .exit_code
+                .map_or_else(|| "no status".to_owned(), |code| code.to_string()),
+            diagnosis(output),
+            output.execution_id,
+        );
     }
     let response: AdapterResponse =
         serde_json::from_str(&output.stdout).context("adapter returned invalid JSON")?;
@@ -30,6 +39,25 @@ pub(super) fn response_from_output(
     } else {
         bail!("adapter response request ID mismatch");
     }
+}
+
+/// The most informative thing the failed execution actually said.
+///
+/// An adapter that dies before it can write anything leaves both streams empty,
+/// and the bare message that used to be produced -- "adapter exited
+/// unsuccessfully: " -- named neither the adapter, the operation, the status,
+/// nor the execution to go and read. That exact string hid three different
+/// causes during one session. When there is nothing to quote, say so and point
+/// at the execution record instead of trailing off.
+fn diagnosis(output: &ExecutionOutput) -> String {
+    for (label, stream) in [("stderr", &output.stderr), ("stdout", &output.stdout)] {
+        let text = stream.trim();
+        if !text.is_empty() {
+            let excerpt: String = text.chars().take(400).collect();
+            return format!(" ({label}: {excerpt})");
+        }
+    }
+    " and wrote nothing to either stream".to_owned()
 }
 
 pub(super) fn validate_response(

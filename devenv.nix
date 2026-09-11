@@ -30,6 +30,7 @@
       modules/*.nix \
       modules/tests/*.nix \
       presets/*.nix \
+      fleet/devenv.nix \
       examples/external-extension/module.nix
   '';
 }
