@@ -219,6 +219,16 @@ Traps found bringing it up, none of them documented upstream:
 - **The binary is named `Xvnc`, not `Xkasmvnc`** — the same name TigerVNC uses. A
   `pgrep`-based health check cannot tell the two apart, which is one more reason the
   lifecycle belongs in a systemd unit rather than in pattern matching.
+- **KasmVNC and TigerVNC contend for `/usr/bin/Xvnc` through `update-alternatives`.**
+  Installing `kasmvncserver` silently switches the alternative, so a script that calls
+  `Xvnc ... -SecurityTypes None` starts getting KasmVNC and fails on flags it does not
+  accept. They can coexist — but only one is `Xvnc` at a time, so **you cannot A/B the
+  two stacks on one guest**; switch with `update-alternatives --set Xvnc`, or use
+  separate guests. Purging `kasmvncserver` restores `Xvnc` to `Xtigervnc` automatically.
+- **Stale X locks survive a killed server.** After switching servers, `/tmp/.X1-lock` and
+  `/tmp/.X11-unix/X1` must be removed or the next `Xvnc` dies with
+  `vncExtInit: failed to bind socket: Address already in use (98)` — an error that names
+  a socket and says nothing about the lock file actually responsible.
 
 ## Measured: previewing a web app needs no proxy at all
 
