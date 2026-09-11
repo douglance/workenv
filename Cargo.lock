@@ -3575,6 +3575,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "workenv-adapter-orchard"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.12.28",
+ "serde_json",
+ "workenv-protocol",
+]
+
+[[package]]
+name = "workenv-adapter-pool"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "workenv-platform",
+ "workenv-protocol",
+]
+
+[[package]]
 name = "workenv-adapter-project"
 version = "0.2.0"
 dependencies = [
