@@ -88,12 +88,93 @@ let
       pending_count = count;
     };
   };
+  # create and destroy take genuinely different inputs, which is exactly what a
+  # single shared providerInput cannot express: lima.nix widens one schema to the
+  # union of both and so constrains neither. Declared separately, create can
+  # forbid a stray `create` receipt and destroy can forbid a stray `cpu`.
+  createInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = {
+      image.type = "string";
+      cpu = {
+        type = "integer";
+        minimum = 1;
+      };
+      memory = {
+        type = "integer";
+        minimum = 512;
+      };
+      disk_size = {
+        type = "integer";
+        minimum = 1;
+      };
+      lease_seconds = {
+        type = "integer";
+        minimum = 60;
+      };
+      startup_script.type = "string";
+      # Overrides for the platform normally derived from the host's declared
+      # system. Present so a one-off can differ without editing the manifest.
+      os.type = "string";
+      arch.type = "string";
+      resources = {
+        type = "object";
+        additionalProperties = true;
+      };
+      # Labels constrain placement: a labelled guest only lands on a worker
+      # carrying the same label. This is how a guest is pinned to one machine,
+      # and why nothing is labelled by default.
+      labels = {
+        type = "object";
+        additionalProperties = true;
+      };
+    };
+  };
+  destroyInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = {
+      # Annotation only: the controller passes the create receipt here so the
+      # guest can be found. Named explicitly so create cannot receive it.
+      create = {
+        description = "Previous create receipt supplied by the controller.";
+      };
+      name.type = "string";
+    };
+  };
+  guestOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [ "name" ];
+    properties = {
+      name.type = "string";
+      status.type = "string";
+      worker.type = "string";
+      removed.type = "boolean";
+      reason.type = "string";
+    };
+  };
   operations = {
     inventory = {
       description = "Report Orchard cluster workers, guests and capacity.";
       mutating = false;
       input_schema = inventoryInput;
       output_schema = inventoryOutput;
+    };
+    create = {
+      description = "Schedule one ephemeral guest for this environment.";
+      mutating = true;
+      input_schema = createInput;
+      output_schema = guestOutput;
+    };
+    destroy = {
+      description = "Remove this environment's guest from the cluster.";
+      mutating = true;
+      input_schema = destroyInput;
+      output_schema = guestOutput;
     };
   };
 in

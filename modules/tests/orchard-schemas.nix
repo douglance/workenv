@@ -83,6 +83,16 @@ assert inventory.input_schema.additionalProperties == false;
 assert inventory.input_schema.required == [ ];
 assert lib.elem "pending_count" inventory.output_schema.required;
 assert lib.elem "totals" inventory.output_schema.required;
+# The per-operation win, asserted: one shared schema could not do this, because
+# it would have to accept both and so would forbid neither.
+assert extension.operations.create.mutating;
+assert extension.operations.destroy.mutating;
+assert extension.operations.create.input_schema.properties ? cpu;
+assert !(extension.operations.create.input_schema.properties ? create);
+assert extension.operations.destroy.input_schema.properties ? create;
+assert !(extension.operations.destroy.input_schema.properties ? cpu);
+assert extension.operations.create.input_schema.additionalProperties == false;
+assert extension.operations.destroy.input_schema.additionalProperties == false;
 assert lib.all (entry: entry.assertion) normal.assertions;
 # An empty controller URL must be refused, not defaulted around.
 assert lib.any (entry: !entry.assertion) emptyUrl.assertions;
@@ -97,5 +107,6 @@ assert lib.all (entry: entry.assertion) withLima.assertions;
   output_schema_requires_capacity_fields = true;
   empty_controller_url_rejected = true;
   renamed_extension_supported = true;
+  create_and_destroy_schemas_differ = true;
   coexists_with_lima = true;
 }

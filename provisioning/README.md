@@ -165,6 +165,36 @@ place a VM it cannot fit.
 The `tart-vms: 2` default is worth noting as a density trade-off — Lima currently runs four
 guests on `box-03`. It is a default, not a hard cap: `orchard worker run --resources` sets it.
 
+## Three undocumented Orchard API requirements
+
+Its CLI fills these in; a body written straight against `POST /v1/vms` does not, and
+every one of them produces the same symptom: the guest sits `pending` forever with an
+**empty status message**, on a cluster with ample free capacity. None is diagnosable from
+the response.
+
+| Field | What happens without it |
+|---|---|
+| `resources: {"org.cirruslabs.tart-vms": 1}` | Never scheduled. The API does not default the slot a guest occupies. |
+| `os` | Defaults to `darwin`. A Linux image with `os: darwin` is placed on nothing. |
+| `labels` | **Must be omitted unless you mean it.** |
+
+The third is the trap. **Labels are scheduling constraints, not metadata**: a labelled
+guest only lands on a worker carrying the same label. Attaching bookkeeping — an
+environment name, a lease deadline — makes the guest unschedulable. Workers carry no
+labels by default, so *any* label is disqualifying.
+
+That reframes labels usefully rather than as a hazard: they are the mechanism for pinning
+a guest to a chosen machine. `workenv.orchard` therefore attaches none of its own and
+passes through only what the caller asks for.
+
+The lease needs no label anyway. A guest is named for its environment and the controller
+records `created_at`, so a sweeper has everything it needs from live cluster state plus
+the lease declared on the binding — which is also the property that lets teardown work
+after a rebuild has invalidated the create receipt.
+
+Measured once correct: **create to running in 2-4 s**, destroy removes, and a second
+destroy converges to `ready` rather than failing.
+
 ## The image/spawn boundary: toolchain is baked, credentials are not
 
 Moving provisioning into a golden image raises a question the Lima path never had

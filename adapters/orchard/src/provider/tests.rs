@@ -1,73 +1,8 @@
-//! Orchard provider tests.
-use super::{Cluster, handle_with};
-use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use workenv_protocol::{AdapterRequest, ResponseStatus, Target};
-
-/// A cluster that answers from a fixed table, or fails a named collection.
-struct FakeCluster {
-    collections: HashMap<String, Vec<Value>>,
-    failing: Option<String>,
-}
-
-impl FakeCluster {
-    fn new() -> Self {
-        Self {
-            collections: HashMap::new(),
-            failing: None,
-        }
-    }
-
-    fn with(mut self, name: &str, items: Vec<Value>) -> Self {
-        self.collections.insert(name.to_owned(), items);
-        self
-    }
-
-    fn failing(mut self, name: &str) -> Self {
-        self.failing = Some(name.to_owned());
-        self
-    }
-}
-
-impl Cluster for FakeCluster {
-    fn collection(&self, name: &str) -> Result<Vec<Value>> {
-        if self.failing.as_deref() == Some(name) {
-            return Err(anyhow!("controller unreachable"));
-        }
-        Ok(self.collections.get(name).cloned().unwrap_or_default())
-    }
-}
-
-fn request(operation: &str) -> AdapterRequest {
-    AdapterRequest {
-        protocol_version: 1,
-        request_id: "observation:test".into(),
-        extension: "workenv.orchard".into(),
-        operation: operation.into(),
-        target: Target {
-            environment: "env".into(),
-            host: "host".into(),
-            address: None,
-            directory: PathBuf::from("/tmp"),
-            system: "aarch64-darwin".into(),
-            source: ".".into(),
-            profiles: Vec::new(),
-        },
-        config: json!({}),
-        input: json!({}),
-        previous: None,
-    }
-}
-
-fn worker(name: &str, cores: u64, vms: u64) -> Value {
-    json!({
-        "name": name,
-        "last_seen": "2026-09-10T22:39:36-04:00",
-        "resources": {"org.cirruslabs.logical-cores": cores, "org.cirruslabs.tart-vms": vms},
-    })
-}
+//! Orchard inventory tests.
+use super::handle_with;
+use super::test_support::{FakeCluster, request, worker};
+use serde_json::json;
+use workenv_protocol::ResponseStatus;
 
 #[test]
 fn inventory_reports_workers_and_guests() {
@@ -184,7 +119,9 @@ fn pending_guests_are_counted_separately() {
 
 #[test]
 fn an_unknown_operation_is_unsupported_not_failed() {
+    // Not `create` or `destroy`: both are supported now, and this test went red
+    // when they landed, which is the behaviour wanted from it.
     let cluster = FakeCluster::new();
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_with(&request("teleport"), &cluster);
     assert_eq!(response.status, ResponseStatus::Unsupported);
 }

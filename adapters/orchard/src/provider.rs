@@ -1,6 +1,14 @@
 //! Orchard cluster provider logic.
 mod client;
+mod create;
+mod destroy;
 mod inventory;
+#[cfg(test)]
+#[path = "provider/lifecycle_tests.rs"]
+mod lifecycle_tests;
+#[cfg(test)]
+#[path = "provider/test_support.rs"]
+mod test_support;
 #[cfg(test)]
 #[path = "provider/tests.rs"]
 mod tests;
@@ -26,6 +34,8 @@ pub(crate) fn handle(request: &AdapterRequest) -> AdapterResponse {
 fn handle_with<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
     match request.operation.as_str() {
         "inventory" => report(request, cluster),
+        "create" => provision(request, cluster, &sleep_seconds),
+        "destroy" => teardown(request, cluster),
         _ => response(
             request,
             ResponseStatus::Unsupported,
@@ -33,6 +43,85 @@ fn handle_with<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResp
             Some("unsupported Orchard provider operation"),
         ),
     }
+}
+
+/// Wait between readiness polls. Injected so tests do not sleep.
+fn sleep_seconds(seconds: u64) {
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+}
+
+/// Answer `create` by asking the controller to schedule a guest.
+fn provision<C: Cluster>(
+    request: &AdapterRequest,
+    cluster: &C,
+    sleep: &dyn Fn(u64),
+) -> AdapterResponse {
+    let spec = create::spec(
+        &request.target.environment,
+        &request.target.system,
+        &request.config,
+        &request.input,
+    );
+    match create::run(cluster, &spec, sleep) {
+        // Already running is Ready, not Changed: re-running create must not
+        // report a change it did not make, or every apply looks like a rebuild.
+        Ok(create::Created::Existing(guest)) => response(
+            request,
+            ResponseStatus::Ready,
+            guest_data(&spec.name, &guest),
+            None,
+        ),
+        Ok(create::Created::Running(guest)) => response(
+            request,
+            ResponseStatus::Changed,
+            guest_data(&spec.name, &guest),
+            None,
+        ),
+        // Pending keeps the name in `data` so a later teardown can still find
+        // the guest that a timed-out create may well have left running.
+        Ok(create::Created::Pending(guest, reason)) => response(
+            request,
+            ResponseStatus::Pending,
+            guest_data(&spec.name, &guest),
+            Some(&reason),
+        ),
+        Err(error) => failed(request, &error),
+    }
+}
+
+/// Answer `destroy` by removing the guest this environment created.
+fn teardown<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
+    let name = destroy::target(
+        &request.target.environment,
+        request.previous.as_ref(),
+        &request.input,
+    );
+    match destroy::run(cluster, &name) {
+        Ok(destroy::Destroyed::Removed) => response(
+            request,
+            ResponseStatus::Changed,
+            json!({"name": name, "removed": true}),
+            None,
+        ),
+        Ok(destroy::Destroyed::AlreadyGone) => response(
+            request,
+            ResponseStatus::Ready,
+            json!({"name": name, "removed": false, "reason": "already absent"}),
+            None,
+        ),
+        Err(error) => failed(request, &error),
+    }
+}
+
+/// Shape one guest for a receipt, always carrying the name teardown needs.
+fn guest_data(name: &str, guest: &Value) -> Value {
+    let mut data = inventory::guest(guest);
+    if let Some(object) = data.as_object_mut() {
+        // The controller may answer a create with an empty echo; the name is the
+        // one field teardown cannot do without, so it is set from the request.
+        object.insert("name".into(), json!(name));
+    }
+    data
 }
 
 /// Answer `inventory` from live controller state.
