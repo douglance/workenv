@@ -83,7 +83,47 @@ That is an acceptable trade for ephemeral demo guests on a personal tailnet. It 
 not acceptable for anything holding real credentials, and nothing here should be
 read as making it so.
 
-## Measured: 7 seconds to ssh-ready
+## Measured: 4354s -> 7s, with the full toolchain
+
+The baked image closes the comparison. This is a complete workenv guest, not a bare
+Ubuntu: cloned from `workenv-base`, which carries nix, devenv, the `tools.json` closure,
+`apoc`, `nib` and the desktop stack.
+
+```
+APFS clone done        t+1s
+ip assigned            t+5s
+SSH READY              t+7s
+TOOLCHAIN READY        t+7s
+
+nix 2.35.2   devenv 2.3.0+e0781f7   apoc 0.6.0
+codex-cli 0.153.4   claude 2.1.267 (Claude Code)
+```
+
+Against the 4354 s clean-room `workenv-up` baseline, that is **622x**. The provisioning
+did not get faster; it moved out of the spawn path and happens once per image tag. Image
+cost: 16 GB on disk, and APFS clones share blocks, so the second guest is nearly free.
+
+### The bake found a real defect
+
+The first bake produced an image missing `apoc`, `node`, `ripgrep`, `gh` and `uv`. One
+cause: `rustc` was SIGKILLed compiling the `apoc` lib crate, and every later stage never
+ran. The guest had **7914 MB** and so sat on the safe side of the provisioner's
+`MEM_MB -lt 6000` test, taking neither the swapfile nor `-j1` — and still ran out.
+
+The threshold is now gone. Swap is added whenever there is none, and build jobs are
+budgeted at roughly 4 GB each and capped at `nproc`. A constant someone must remember to
+raise is not a guard.
+
+Two more traps worth recording:
+
+- **Cloud images run `apt` at first boot.** Starting the provisioner into that lock fails
+  stage 1 instantly with `Could not get lock /var/lib/dpkg/lock-frontend`, which looks
+  nothing like "you started too early". Wait for the lock before provisioning.
+- **`rsync` will not create intermediate directories.** Syncing to `~/src/workenv` on a
+  guest with no `~/src` fails, and every later stage then fails for reasons that appear
+  unrelated.
+
+## Measured: 7 seconds to ssh-ready (bare image)
 
 The premise of the whole re-platform is that spawning an environment should be seconds, not
 an hour. Measured on the controller Mac (64 GB / 14 cpu) running `orchard dev` with
