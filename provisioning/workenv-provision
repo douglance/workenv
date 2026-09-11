@@ -112,12 +112,23 @@ log "6/8 apoc and nib (built from source)"
 # rustc needs well over the 3 GB a small guest gets; without swap the OOM killer
 # takes it (SIGKILL) partway through the crate graph. Cheap insurance on disk.
 MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-if [ "$MEM_MB" -lt 6000 ] && ! swapon --show 2>/dev/null | grep -q swapfile; then
-  echo "low memory (${MEM_MB}MB): adding 8G swap for the build"
+# Swap unconditionally, not below a threshold. A 7914 MB guest sat on the safe
+# side of the old `-lt 6000` cliff, took neither swap nor -j1, and rustc was
+# still SIGKILLed compiling the apoc lib crate. A constant someone has to
+# remember to raise is not a guard; swap costs disk and nothing else.
+if ! swapon --show 2>/dev/null | grep -q swapfile; then
+  echo "adding 8G swap for the build (${MEM_MB}MB RAM)"
   sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
     && sudo mkswap -q /swapfile && sudo swapon /swapfile
 fi
-BUILD_JOBS=2; [ "$MEM_MB" -lt 6000 ] && BUILD_JOBS=1
+# Budget roughly 4 GB of RAM per concurrent rustc rather than picking a number.
+# codegen-units=1 at opt-level=3 makes the final crate the peak, and that peak
+# scales with jobs, so this is the dimension that actually decides an OOM.
+BUILD_JOBS=$(( MEM_MB / 4000 ))
+[ "$BUILD_JOBS" -lt 1 ] && BUILD_JOBS=1
+CPUS=$(nproc 2>/dev/null || echo 2)
+[ "$BUILD_JOBS" -gt "$CPUS" ] && BUILD_JOBS=$CPUS
+echo "build jobs: $BUILD_JOBS (${MEM_MB}MB RAM, ${CPUS} cpu)"
 
 if [ -x "$BIN/apoc" ]; then
   echo "apoc present: $($BIN/apoc --version 2>&1 | head -1)"
