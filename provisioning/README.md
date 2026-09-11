@@ -368,6 +368,35 @@ Two details that are not obvious:
 - **No cluster read on purpose.** Reaching in has to keep working while the controller is
   briefly unreachable, which is exactly when someone is trying to get in and look.
 
+### The transport: running work inside a guest that has no address
+
+`connect` returns argv a human can use. `workenv-core` needs something else to
+place a *target-located* extension (`identity`, `clipboard`): it calls the
+host's transport with `execute`, one exact argv, and reads back
+`{exit_code, stdout, stderr}`. Every other transport dials `target.address`, so
+before `workenv.orchard` gained `execute`, an Orchard-backed host could be
+created and then could not run an integration at all.
+
+The outer hop is `orchard ssh vm <name>`. Probed against a live guest before
+any of it was written:
+
+| property | measured |
+|---|---|
+| stdout cleanliness | exactly the child's bytes (`4d41524b4552`), no banner |
+| stdin | passes through (`wc -c` returned 11) |
+| exit code | **not propagated** -- `exit 7` surfaces as `1` |
+| stderr | prefixed with orchard's `no credentials specified or found...` |
+
+The last two decide the design. The child's result is not read off the orchard
+process at all: a wrapper script inside the guest captures the child's own
+streams and status and prints one JSON object on stdout, which is the stream
+measured to be clean. Verified end to end -- a child that writes to both
+streams, reads stdin and exits 7 comes back as exit_code 7, `err-here\n`, and
+`out-here\npiped-stdin-payload`, with the orchard banner gone.
+
+The script travels base64-encoded, because that alphabet contains no shell
+metacharacter and so cannot be re-split by the guest's shell.
+
 ### `orchard port-forward vm` is broken; there is no `preview` operation
 
 A port-forwarding counterpart was written, verified against its own tests, and then
@@ -388,6 +417,94 @@ binds the listener itself and reports the port it actually bound back as
 `observedEndpoints[].workerPort`. That is read-back rather than assumption, and it does not
 route bytes through the broken `port-forward` gRPC stream. `ssh -L` (above) remains the
 zero-code path in the meantime.
+
+## The fleet root
+
+`presets/personal.nix` holds the hosts, but nothing imported it, and the
+repository's own `devenv.nix` enables no adapters -- so running the CLI from the
+repo root reported no environments and the shipped fleet was unreachable from
+the shipped CLI. `fleet/` is the join:
+
+```sh
+workenv --root fleet environment list
+workenv --root fleet environment up wkv-fast
+```
+
+`wkv-fast` is the address-free host: `workenv.orchard` is both the provider that
+creates the guest and the transport that reaches it. Nothing in the manifest
+names a machine, so the environment lands on whichever worker has capacity.
+
+Three defects had to be fixed before that root would load at all, each of which
+only appears once a manifest has real content in it:
+
+- **A manifest slower than 30s could never be loaded.** `ApocExecutor::execute`
+  caps its first wait at 30s inside the code-mode runner, then reports the
+  result. A fleet manifest evaluates in 55s (measured), so it came back with no
+  exit code and surfaced as `devenv manifest evaluation did not complete
+  successfully` with an *empty* stderr -- an error naming neither the cause nor
+  the timeout. It now keeps observing the execution APoC already accepted until
+  the caller's own budget is spent.
+- **An unavailable tool took down the whole shell.** `modules/tools.nix`
+  resolves a tool the host cannot run to a placeholder carrying the *tool's*
+  `meta.platforms`, so nixpkgs' `check-meta` refuses to evaluate it and every
+  command fails with `Refusing to evaluate package
+  'apoc-unsupported-on-aarch64-darwin'`. The module already computed
+  `availableNames` and simply never used it; `packages` now uses the filter.
+- **`workenv.clipboard` cannot be enabled on an Apple Silicon controller.** It
+  is an xclip/xsel integration declared `x86_64-linux` only, and enabling it put
+  an unbuildable package in the devenv shell. This fleet is Macs only, so it is
+  off.
+
+## Supervision: the cluster was three unsupervised processes
+
+Before `workenv-controller-install`, the fleet was held together by an
+`orchard dev` (pid parented to launchd), a hand-started worker on `box-03`, and a
+single `ssh -N` reverse tunnel -- none supervised, none surviving a reboot, and
+`~/Library/LaunchAgents` empty on both machines. Three things were wrong with
+the controller specifically, all measured rather than assumed:
+
+- `orchard dev --help` says "for development purposes" and bundles a worker into
+  the controller process.
+- its `--data-dir` defaults to the **relative** path `.dev-data`, so the cluster
+  database landed wherever the process was started. It was found under a
+  per-session scratchpad in `/private/tmp`, which is reaped -- every worker
+  registration and service account with it.
+- it bound `*:6120` (confirmed with `lsof` against the live process) while
+  answering to **default `admin:admin` credentials**, on a tailnet whose grant is
+  `dst:["*"]`. That is the fleet's whole control plane offered to every device
+  on it.
+
+`workenv-controller-install` replaces it with a launchd agent running a real
+controller, an absolute data dir under `$HOME`, and `--listen 127.0.0.1:6120`.
+It refuses to load an agent whose listener is not loopback, and verifies after
+starting that nothing is listening on all interfaces -- the `--insecure-no-tls`
+that keeps the existing context URL working is only safe while that holds.
+
+### Two things supervision only taught by being tested
+
+Both were found by killing the process and watching, not by reading the code.
+
+- **A 401 is the readiness signal, not a failure.** `orchard dev` answered with
+  default `admin:admin`. A real controller mints a random `bootstrap-admin`
+  account on first start and answers 401 to an unauthenticated probe -- so the
+  install script's original `curl -f` readiness check reported a correctly
+  secured, fully working controller as one that never came up. Readiness is
+  "the port speaks HTTP" (200/401/403), and the 401 is the deliverable.
+- **The worker needs its token on every start.** `orchard worker run` has no
+  persisted-credential flag. Supplying the token once at enrolment, on the
+  theory that it created a durable identity, produced a supervised worker that
+  crash-looped on `no bootstrap token was provided` **while
+  `orchard list workers` still showed the worker present** -- what the
+  controller had seen was the one-shot enrolment process, which then exited. The
+  token now lives in a 0600 file read on stdin at each start, never in argv and
+  never in the plist.
+
+Proven by killing each of the three and watching launchd bring it back with a
+new pid: controller 11187 -> 24829, worker 45594 -> 45858, tunnel -> 24904.
+
+Also note the first boot writes the generated token to the controller log, so
+that log is a credential at rest from the start; the install script now creates
+`~/Library/Logs/workenv` and `~/.orchard` as 0700.
 
 ## Traps this encodes
 

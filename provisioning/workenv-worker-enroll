@@ -48,13 +48,45 @@ step "2/5 reverse tunnel for the controller API"
 # grant (src is autogroup:member only), and the connection times out with no
 # diagnostic. The controller can always dial the worker, so the tunnel runs the
 # other way. Grant tag:<worker> -> controller:$PORT in the policy to drop this.
-pkill -f "ssh -N .*-R $PORT:127.0.0.1:$PORT $TARGET" 2>/dev/null || true
-nohup ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -R "$PORT:127.0.0.1:$PORT" "$TARGET" >/dev/null 2>&1 &
-disown
+# Supervised, not nohup'd. An unsupervised tunnel is the single process the
+# whole worker depends on, and when it dies the worker leaves the fleet with no
+# signal -- it just stops being scheduled onto.
+TUNNEL_LABEL="dev.workenv.orchard-tunnel.$NAME"
+TUNNEL_PLIST="$HOME/Library/LaunchAgents/$TUNNEL_LABEL.plist"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/workenv"
+cat > "$TUNNEL_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$TUNNEL_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string><string>-N</string>
+    <string>-o</string><string>BatchMode=yes</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-o</string><string>ServerAliveInterval=30</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-R</string><string>$PORT:127.0.0.1:$PORT</string>
+    <string>$TARGET</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/workenv/orchard-tunnel-$NAME.log</string>
+</dict>
+</plist>
+PLIST_EOF
+launchctl bootout "gui/$UID/$TUNNEL_LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$UID" "$TUNNEL_PLIST"
 sleep 4
-"${SSH[@]}" "curl -fsS -o /dev/null --max-time 8 http://127.0.0.1:$PORT/v1/workers" \
-  || { echo "controller API is not reachable from $TARGET" >&2; exit 1; }
+# 401 means reachable and authenticating, which is the goal. `curl -f` would
+# read a correctly-secured controller as an unreachable one.
+REMOTE_CODE="$("${SSH[@]}" "curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://127.0.0.1:$PORT/v1/workers" || true)"
+case "$REMOTE_CODE" in
+  200|401|403) ;;
+  *) echo "controller API is not reachable from $TARGET (got '$REMOTE_CODE')" >&2; exit 1 ;;
+esac
 echo "  controller API reachable from $TARGET"
 
 step "3/5 bootstrap token"
@@ -63,20 +95,57 @@ TOKEN="$(orchard get bootstrap-token workers | tail -1)"
 [ -n "$TOKEN" ] || { echo "could not mint a bootstrap token" >&2; exit 1; }
 
 step "4/5 start the worker"
-# Token travels on stdin and lands in a 0600 tmpfile, never in argv, so it is
-# absent from the process table and from any receipt.
-printf '%s' "$TOKEN" | "${SSH[@]}" "
-  set -e
-  export PATH=\$HOME/.local/bin:\$PATH
-  umask 077 && cat > /tmp/wkv-bt
-  pkill -f 'orchard worker run' 2>/dev/null || true
-  sleep 1
-  nohup sh -c 'orchard worker run http://127.0.0.1:$PORT --name $NAME \
-    --bootstrap-token-stdin --resources org.cirruslabs.tart-vms=$SLOTS \
-    < /tmp/wkv-bt > /tmp/orchard-worker.log 2>&1' >/dev/null 2>&1 &
-  sleep 8
-  rm -f /tmp/wkv-bt
-"
+# Two hops, deliberately. Interpolating a remote script inside a double-quoted
+# ssh argument means every `$HOME` and `$(id -u)` expands on the CONTROLLER:
+# an earlier version wrote the worker's token to the controller's own home and
+# started the worker with no controller URL at all. The token goes over stdin
+# on its own, then the setup script goes over stdin with nothing to expand.
+printf '%s' "$TOKEN" | "${SSH[@]}" '
+  umask 077
+  mkdir -p "$HOME/.orchard" && chmod 700 "$HOME/.orchard"
+  cat > "$HOME/.orchard/worker-token"
+  chmod 600 "$HOME/.orchard/worker-token"
+'
+# The token is read from that 0600 file on every start, never passed in argv.
+# Measured, not assumed: an earlier version supplied it once, on the theory that
+# it created a durable identity, and the supervised worker then crash-looped on
+# "no bootstrap token was provided" while `orchard list workers` still showed
+# the worker present -- because what the controller had seen was the one-shot
+# enrolment process, which then exited. `orchard worker run` has no
+# persisted-credential flag.
+"${SSH[@]}" "bash -s -- '$PORT' '$NAME' '$SLOTS'" <<'REMOTE'
+set -eu
+PORT="$1"; NAME="$2"; SLOTS="$3"
+AGENT="$HOME/Library/LaunchAgents/dev.workenv.orchard-worker.plist"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/workenv"
+chmod 700 "$HOME/Library/Logs/workenv" 2>/dev/null || true
+cat > "$AGENT" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.workenv.orchard-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>exec $HOME/.local/bin/orchard worker run http://127.0.0.1:$PORT --name $NAME --bootstrap-token-stdin --resources org.cirruslabs.tart-vms=$SLOTS &lt; $HOME/.orchard/worker-token</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/workenv/orchard-worker.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/workenv/orchard-worker.log</string>
+</dict>
+</plist>
+PLIST
+pkill -f 'orchard worker run' 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/dev.workenv.orchard-worker" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$AGENT"
+sleep 8
+REMOTE
 
 step "5/5 verify"
 for _ in $(seq 1 20); do
