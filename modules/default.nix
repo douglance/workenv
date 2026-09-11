@@ -10,6 +10,7 @@
     ./clipboard.nix
     ./exedev.nix
     ./lima.nix
+    ./pool.nix
     ./ssh.nix
     ./bootstrap.nix
     ./project.nix
