@@ -24,16 +24,23 @@
     clipboard.enable = true;
     exedev.enable = true;
     lima.enable = true;
+    # Read-only cluster inventory. Declares no hosts, so it cannot affect the
+    # Lima-backed environments above; it only makes `workenv extension call
+    # workenv.orchard inventory` reachable from the CLI and MCP.
+    orchard.enable = true;
     ssh.enable = true;
     bootstrap.enable = true;
 
-    # One ephemeral Lima slot on the Intel Mac `box-03`. The address is static
-    # because the controller reads it from this manifest, never from a provider
-    # response, so a claim binds an identity to a slot and never renames it.
+    # One ephemeral Lima slot on `box-03`, an Apple Silicon (M2) Mac mini. The
+    # address is static because the controller reads it from this manifest and
+    # never from a provider response, so a claim binds an identity to a slot and
+    # never renames it. The user is `box-03` because that is the Lima guest user;
+    # `fleet.json` says `exedev`, and the two want reconciling when the guest
+    # gains its own account.
     hosts."wkv-01" = {
-      address = "exedev@wkv-01.example.ts.net";
+      address = "box-03@wkv-01.example.ts.net";
       transport = "workenv.ssh";
-      system = "x86_64-linux";
+      system = "aarch64-linux";
       provider = {
         extension = "workenv.lima";
         config = {
@@ -54,12 +61,17 @@
 
     environments."wkv-01" = {
       host = "wkv-01";
-      directory = "/home/exedev/workenv";
+      directory = "/home/box-03.linux/workenv";
       source = toString ../.;
       ephemeral = true;
+      # herdr appears here as well as in `connection` because it declares a
+      # `register` operation, and lifecycle up refuses a connection extension
+      # that supports register unless the identical binding is also an
+      # integration. Without this, `environment up` bails before doing any work.
       integrations = [
         { extension = "workenv.identity"; }
         { extension = "workenv.bootstrap"; }
+        { extension = "workenv.herdr"; }
       ];
       connection = {
         extension = "workenv.herdr";

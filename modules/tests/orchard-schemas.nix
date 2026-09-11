@@ -43,6 +43,29 @@ let
       ];
     };
   normal = (evaluate { }).config;
+  # Enabling orchard must not disturb the provider already serving real hosts.
+  # pool shipped enabled-by-nothing; this asserts orchard is actually reachable
+  # and that lima keeps its extension and its assertions when both are on.
+  withLima =
+    (evaluate {
+      imports = [ ../lima.nix ];
+      workenv.lima.enable = true;
+      workenv.lima.package = pkgs.hello;
+      workenv.hosts.guest = {
+        address = "user@guest.example";
+        transport = "workenv.ssh";
+        provider = {
+          extension = "workenv.lima";
+          config.vm_host = "vmhost.example";
+        };
+      };
+      workenv.environments.guest = {
+        host = "guest";
+        directory = "/tmp/guest";
+        source = "path:/tmp/config";
+        ephemeral = true;
+      };
+    }).config;
   emptyUrl = (evaluate { workenv.orchard.controllerUrl = lib.mkForce ""; }).config;
   renamed = (evaluate { workenv.orchard.extensionId = "personal.orchard"; }).config;
   extension = normal.workenv.extensions."workenv.orchard";
@@ -64,6 +87,9 @@ assert lib.all (entry: entry.assertion) normal.assertions;
 # An empty controller URL must be refused, not defaulted around.
 assert lib.any (entry: !entry.assertion) emptyUrl.assertions;
 assert renamed.workenv.extensions ? "personal.orchard";
+assert withLima.workenv.extensions ? "workenv.orchard";
+assert withLima.workenv.extensions ? "workenv.lima";
+assert lib.all (entry: entry.assertion) withLima.assertions;
 {
   controller_located = true;
   inventory_is_observation = true;
@@ -71,4 +97,5 @@ assert renamed.workenv.extensions ? "personal.orchard";
   output_schema_requires_capacity_fields = true;
   empty_controller_url_rejected = true;
   renamed_extension_supported = true;
+  coexists_with_lima = true;
 }
