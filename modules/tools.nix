@@ -329,7 +329,13 @@ in
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
-        packages = selectedPackages ++ cfg.extraPackages;
+        # Filtered, not `selectedPackages`. An unavailable tool resolves to a
+        # placeholder carrying the tool's own `meta.platforms`, so putting it in
+        # the shell makes nixpkgs' check-meta refuse to evaluate it: enabling a
+        # tool the host cannot run took down the entire devenv shell rather than
+        # omitting one binary. `availableNames` was already computed here and
+        # simply never used. The omitted names stay reportable below.
+        packages = map selectedPackage availableNames ++ cfg.extraPackages;
 
         env.WORKENV_UNSUPPORTED_PACKAGES = builtins.toJSON unsupportedNames;
         workenv.packages = lib.genAttrs cfg.packageNames selectedPackage;
