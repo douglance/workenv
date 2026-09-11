@@ -98,6 +98,13 @@ in
         executable = "${cfg.package}/bin/${cfg.binaryName}";
         location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
+        runtime_inputs = [
+          "apoc"
+          "herdr"
+          "devenv"
+          "ssh"
+          "bash"
+        ];
         operations = cfg.operations;
       };
     };

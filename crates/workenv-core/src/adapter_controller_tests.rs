@@ -120,6 +120,7 @@ fn extension(executable: &str) -> Extension {
         executable: PathBuf::from(executable),
         location: Location::Controller,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: [(
             "inspect".to_owned(),
             Operation {

@@ -211,6 +211,7 @@ fn target_extension() -> Extension {
         executable: PathBuf::from("/nix/store/bin/project-adapter"),
         location: Location::Target,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: ["prepare", "apply"].into_iter().map(operation).collect(),
     }
 }
@@ -222,6 +223,7 @@ fn transport_extension() -> Extension {
         executable: PathBuf::from("/nix/store/bin/transport"),
         location: Location::Controller,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: [operation("execute")].into(),
     }
 }

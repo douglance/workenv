@@ -238,6 +238,7 @@ fn extension(location: Location) -> Extension {
         executable: PathBuf::from("/nix/store/bin/adapter"),
         location,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: [(
             "status".to_owned(),
             Operation {

@@ -84,6 +84,15 @@ pub struct Extension {
     /// Supported Nix systems; an empty list means platform-independent.
     #[serde(default)]
     pub systems: Vec<String>,
+    /// Executables this adapter runs, beyond itself.
+    ///
+    /// Declared so the controller can skip wrapping the adapter in a devenv
+    /// shell when everything it needs is already resolvable. `Some([])` means
+    /// "needs nothing else"; `None` means "not stated", which keeps the shell.
+    /// Absence is therefore always the safe reading, and the decision is made
+    /// against the machine rather than against a flag someone must maintain.
+    #[serde(default)]
+    pub runtime_inputs: Option<Vec<String>>,
     /// Declared operation contracts.
     pub operations: BTreeMap<String, Operation>,
 }

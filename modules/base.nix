@@ -193,6 +193,15 @@ in
               description = "Supported Nix systems. Empty means platform-independent.";
             };
 
+            # Null, not [ ], by default. An extension that has not stated what it
+            # runs keeps the devenv shell wrapper, so adding this option cannot
+            # change the behaviour of an extension that does not opt in.
+            runtime_inputs = lib.mkOption {
+              type = lib.types.nullOr (lib.types.listOf lib.types.str);
+              default = null;
+              description = "Executables this adapter runs, beyond itself. Stating them lets the controller skip the devenv shell when all of them already resolve.";
+            };
+
             operations = lib.mkOption {
               type = lib.types.attrsOf operationType;
               default = { };

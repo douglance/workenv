@@ -199,6 +199,7 @@ fn extension(operation: &str, location: Location, internal: bool) -> Extension {
         executable: PathBuf::from(format!("/nix/store/bin/{operation}")),
         location,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: [(
             operation.to_owned(),
             Operation {

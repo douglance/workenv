@@ -180,6 +180,7 @@ pub(super) fn setup_extension(location: Location) -> Extension {
         executable: std::path::PathBuf::from("/nix/store/bin/target-tool"),
         location,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: [
             ("apply".to_owned(), operation(true, json!(true))),
             ("bootstrap".to_owned(), operation(true, json!(true))),
@@ -203,6 +204,7 @@ pub(super) fn transport_extension() -> Extension {
         executable: std::path::PathBuf::from("/nix/store/bin/transport"),
         location: Location::Controller,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations: [
             (
                 "connect".to_owned(),

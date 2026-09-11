@@ -147,6 +147,7 @@ fn extension<const N: usize>(location: Location, operations: [(&str, bool); N]) 
         executable: "/nix/store/workenv-adapter".into(),
         location,
         systems: Vec::new(),
+        runtime_inputs: None,
         operations,
     }
 }

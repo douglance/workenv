@@ -375,6 +375,10 @@ in
         # binding_supported rejects it.
         location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
+        runtime_inputs = [
+          "orchard"
+          "ssh"
+        ];
         operations = cfg.operations;
       };
     };

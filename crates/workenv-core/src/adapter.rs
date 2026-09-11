@@ -22,6 +22,8 @@ mod adapter_transport;
 use adapter_target::{local_target_command, target_command};
 use adapter_transport::{pending_transport, request_for_transport, transport_response};
 
+pub(crate) use crate::adapter_invocation::controller_command;
+
 pub(crate) struct Invocation<'a> {
     pub(crate) extension_id: &'a str,
     pub(crate) operation: &'a str,
@@ -142,18 +144,6 @@ fn invoke_controller_with_previous(
         ),
     };
     execute_or_observe(runtime.executor, request, spec, previous)
-}
-
-fn controller_command(extension: &Extension) -> (String, Vec<String>) {
-    let executable = extension.executable.to_string_lossy().into_owned();
-    if extension.executable.starts_with("/nix/store") {
-        (
-            "devenv".to_owned(),
-            vec!["shell".to_owned(), "--".to_owned(), executable],
-        )
-    } else {
-        (executable, Vec::new())
-    }
 }
 
 fn invoke_target(

@@ -81,6 +81,12 @@ in
         executable = "${cfg.package}/bin/${cfg.binaryName}";
         location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
+        runtime_inputs = [
+          "devenv"
+          "nix"
+          "ssh"
+          "bash"
+        ];
         operations = cfg.operations;
       };
     };

@@ -10,7 +10,15 @@
     rust.enable = true;
   };
 
-  packages = [ pkgs.nixfmt-rfc-style ];
+  # nix is listed, not assumed. `workenv-check` calls `nix-instantiate` for the
+  # module assertion suites, and relied on the ambient PATH carrying it: run the
+  # script from a context whose PATH lacks the nix profile and those three steps
+  # die with "nix-instantiate: command not found" after everything before them
+  # has already passed.
+  packages = [
+    pkgs.nixfmt-rfc-style
+    pkgs.nix
+  ];
 
   scripts.workenv-check.exec = ''
     set -euo pipefail

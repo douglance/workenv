@@ -106,6 +106,12 @@ in
         executable = "${cfg.package}/bin/${cfg.binaryName}";
         location = "target";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
+        runtime_inputs = [
+          "herdr"
+          "devenv"
+          "ssh"
+          "bash"
+        ];
         operations = cfg.operations;
       };
     };
