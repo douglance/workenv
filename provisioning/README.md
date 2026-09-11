@@ -343,6 +343,52 @@ Host: localhost:15173
 this; it needed 117 lines only because it ran on the Mac mini multiplexing four guests onto
 one loopback. From the reviewer's own machine it is one command.
 
+## Reaching a scheduled guest: `workenv.orchard connect`
+
+Every other connection in this repo needs `target.address`. A scheduled guest cannot have
+one: placement is chosen after the manifest is written, and the provider response never
+feeds back into it. So a guest could be created and then not reached at all.
+
+`connect` closes that. It answers from the request alone -- no cluster read -- with argv that
+tunnels by name through the controller:
+
+```
+orchard ssh vm <guest> [<command>]
+```
+
+Verified live against a guest scheduled onto `box-03`, with no address anywhere in the
+manifest or the response: exit 0 and `Linux ubuntu 7.0.0-30-generic ... aarch64`.
+
+Two details that are not obvious:
+
+- **The command is ONE argument, not spread.** `orchard ssh vm` takes at most two
+  positionals. Spreading `uname -a` both overflows that and lets the command's own flags be
+  parsed as orchard's, failing with `unknown shorthand flag: 'a'` -- which names neither
+  orchard nor uname.
+- **No cluster read on purpose.** Reaching in has to keep working while the controller is
+  briefly unreachable, which is exactly when someone is trying to get in and look.
+
+### `orchard port-forward vm` is broken; there is no `preview` operation
+
+A port-forwarding counterpart was written, verified against its own tests, and then
+**deleted** rather than shipped. `orchard port-forward vm <guest> <local>:<remote>` binds its
+local listener and prints `forwarding 127.0.0.1:19488 -> <guest>:8080...`, then fails every
+data transfer:
+
+```
+failed to forward port: ... failed to read frame header: EOF
+```
+
+Reproduced on **both workers**, against a guest whose server answers 200 to itself, across
+three retries, while `orchard ssh` to that same guest works. An adapter operation returning
+`ready` with that argv would report success and hand the caller a dead port.
+
+The correct mechanism for a future preview feature is Orchard's **`endpoints`**: the worker
+binds the listener itself and reports the port it actually bound back as
+`observedEndpoints[].workerPort`. That is read-back rather than assumption, and it does not
+route bytes through the broken `port-forward` gRPC stream. `ssh -L` (above) remains the
+zero-code path in the meantime.
+
 ## Traps this encodes
 
 Each of these cost real time to find; the scripts handle them so you don't rediscover them.

@@ -38,6 +38,13 @@ impl FakeCluster {
         self
     }
 
+    /// True when this call should fail. "*" fails every call, which is what
+    /// proves an operation touches the cluster at all rather than just one
+    /// collection a test happened to name.
+    fn fails(&self, name: &str) -> bool {
+        matches!(self.failing.as_deref(), Some("*")) || self.failing.as_deref() == Some(name)
+    }
+
     pub(super) fn absent_on_remove(mut self) -> Self {
         self.absent_on_remove = true;
         self
@@ -56,14 +63,14 @@ impl FakeCluster {
 
 impl Cluster for FakeCluster {
     fn collection(&self, name: &str) -> Result<Vec<Value>> {
-        if self.failing.as_deref() == Some(name) {
+        if self.fails(name) {
             return Err(anyhow!("controller unreachable"));
         }
         Ok(self.collections.get(name).cloned().unwrap_or_default())
     }
 
     fn guest(&self, _name: &str) -> Result<Option<Value>> {
-        if self.failing.as_deref() == Some("guest") {
+        if self.fails("guest") {
             return Err(anyhow!("controller unreachable"));
         }
         let mut sequence = self.guest_sequence.borrow_mut();
@@ -78,7 +85,7 @@ impl Cluster for FakeCluster {
     }
 
     fn create(&self, body: &Value) -> Result<Value> {
-        if self.failing.as_deref() == Some("create") {
+        if self.fails("create") {
             return Err(anyhow!("scheduler refused"));
         }
         self.created.borrow_mut().push(body.clone());
@@ -86,7 +93,7 @@ impl Cluster for FakeCluster {
     }
 
     fn remove(&self, name: &str) -> Result<Removal> {
-        if self.failing.as_deref() == Some("remove") {
+        if self.fails("remove") {
             return Err(anyhow!("controller unreachable"));
         }
         self.removed.borrow_mut().push(name.to_owned());

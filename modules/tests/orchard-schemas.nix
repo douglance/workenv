@@ -98,6 +98,16 @@ assert lib.elem "name_prefix" extension.operations.reap.input_schema.required;
 assert lib.elem "lease_seconds" extension.operations.reap.input_schema.required;
 assert extension.operations.reap.mutating;
 assert lib.elem "skipped" extension.operations.reap.output_schema.required;
+# Reaching a guest is an observation, and it must take no address: the whole
+# point is that placement is invisible to the manifest.
+assert !extension.operations.connect.mutating;
+assert lib.elem "attach_argv" extension.operations.connect.output_schema.required;
+assert extension.operations.connect.input_schema.required == [ ];
+assert !(extension.operations.connect.input_schema.properties ? address);
+assert extension.operations.connect.input_schema.additionalProperties == false;
+# Port forwarding is not declared, because `orchard port-forward vm` binds a
+# listener and then fails every transfer. A declared operation is a promise.
+assert !(extension.operations ? preview);
 assert lib.all (entry: entry.assertion) normal.assertions;
 # An empty controller URL must be refused, not defaulted around.
 assert lib.any (entry: !entry.assertion) emptyUrl.assertions;
@@ -114,5 +124,7 @@ assert lib.all (entry: entry.assertion) withLima.assertions;
   renamed_extension_supported = true;
   create_and_destroy_schemas_differ = true;
   reap_requires_an_ownership_prefix = true;
+  guests_are_reachable_without_an_address = true;
+  broken_port_forward_is_not_declared = true;
   coexists_with_lima = true;
 }

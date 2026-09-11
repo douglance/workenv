@@ -1,4 +1,8 @@
 //! Orchard cluster provider logic.
+mod access;
+#[cfg(test)]
+#[path = "provider/access_tests.rs"]
+mod access_tests;
 mod client;
 mod create;
 mod destroy;
@@ -41,6 +45,9 @@ fn handle_with<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResp
         "create" => provision(request, cluster, &sleep_seconds),
         "destroy" => teardown(request, cluster),
         "reap" => sweep(request, cluster),
+        // Reaching a guest needs no cluster read: the controller tunnels by
+        // name, so this answers from the request alone.
+        "connect" => access::connect(request),
         _ => response(
             request,
             ResponseStatus::Unsupported,
@@ -212,7 +219,7 @@ fn controller_url(request: &AdapterRequest) -> String {
 }
 
 /// Build one protocol response.
-fn response(
+pub(super) fn response(
     request: &AdapterRequest,
     status: ResponseStatus,
     data: Value,

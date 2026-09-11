@@ -205,6 +205,43 @@ let
       dry_run.type = "boolean";
     };
   };
+  # Reaching a guest takes no cluster read, so this is an observation. It
+  # answers from the request alone, which is what keeps it working when the
+  # controller is briefly unreachable -- exactly when someone is trying to get
+  # in and look at something.
+  #
+  # There is no port-forwarding operation: `orchard port-forward vm` binds a
+  # local listener and then fails every transfer with "failed to read frame
+  # header: EOF", so declaring it would publish a contract the tool cannot keep.
+  connectInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = {
+      name.type = "string";
+      command = {
+        type = "array";
+        items.type = "string";
+      };
+    };
+  };
+  connectionOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [
+      "attach_argv"
+      "guest"
+    ];
+    properties = {
+      status.type = "string";
+      guest.type = "string";
+      attach_argv = {
+        type = "array";
+        items.type = "string";
+      };
+      reaches_by.type = "string";
+    };
+  };
   operations = {
     inventory = {
       description = "Report Orchard cluster workers, guests and capacity.";
@@ -229,6 +266,12 @@ let
       mutating = true;
       input_schema = reapInput;
       output_schema = reapOutput;
+    };
+    connect = {
+      description = "Argv that opens a shell on this environment's guest.";
+      mutating = false;
+      input_schema = connectInput;
+      output_schema = connectionOutput;
     };
   };
 in
