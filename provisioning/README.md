@@ -83,6 +83,48 @@ That is an acceptable trade for ephemeral demo guests on a personal tailnet. It 
 not acceptable for anything holding real credentials, and nothing here should be
 read as making it so.
 
+## Measured: 7 seconds to ssh-ready
+
+The premise of the whole re-platform is that spawning an environment should be seconds, not
+an hour. Measured on the controller Mac (64 GB / 14 cpu) running `orchard dev` with
+Tart 2.32.1 and Orchard 0.56.1, from a cached `ghcr.io/cirruslabs/ubuntu` image:
+
+```
+create returned      t+0s
+status=running       t+6s
+SSH READY            t+7s
+guest: aarch64, 2 cpu, 1951 MB
+```
+
+**Read the comparison honestly.** The 4,354 s clean-room figure elsewhere in this file is
+`workenv-up` on Lima doing create + seed + provision, including compiling `apoc` and `nib`
+from source in the guest. The 7 s figure is create-to-ssh from a cached image with none of
+that. They measure different things — and that *is* the point: the re-platform moves
+provisioning out of the per-spawn path and into a one-time image bake. Spawn becomes an
+APFS clone of an already-provisioned disk.
+
+The remaining work to make the comparison exact is baking the workenv toolchain into the
+image; the spawn cost does not change when you do, only the image tag does.
+
+### The scheduler actually enforces resources
+
+Three VMs were requested against an idle worker advertising:
+
+```
+org.cirruslabs.logical-cores: 14
+org.cirruslabs.memory-mib:    65536
+org.cirruslabs.tart-vms:      2
+```
+
+Each VM consumes `tart-vms: 1`, so the third stayed `pending` with no assigned worker until
+capacity was freed. **This is the single defect that most justifies the migration**:
+`provisioning/workenv-lima` accepts `--system`, `--cpus`, `--memory-gb` and `--disk-gb` and
+ignores every one of them, handing back a fixed-size guest regardless. Orchard refuses to
+place a VM it cannot fit.
+
+The `tart-vms: 2` default is worth noting as a density trade-off — Lima currently runs four
+guests on `box-03`. It is a default, not a hard cap: `orchard worker run --resources` sets it.
+
 ## Measured: KasmVNC replaces the hand-rolled stack
 
 Verified on `wkv-02` (Ubuntu 24.04 aarch64, 2 GB, 2 vCPU). These numbers are not published
