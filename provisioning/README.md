@@ -547,6 +547,55 @@ confident wrong answer rather than an error:
   and no message, because `head` closing the pipe sends `tr` SIGPIPE and
   `set -o pipefail` turns that into a failure. Token generation uses `openssl`.
 
+## Verified end to end
+
+Against the supervised, authenticated cluster, through the shipped CLI, with no
+address anywhere in the manifest:
+
+```
+workenv --root fleet extension call workenv.orchard create --environment wkv-fast
+  -> status ready, guest "wkv-fast" running, assigned worker "box-03"
+```
+
+and then work run inside that guest through the transport: a child writing both
+streams, reading stdin and exiting 5 came back as `exit_code: 5`,
+`stdout: "Linux aarch64\nadmin\ncarried-through-the-transport"`, `stderr: ""`.
+Placement was chosen by the scheduler; nothing in the manifest names a machine.
+
+## Known: every adapter call costs ~100s of devenv shell
+
+`crates/workenv-core/src/adapter.rs` wraps any `/nix/store` adapter in
+`devenv shell -- <path>`. Measured on a warm tree:
+
+| invocation | time | result |
+|---|---:|---|
+| `devenv shell -- <adapter>` | **100,000 ms** | correct |
+| `<adapter>` directly | **39 ms** | identical |
+
+The executable is already an absolute store path and needs no shell to run. An
+`environment up` with a provider and two integrations is three adapter calls, so
+roughly five minutes passes before any work starts -- which is why
+`extension inspect` (manifest only) returns instantly while `extension call`
+looks like it has hung. Several verification runs in this session were written
+off as failures for exactly this reason.
+
+It is **not** changed here on purpose. The wrapper plausibly exists so adapters
+inherit the devenv shell's PATH, and `herdr`, `tailscale` and `bootstrap` all
+shell out to tools that shell provides. Changing how all nine adapters are
+invoked while only one or two can be exercised from this machine (exedev needs
+exe.dev, tailscale needs the tailnet) would trade a measured 2,500x win for an
+unmeasured risk of breaking adapters silently. Whoever takes it should confirm,
+per adapter, what it actually needs on PATH.
+
+## Known: `adapters/project` is built, accepted, and enabled by nothing
+
+Unlike `adapters/pool`, which was deleted because nothing referenced it,
+`adapters/project` works -- git history carries "Record live project up and down
+acceptance" -- but `project.enable` appears only in
+`.state/project-lifecycle/controller/devenv.nix`, a working-state manifest,
+never in `presets/personal.nix`. It should be wired into the shipped preset, not
+removed.
+
 ## Traps this encodes
 
 Each of these cost real time to find; the scripts handle them so you don't rediscover them.
