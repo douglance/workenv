@@ -195,6 +195,33 @@ Four traps, each of which fails in a way that does not name its cause:
 - **Workers need a bootstrap token**, and there is no service account by default. Without
   one the worker exits immediately with `no bootstrap token was provided`.
 
+## Expiry: reap works from cluster state, never from receipts
+
+Orchard has no TTL, so expiry is the one piece of lifecycle that stays ours. `reap` lists
+live guests, compares `createdAt` against a lease, and deletes what has expired.
+
+It reads **cluster state, never a receipt**, and that is the point. The create fingerprint
+covers the whole environment and host, so a rebuild invalidates it; a sweeper that needed
+a receipt would stop working exactly when guests start leaking. This is what today's
+`workenv-lima cmd_reap` cannot do — it returns a hardcoded `"tailnet_removed": []`.
+
+Three safety properties, each covered by a test that fails when the property is removed:
+
+- **`name_prefix` is required by the schema, not defaulted.** An omitted prefix would
+  otherwise mean "every guest in the cluster is mine to delete". Dispatch refuses the call
+  before the adapter runs.
+- **An unreadable `createdAt` is skipped and reported, never reaped.** Treating an
+  unparseable date as infinitely old would let one malformed record take the fleet.
+- **`dry_run` reports without removing**, so a lease change can be checked before it bites.
+
+Verified live: dry run listed the expired guest and left it running; a sweep with a
+non-matching prefix touched nothing; the real sweep removed it.
+
+**A field-name trap worth recording**: the controller spells this timestamp `createdAt`
+while `scheduled_at` and `started_at` beside it are snake_case. Reading `created_at`
+returns empty, which is indistinguishable from a guest with no age — so every guest looks
+un-reapable and nothing ever expires.
+
 ## Three undocumented Orchard API requirements
 
 Its CLI fills these in; a body written straight against `POST /v1/vms` does not, and

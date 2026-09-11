@@ -25,7 +25,10 @@ pub(super) fn guest(record: &Value) -> Value {
         "status_message": text(record, "status_message"),
         "worker": text(record, "worker"),
         "image": text(record, "image"),
-        "created_at": text(record, "created_at"),
+        // The controller spells this one camelCase while `scheduled_at` and
+        // `started_at` beside it are snake_case. Reading `created_at` silently
+        // returns empty, which is indistinguishable from a guest with no age.
+        "created_at": text(record, "createdAt"),
         "resources": record.get("resources").cloned().unwrap_or_else(|| json!({})),
     })
 }

@@ -157,6 +157,54 @@ let
       reason.type = "string";
     };
   };
+  # name_prefix is REQUIRED, not defaulted. An omitted prefix would otherwise
+  # mean "every guest in the cluster is mine to delete", so the schema refuses
+  # the call before the adapter ever runs.
+  reapInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [
+      "lease_seconds"
+      "name_prefix"
+    ];
+    properties = {
+      lease_seconds = {
+        type = "integer";
+        minimum = 60;
+      };
+      name_prefix = {
+        type = "string";
+        minLength = 1;
+      };
+      dry_run.type = "boolean";
+    };
+  };
+  reapOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [
+      "reaped"
+      "kept"
+      "skipped"
+    ];
+    properties = {
+      reaped = {
+        type = "array";
+        items.type = "string";
+      };
+      kept = {
+        type = "array";
+        items.type = "string";
+      };
+      # Guests whose age could not be read. Reported rather than reaped, so a
+      # malformed record is visible instead of silently deleted or silently kept.
+      skipped = {
+        type = "array";
+        items.type = "object";
+      };
+      dry_run.type = "boolean";
+    };
+  };
   operations = {
     inventory = {
       description = "Report Orchard cluster workers, guests and capacity.";
@@ -175,6 +223,12 @@ let
       mutating = true;
       input_schema = destroyInput;
       output_schema = guestOutput;
+    };
+    reap = {
+      description = "Remove guests whose lease has expired, from live cluster state.";
+      mutating = true;
+      input_schema = reapInput;
+      output_schema = reapOutput;
     };
   };
 in

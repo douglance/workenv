@@ -93,6 +93,11 @@ assert extension.operations.destroy.input_schema.properties ? create;
 assert !(extension.operations.destroy.input_schema.properties ? cpu);
 assert extension.operations.create.input_schema.additionalProperties == false;
 assert extension.operations.destroy.input_schema.additionalProperties == false;
+# reap must not be callable without stating which guests it owns.
+assert lib.elem "name_prefix" extension.operations.reap.input_schema.required;
+assert lib.elem "lease_seconds" extension.operations.reap.input_schema.required;
+assert extension.operations.reap.mutating;
+assert lib.elem "skipped" extension.operations.reap.output_schema.required;
 assert lib.all (entry: entry.assertion) normal.assertions;
 # An empty controller URL must be refused, not defaulted around.
 assert lib.any (entry: !entry.assertion) emptyUrl.assertions;
@@ -108,5 +113,6 @@ assert lib.all (entry: entry.assertion) withLima.assertions;
   empty_controller_url_rejected = true;
   renamed_extension_supported = true;
   create_and_destroy_schemas_differ = true;
+  reap_requires_an_ownership_prefix = true;
   coexists_with_lima = true;
 }
