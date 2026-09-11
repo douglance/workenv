@@ -11,7 +11,6 @@
     ./exedev.nix
     ./lima.nix
     ./orchard.nix
-    ./pool.nix
     ./ssh.nix
     ./bootstrap.nix
     ./project.nix
