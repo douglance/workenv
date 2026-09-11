@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Enrol a Mac as an Orchard worker so environments can be placed on it.
+#
+#   workenv-worker-enroll <ssh-target> [worker-name] [tart-vm-slots]
+#
+# Runs on the controller. Installs tart and orchard on the target, opens a
+# reverse tunnel for the controller API, mints a bootstrap token, and starts
+# the worker. Idempotent: re-running replaces the worker process.
+set -euo pipefail
+
+TARGET="${1:?usage: workenv-worker-enroll <ssh-target> [name] [slots]}"
+NAME="${2:-$(printf '%s' "$TARGET" | sed 's/.*@//; s/\..*//')}"
+SLOTS="${3:-1}"
+PORT="${WORKENV_ORCHARD_PORT:-6120}"
+ORCHARD_VERSION="${WORKENV_ORCHARD_VERSION:-0.56.1}"
+TART_VERSION="${WORKENV_TART_VERSION:-2.37.0}"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$TARGET")
+step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
+
+step "1/5 install tart and orchard on $TARGET"
+# Downloaded on the target, not copied from here: copying a signed Mach-O
+# invalidates its signature and the binary is then SIGKILLed on exec with no
+# message other than "Killed: 9".
+"${SSH[@]}" "
+  set -e
+  mkdir -p ~/.local/bin /tmp/wkv-install && cd /tmp/wkv-install
+  if ! ~/.local/bin/tart --version >/dev/null 2>&1; then
+    curl -fsSL -o tart.tar.gz https://github.com/openai/tart/releases/download/${TART_VERSION}/tart.tar.gz
+    tar xzf tart.tar.gz
+    rm -rf ~/.local/share/tart.app && mkdir -p ~/.local/share && mv tart.app ~/.local/share/
+    ln -sf ~/.local/share/tart.app/Contents/MacOS/tart ~/.local/bin/tart
+  fi
+  if ! ~/.local/bin/orchard --version >/dev/null 2>&1; then
+    curl -fsSL -o orchard.tgz https://github.com/openai/orchard/releases/download/${ORCHARD_VERSION}/orchard-darwin-arm64.tar.gz
+    tar xzf orchard.tgz && install -m 755 orchard ~/.local/bin/orchard
+    xattr -d com.apple.quarantine ~/.local/bin/orchard 2>/dev/null || true
+    # spctl rejects the release binary as 'not an app' even though it carries a
+    # valid Developer ID, and the kernel kills it. An ad-hoc re-sign fixes it.
+    codesign --force --sign - ~/.local/bin/orchard
+  fi
+  printf '  tart %s / orchard %s\n' \
+    \"\$(~/.local/bin/tart --version 2>&1 | head -1)\" \
+    \"\$(~/.local/bin/orchard --version 2>&1 | head -1)\"
+"
+
+step "2/5 reverse tunnel for the controller API"
+# A tagged worker cannot dial a user-owned controller under the default tailnet
+# grant (src is autogroup:member only), and the connection times out with no
+# diagnostic. The controller can always dial the worker, so the tunnel runs the
+# other way. Grant tag:<worker> -> controller:$PORT in the policy to drop this.
+pkill -f "ssh -N .*-R $PORT:127.0.0.1:$PORT $TARGET" 2>/dev/null || true
+nohup ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -R "$PORT:127.0.0.1:$PORT" "$TARGET" >/dev/null 2>&1 &
+disown
+sleep 4
+"${SSH[@]}" "curl -fsS -o /dev/null --max-time 8 http://127.0.0.1:$PORT/v1/workers" \
+  || { echo "controller API is not reachable from $TARGET" >&2; exit 1; }
+echo "  controller API reachable from $TARGET"
+
+step "3/5 bootstrap token"
+orchard create service-account workers --roles compute:write --roles compute:read >/dev/null 2>&1 || true
+TOKEN="$(orchard get bootstrap-token workers | tail -1)"
+[ -n "$TOKEN" ] || { echo "could not mint a bootstrap token" >&2; exit 1; }
+
+step "4/5 start the worker"
+# Token travels on stdin and lands in a 0600 tmpfile, never in argv, so it is
+# absent from the process table and from any receipt.
+printf '%s' "$TOKEN" | "${SSH[@]}" "
+  set -e
+  export PATH=\$HOME/.local/bin:\$PATH
+  umask 077 && cat > /tmp/wkv-bt
+  pkill -f 'orchard worker run' 2>/dev/null || true
+  sleep 1
+  nohup sh -c 'orchard worker run http://127.0.0.1:$PORT --name $NAME \
+    --bootstrap-token-stdin --resources org.cirruslabs.tart-vms=$SLOTS \
+    < /tmp/wkv-bt > /tmp/orchard-worker.log 2>&1' >/dev/null 2>&1 &
+  sleep 8
+  rm -f /tmp/wkv-bt
+"
+
+step "5/5 verify"
+for _ in $(seq 1 20); do
+  orchard list workers 2>/dev/null | grep -q "^$NAME" && break
+  sleep 2
+done
+orchard list workers 2>/dev/null | grep -E "^Name|^$NAME" || {
+  echo "worker $NAME did not register" >&2; exit 1; }
+echo "worker $NAME enrolled"

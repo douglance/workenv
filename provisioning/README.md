@@ -13,6 +13,7 @@ worker. All are arch-aware (`x86_64` and `aarch64`) and idempotent.
 | `workenv-desktop` | the guest | Xvnc + openbox + browser + noVNC, on demand |
 | `workenv-desk-forward` | VM host (macOS) | supervised tailnet publish of one guest's noVNC port |
 | `workenv-desk-publish` | controller | publish desktops for a set of slots, verified from here |
+| `workenv-worker-enroll` | controller | enrol another Mac as an Orchard worker |
 
 ## Usage
 
@@ -164,6 +165,35 @@ place a VM it cannot fit.
 
 The `tart-vms: 2` default is worth noting as a density trade-off — Lima currently runs four
 guests on `box-03`. It is a default, not a hard cap: `orchard worker run --resources` sets it.
+
+## Enrolling another Mac as a worker
+
+`workenv-worker-enroll <ssh-target> [name] [slots]` installs tart and orchard on a Mac and
+registers it with the controller, so an environment can be placed there. Verified across
+two Macs:
+
+```
+box-03                   cores=  8 mem=  8192MiB slots=1
+desk-01.lan.example   cores= 14 mem= 65536MiB slots=2
+fleet totals: 22 cores, 73728 MiB, 3 slots
+```
+
+Four traps, each of which fails in a way that does not name its cause:
+
+- **A tagged worker cannot dial a user-owned controller.** The default tailnet grant is
+  `{src:["autogroup:member"], dst:["*"], ip:["*"]}`, and a tagged machine is not a member,
+  so TCP simply times out. Note `tailscale ping` still succeeds — it is a disco ping and
+  does not traverse the ACL, so it is not evidence that a connection will work. The script
+  works around it with a reverse ssh tunnel in the direction that *is* permitted. **The
+  real fix is a grant of `tag:<worker>` → controller on the Orchard port**, which is a
+  policy change and is deliberately left to a human.
+- **Copying a signed Mach-O invalidates its signature.** The binary is then SIGKILLed on
+  exec with no output but `Killed: 9`. Download on the target instead.
+- **Even downloaded, `spctl` rejects the orchard release** as "the code is valid but does
+  not seem to be an app", despite a valid Cirrus Labs Developer ID. `codesign --force
+  --sign -` makes it runnable.
+- **Workers need a bootstrap token**, and there is no service account by default. Without
+  one the worker exits immediately with `no bootstrap token was provided`.
 
 ## Three undocumented Orchard API requirements
 
