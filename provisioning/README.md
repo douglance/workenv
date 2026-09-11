@@ -71,12 +71,76 @@ The protection is entirely positional:
   `workenv-desk-forward` on the VM host binding the host's tailnet address.
 - The tailnet ACL is the whole access control. The live grant is
   `{src:["autogroup:member"], dst:["*"], ip:["*"]}`, so **anyone on the tailnet can
-  open and drive these desktops**, and the guest cannot tell which device connected
-  (Serve does not populate identity headers for tagged devices).
+  open and drive these desktops**.
+
+**Correction to an earlier version of this section.** It claimed Serve populates no
+identity headers. That is backwards. The docs say identity headers are not populated for
+traffic *originating from* tagged devices — the guest is the *destination*. A reviewer on
+a user-owned device **does** receive `Tailscale-User-Login`. Only tagged clients (other
+guests, CI) are anonymous, and `--accept-app-caps` covers those.
 
 That is an acceptable trade for ephemeral demo guests on a personal tailnet. It is
 not acceptable for anything holding real credentials, and nothing here should be
 read as making it so.
+
+## Measured: KasmVNC replaces the hand-rolled stack
+
+Verified on `wkv-02` (Ubuntu 24.04 aarch64, 2 GB, 2 vCPU). These numbers are not published
+anywhere and were the gate on adopting KasmVNC over the current TigerVNC + noVNC +
+websockify stack.
+
+| check | result |
+|---|---|
+| `kasmvncserver_noble_1.5.0_arm64.deb` install (`--no-install-recommends`) | resolves, 92 packages, no unmet dependency |
+| **`Xvnc` RSS** | **71–77 MB** |
+| openbox RSS | 19 MB |
+| `MemAvailable` with desktop up | **1624 MB of 1959 MB** |
+| CPU, idle with a rendering client | 0.1% of one core |
+| framebuffer changing (two `scrot` hashes, 2 s apart) | differ — rendering |
+| auth: no credentials / with credentials | **401 / 200** |
+
+That is *less* memory than the stack it replaces, while also absorbing websockify, noVNC,
+TLS and a real user store. The `401` is the point: it retires `-SecurityTypes None`.
+
+Traps found bringing it up, none of them documented upstream:
+
+- **The snakeoil cert does not exist on a minimal guest.** `require_ssl: true` is the
+  default and the server refuses to start with
+  `/etc/ssl/private/ssl-cert-snakeoil.key: certificate file doesn't exist`. Generating it
+  with `make-ssl-cert` leaves it `root:ssl-cert 0640`, and adding the user to `ssl-cert`
+  does not take effect until a new login session. For an ephemeral guest the simpler answer
+  is a user-owned self-signed cert in `~/.vnc/` named in `kasmvnc.yaml`.
+- **`logging.level` must be an integer.** `level: info` fails with
+  `must be an integer`, and the server exits.
+- **The binary is named `Xvnc`, not `Xkasmvnc`** — the same name TigerVNC uses. A
+  `pgrep`-based health check cannot tell the two apart, which is one more reason the
+  lifecycle belongs in a systemd unit rather than in pattern matching.
+
+## Measured: previewing a web app needs no proxy at all
+
+Both failure classes reproduced on `wkv-02`, then fixed with one command and no new code.
+
+**(i) Dev servers bind loopback.** A server on `127.0.0.1:5173`: reached over the guest's
+own external address (`192.168.0.2`) → **connection refused**; over loopback → **200**.
+The server is fine; the binding is the whole problem.
+
+**(ii) Frameworks reject unfamiliar `Host` headers** (Vite `allowedHosts`, Next
+`allowedDevOrigins`, Rails `config.hosts`). Tailscale Serve does **not** help here — it
+preserves the original Host.
+
+**The fix is `ssh -L`, and the proof is the bytes.** With
+`ssh -N -L 15173:127.0.0.1:5173 <guest>` and `nc -l 127.0.0.1 5173` capturing raw input
+inside the guest, what arrives is:
+
+```
+GET / HTTP/1.1
+Host: localhost:15173
+```
+
+`localhost` is permitted unconditionally by every framework allowlist, so (ii) is sidestepped
+*by construction* rather than by configuration. `workenv-desk-forward` was doing exactly
+this; it needed 117 lines only because it ran on the Mac mini multiplexing four guests onto
+one loopback. From the reviewer's own machine it is one command.
 
 ## Traps this encodes
 
