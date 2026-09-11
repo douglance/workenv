@@ -66,7 +66,7 @@ pub(super) fn connect(request: &AdapterRequest) -> AdapterResponse {
 }
 
 /// The guest is named for its environment, exactly as `create` named it.
-fn guest_name(request: &AdapterRequest) -> String {
+pub(super) fn guest_name(request: &AdapterRequest) -> String {
     request
         .input
         .get("name")

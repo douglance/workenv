@@ -6,6 +6,13 @@ mod access_tests;
 mod client;
 mod create;
 mod destroy;
+mod execute;
+#[cfg(test)]
+// Test-only, and only these: a transport test that cannot unwrap its own
+// fixtures says less than one that panics loudly when a fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "provider/execute_tests.rs"]
+mod execute_tests;
 mod inventory;
 #[cfg(test)]
 #[path = "provider/lifecycle_tests.rs"]
@@ -22,9 +29,16 @@ mod test_support;
 mod tests;
 
 use serde_json::{Value, json};
+use workenv_platform::ApocExecutor;
 use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 
+use access::guest_name;
 use client::{Cluster, HttpCluster};
+
+/// An executor rooted at the controller's own working directory.
+fn executor() -> ApocExecutor {
+    ApocExecutor::new(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+}
 
 /// Controller base URL used when the binding declares none.
 const DEFAULT_CONTROLLER: &str = "http://127.0.0.1:6120";
@@ -48,6 +62,9 @@ fn handle_with<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResp
         // Reaching a guest needs no cluster read: the controller tunnels by
         // name, so this answers from the request alone.
         "connect" => access::connect(request),
+        // The transport hop. A target-located extension reaches its guest
+        // through here, which is what lets a host declare no address at all.
+        "execute" => execute::run(request, &guest_name(request), &executor()),
         _ => response(
             request,
             ResponseStatus::Unsupported,

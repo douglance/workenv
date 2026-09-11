@@ -108,6 +108,17 @@ assert extension.operations.connect.input_schema.additionalProperties == false;
 # Port forwarding is not declared, because `orchard port-forward vm` binds a
 # listener and then fails every transfer. A declared operation is a promise.
 assert !(extension.operations ? preview);
+# The transport contract. workenv-core ships a target-located extension to its
+# host by calling the host transport's `execute`, so without this an
+# Orchard-backed host can only run controller-located extensions.
+assert extension.operations ? execute;
+assert extension.operations.execute.internal;
+assert extension.operations.execute.mutating;
+assert lib.elem "argv" extension.operations.execute.input_schema.required;
+assert extension.operations.execute.input_schema.properties.argv.minItems == 1;
+# The command's own status must be a required field: a transport that may omit
+# it lets a failed command be read as a success with no output.
+assert lib.elem "exit_code" extension.operations.execute.output_schema.required;
 assert lib.all (entry: entry.assertion) normal.assertions;
 # An empty controller URL must be refused, not defaulted around.
 assert lib.any (entry: !entry.assertion) emptyUrl.assertions;
@@ -126,5 +137,6 @@ assert lib.all (entry: entry.assertion) withLima.assertions;
   reap_requires_an_ownership_prefix = true;
   guests_are_reachable_without_an_address = true;
   broken_port_forward_is_not_declared = true;
+  guests_are_reachable_as_a_transport = true;
   coexists_with_lima = true;
 }

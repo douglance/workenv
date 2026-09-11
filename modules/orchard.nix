@@ -225,6 +225,41 @@ let
       };
     };
   };
+  # The transport contract workenv-core calls: one exact argv, run on the
+  # target, answered with the command's own result. `internal` keeps it out of
+  # the hand-callable surface -- it is plumbing for target-located extensions,
+  # not an operation anyone drives directly.
+  executeInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ "argv" ];
+    properties = {
+      name.type = "string";
+      argv = {
+        type = "array";
+        items.type = "string";
+        minItems = 1;
+      };
+      cwd.type = "string";
+      purpose.type = "string";
+      stdin.type = "string";
+      timeout_ms = {
+        type = "integer";
+        minimum = 1;
+      };
+    };
+  };
+  executeOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [ "exit_code" ];
+    properties = {
+      exit_code.type = "integer";
+      stdout.type = "string";
+      stderr.type = "string";
+      guest.type = "string";
+    };
+  };
   connectionOutput = {
     type = "object";
     additionalProperties = true;
@@ -266,6 +301,13 @@ let
       mutating = true;
       input_schema = reapInput;
       output_schema = reapOutput;
+    };
+    execute = {
+      description = "Run one exact argv inside this environment's guest.";
+      mutating = true;
+      internal = true;
+      input_schema = executeInput;
+      output_schema = executeOutput;
     };
     connect = {
       description = "Argv that opens a shell on this environment's guest.";
