@@ -5,6 +5,13 @@ mod access;
 mod access_tests;
 mod client;
 mod create;
+mod credentials;
+#[cfg(test)]
+// Test-only, and only these: a credential test that cannot unwrap its own
+// fixture says less than one that panics loudly when the fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "provider/credentials_tests.rs"]
+mod credentials_tests;
 mod destroy;
 mod execute;
 #[cfg(test)]

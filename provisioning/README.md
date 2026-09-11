@@ -506,6 +506,47 @@ Also note the first boot writes the generated token to the controller log, so
 that log is a credential at rest from the start; the install script now creates
 `~/Library/Logs/workenv` and `~/.orchard` as 0700.
 
+### Credentials: the adapter cannot use the manifest
+
+Securing the controller broke every adapter operation with `401 Unauthorized`,
+because `adapters/orchard` talked to the API with no credentials at all and had
+only ever been tested against a wide-open dev controller. The protocol forbids
+secrets in `config` or `input` -- a manifest is committed -- so the token
+reaches the adapter another way: a two-line file, account then token, at
+`~/.orchard/workenv-credentials` (0600), overridable by
+`WORKENV_ORCHARD_CREDENTIALS`, or by `WORKENV_ORCHARD_ACCOUNT` /
+`WORKENV_ORCHARD_TOKEN` for CI.
+
+Two lines rather than reading orchard's own YAML: a generated token can contain
+`": "`, and a line-oriented YAML reader would hand the controller a silently
+truncated secret, which fails as a wrong password rather than as a parsing bug.
+A real YAML parser would be a new dependency for six lines of config. Measured:
+HTTP Basic with the service account name and token answers 200.
+
+The adapter's account is **compute-scoped, never the bootstrap admin**, and the
+install script creates it. Both halves of that were learned by breaking it:
+
+> Rotating the bootstrap account by deleting and recreating it **locked admin
+> operations out of the controller entirely**. The bootstrap account is minted
+> only when NO service accounts exist, so with a compute-scoped account still
+> present nothing re-mints it, and no remaining account could create one. The
+> fleet kept working -- the adapter and worker were unaffected -- but there was
+> no recovery short of moving the data directory aside and re-enrolling. The
+> script now creates the scoped account *from* the bootstrap account and never
+> deletes the bootstrap account.
+
+Three smaller things the script had to stop doing, each of which produced a
+confident wrong answer rather than an error:
+
+- `head -c -1` is a GNU extension; on macOS it fails with "illegal byte count",
+  which made the credential check report a working credential as a 401.
+- reading the bootstrap account with `head -1` takes the *first* line in the
+  log, so a re-run after a rotation read a stale, redacted entry and wrote
+  credentials that could not authenticate. It reads the last one now.
+- `tr -dc ... < /dev/urandom | head -c 48` aborts the whole script with status 2
+  and no message, because `head` closing the pipe sends `tr` SIGPIPE and
+  `set -o pipefail` turns that into a failure. Token generation uses `openssl`.
+
 ## Traps this encodes
 
 Each of these cost real time to find; the scripts handle them so you don't rediscover them.

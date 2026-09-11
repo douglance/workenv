@@ -107,4 +107,53 @@ esac
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -qE '\*:|\[::\]:'; then
   echo "controller is still listening on all interfaces" >&2; exit 1
 fi
+step "5/5 adapter credentials"
+# The adapter gets its OWN compute-scoped account, never the bootstrap admin.
+# Two reasons, both learned the hard way: an adapter holding admin:write can
+# delete the service accounts, and deleting the last admin:write account locks
+# admin operations out of the controller entirely -- there is no recovery short
+# of starting from an empty data dir, because the bootstrap account is minted
+# only when NO service accounts exist. So the bootstrap account is created once
+# and left alone.
+CRED_FILE="$HOME/.orchard/workenv-credentials"
+# The LAST match, not the first: a re-run appends a fresh bootstrap line and a
+# previous line may have been redacted after rotation. `head -1` would read the
+# stale one and write credentials that cannot authenticate.
+read_logged() { sed -n "s/.*$1: //p" "$LOG_DIR/orchard-controller.log" 2>/dev/null \
+  | sed $'s/\033\[[0-9;]*m//g' | tr -d '\r' | grep -v '^<redacted' | tail -1; }
+ADMIN_ACCOUNT="$(read_logged 'Service account name')"
+ADMIN_TOKEN="$(read_logged 'Service account token')"
+
+authenticates() { # account token -> 0 when the controller accepts them
+  [ -n "$1" ] && [ -n "$2" ] && \
+    [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -u "$1:$2" "http://127.0.0.1:$PORT/v1/workers")" = "200" ]
+}
+
+if authenticates "$(head -1 "$CRED_FILE" 2>/dev/null)" "$(sed -n '2p' "$CRED_FILE" 2>/dev/null)"; then
+  echo "  adapter credentials already authenticate"
+elif authenticates "$ADMIN_ACCOUNT" "$ADMIN_TOKEN"; then
+  # openssl, not `tr -dc < /dev/urandom | head -c`: `head` closing the pipe
+  # sends SIGPIPE to `tr`, which under `set -o pipefail` aborts the script with
+  # status 2 and no message at all.
+  ADAPTER_TOKEN="$(openssl rand -hex 32)"
+  ORCHARD_CTX_ARGS="--service-account-name $ADMIN_ACCOUNT"
+  "$ORCHARD" context create bootstrap-context --force \
+    $ORCHARD_CTX_ARGS --service-account-token "$ADMIN_TOKEN" >/dev/null 2>&1 || true
+  "$ORCHARD" create service-account workenv-adapter \
+    --roles compute:read --roles compute:write --roles compute:connect \
+    --token "$ADAPTER_TOKEN" >/dev/null 2>&1 || true
+  umask 077
+  printf '%s\n%s\n' "workenv-adapter" "$ADAPTER_TOKEN" > "$CRED_FILE"
+  chmod 600 "$CRED_FILE"
+  # Prove it, rather than assume the create worked: a silently failed create
+  # leaves a credentials file that looks right and 401s on every call.
+  authenticates "workenv-adapter" "$ADAPTER_TOKEN" \
+    || { echo "adapter credentials do not authenticate" >&2; exit 1; }
+  unset ADAPTER_TOKEN
+  echo "  created compute-scoped workenv-adapter account"
+else
+  echo "  WARN no usable controller credentials; see $LOG_DIR/orchard-controller.log" >&2
+fi
+unset ADMIN_TOKEN
+
 echo "controller supervised as $LABEL, loopback only, data in $DATA_DIR"

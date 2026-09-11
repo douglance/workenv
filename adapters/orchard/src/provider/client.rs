@@ -5,7 +5,7 @@
 //! read-and-translate: ask the controller, reshape its answer into the manifest
 //! contract. There is deliberately no local model of what the cluster contains.
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ pub(super) trait Cluster {
 pub(super) struct HttpCluster {
     base: String,
     client: Client,
+    credentials: Option<super::credentials::Credentials>,
 }
 
 impl HttpCluster {
@@ -49,7 +50,11 @@ impl HttpCluster {
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .build()
             .context("building the controller HTTP client")?;
-        Ok(Self { base, client })
+        Ok(Self {
+            base,
+            client,
+            credentials: super::credentials::load(),
+        })
     }
 }
 
@@ -57,8 +62,7 @@ impl Cluster for HttpCluster {
     fn collection(&self, name: &str) -> Result<Vec<Value>> {
         let url = format!("{}/v1/{name}", self.base.trim_end_matches('/'));
         let response = self
-            .client
-            .get(&url)
+            .authed(self.client.get(&url))
             .send()
             .with_context(|| format!("requesting {url}"))?;
         let status = response.status();
@@ -82,7 +86,7 @@ impl Cluster for HttpCluster {
 
     fn guest(&self, name: &str) -> Result<Option<Value>> {
         let url = self.url(&format!("vms/{name}"));
-        let (status, body) = send(self.client.get(&url), &url)?;
+        let (status, body) = send(self.authed(self.client.get(&url)), &url)?;
         if status == 404 {
             return Ok(None);
         }
@@ -96,7 +100,7 @@ impl Cluster for HttpCluster {
 
     fn create(&self, body: &Value) -> Result<Value> {
         let url = self.url("vms");
-        let (status, text) = send(self.client.post(&url).json(body), &url)?;
+        let (status, text) = send(self.authed(self.client.post(&url).json(body)), &url)?;
         if !(200..300).contains(&status) {
             anyhow::bail!("{url} answered {status}: {}", text.trim());
         }
@@ -110,7 +114,7 @@ impl Cluster for HttpCluster {
 
     fn remove(&self, name: &str) -> Result<Removal> {
         let url = self.url(&format!("vms/{name}"));
-        let (status, body) = send(self.client.delete(&url), &url)?;
+        let (status, body) = send(self.authed(self.client.delete(&url)), &url)?;
         // 404 is success for teardown: the resource is gone, which is the goal.
         // Treating it as failure would make a retried destroy fail forever.
         match status {
@@ -125,6 +129,14 @@ impl HttpCluster {
     /// Build one endpoint URL.
     fn url(&self, path: &str) -> String {
         format!("{}/v1/{path}", self.base.trim_end_matches('/'))
+    }
+
+    /// Attach credentials when the controller has any to check against.
+    fn authed(&self, request: RequestBuilder) -> RequestBuilder {
+        match &self.credentials {
+            Some(found) => request.basic_auth(&found.account, Some(&found.token)),
+            None => request,
+        }
     }
 }
 
