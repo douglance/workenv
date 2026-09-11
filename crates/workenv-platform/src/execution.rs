@@ -9,6 +9,8 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use std::time::{Duration, Instant};
+
 use crate::execution_code::{observe_execution, run_execution};
 
 const STDIN_HELPER: &str = r#"input_file=$1; shift; exec "$@" < "$input_file""#;
@@ -82,6 +84,39 @@ impl ApocExecutor {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
+
+    /// Keep observing an accepted execution until the caller's budget is spent.
+    ///
+    /// Returns the last observation either way: a still-running command is not
+    /// an error here, and the caller distinguishes the two by `exit_code`.
+    fn observe_until(
+        &self,
+        started: &ExecutionOutput,
+        spec: &ExecutionSpec,
+    ) -> Result<ExecutionOutput> {
+        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
+        let mut latest = started.clone();
+        while latest.exit_code.is_none() && Instant::now() < deadline {
+            latest = self.observe_once(started, spec, deadline)?;
+        }
+        Ok(latest)
+    }
+
+    /// One observation, bounded by whatever remains of the caller's budget.
+    fn observe_once(
+        &self,
+        started: &ExecutionOutput,
+        spec: &ExecutionSpec,
+        deadline: Instant,
+    ) -> Result<ExecutionOutput> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        observe_execution(
+            &self.root,
+            &started.execution_id,
+            &spec.purpose,
+            u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+        )
+    }
 }
 
 impl Executor for ApocExecutor {
@@ -89,9 +124,18 @@ impl Executor for ApocExecutor {
         let staged = stage_if_needed(&self.root, &spec)?;
         let mut command = staged.command_spec();
         command.executable = resolve_executable(&command.executable)?;
-        let output = run_execution(&self.root, &command)?;
+        let mut output = run_execution(&self.root, &command)?;
         if output.execution_id.is_empty() {
             bail!("APoC execution returned no durable ID");
+        }
+        // The first wait is capped at 30s inside the code-mode runner, so a
+        // command that legitimately takes longer comes back with no exit code
+        // and reads to the caller as a failure with empty stderr. Measured: a
+        // devenv manifest with a real host set evaluates in 55s, so every fleet
+        // worth having tripped this. Keep observing the execution APoC already
+        // accepted until the caller's own budget is spent.
+        if output.exit_code.is_none() {
+            output = self.observe_until(&output, &spec)?;
         }
         if staged.is_some() && output.exit_code.is_some() {
             staged.cleanup();
