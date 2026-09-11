@@ -125,6 +125,28 @@ place a VM it cannot fit.
 The `tart-vms: 2` default is worth noting as a density trade-off — Lima currently runs four
 guests on `box-03`. It is a default, not a hard cap: `orchard worker run --resources` sets it.
 
+## The image/spawn boundary: toolchain is baked, credentials are not
+
+Moving provisioning into a golden image raises a question the Lima path never had
+to answer, because it provisioned each guest individually: **what goes in the image?**
+
+The boundary is credentials.
+
+- **Baked into the image:** nix, devenv, the `tools.json` closure, `apoc`, `nib`, the
+  desktop stack. Everything reproducible from this repository.
+- **Seeded at spawn:** `~/.claude/.credentials.json`, `~/.codex/auth.json`,
+  `~/.grok/auth.json`, and the skills trees. Everything specific to the person.
+
+This is not a preference. A Tart image is *cloned* for every guest and can be pushed to
+an OCI registry, so a credential baked into it is a credential in every clone and in the
+registry. `provisioning/workenv-seed` already streams these over ssh at 0600 and prints
+only byte counts; it stays a per-spawn step and is deliberately **not** part of the bake.
+
+The practical consequence is that the bake runs `workenv-provision` directly against
+rsynced sources rather than running `workenv-seed` first, even though `workenv-seed` is
+what normally delivers those sources. Two things that were one step become two, and the
+split is along the line that matters.
+
 ## Measured: KasmVNC replaces the hand-rolled stack
 
 Verified on `wkv-02` (Ubuntu 24.04 aarch64, 2 GB, 2 vCPU). These numbers are not published
