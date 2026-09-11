@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Install and start a minimal remote desktop in a guest, plus a demo counter
+# server, and publish it over the tailnet.
+#
+#   workenv-desktop --number 3 [--port 8300] [--display 1] [--geometry 1280x800]
+#
+# Idempotent: re-running reuses what is already installed and restarts the
+# session. Deliberately light — four of these share one 8 GB Mac mini, so this
+# is Xvnc + openbox + a WebKit browser, never a full desktop environment.
+set -euo pipefail
+
+NUMBER=1; PORT=""; DISPLAY_NUM=1; GEOMETRY="1280x800"; WEB_PORT=""; STATUS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)   STATUS=1; shift ;;
+    --number)   NUMBER="$2"; shift 2 ;;
+    --port)     PORT="$2"; shift 2 ;;
+    --web-port) WEB_PORT="$2"; shift 2 ;;
+    --display)  DISPLAY_NUM="$2"; shift 2 ;;
+    --geometry) GEOMETRY="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+PORT="${PORT:-$((8300 + NUMBER))}"
+WEB_PORT="${WEB_PORT:-6080}"
+STATE="$HOME/.local/state/workenv-desktop"
+export DISPLAY=":$DISPLAY_NUM"
+mkdir -p "$STATE"
+log() { printf '\n=== %s ===\n' "$*"; }
+
+# Report what is actually running, reading the recorded manifest rather than
+# re-deriving it. Liveness is measured, not assumed: the counter has to advance
+# between two samples to be called up.
+if [ "$STATUS" = 1 ]; then
+  [ -f "$STATE/desktop.json" ] || { echo "no desktop on this guest"; exit 1; }
+  python3 - "$STATE/desktop.json" <<'STATUS_EOF'
+import json, subprocess, sys, time, urllib.request
+m = json.load(open(sys.argv[1]))
+print(json.dumps(m, indent=2))
+def alive(pattern):
+    return subprocess.run(["pgrep", "-f", pattern],
+                          capture_output=True).returncode == 0
+checks = [
+    ("Xvnc",       alive(f"Xvnc {m['display']}")),
+    ("websockify", alive(f"websockify.*127.0.0.1:{m['web_port']}")),
+    ("browser",    alive(f"epiphany.*127.0.0.1:{m['counter_port']}")),
+]
+try:
+    url = f"http://127.0.0.1:{m['counter_port']}/raw"
+    read = lambda: float(urllib.request.urlopen(url, timeout=5).read())
+    a = read(); time.sleep(1.2); b = read()
+    checks.append(("counter advancing", b > a))
+except Exception as exc:
+    checks.append((f"counter unreachable ({exc})", False))
+for name, ok in checks:
+    print(f"  {'up  ' if ok else 'DOWN'}  {name}")
+sys.exit(0 if all(ok for _, ok in checks) else 1)
+STATUS_EOF
+  exit $?
+fi
+
+log "1/5 packages"
+# Every one of xfonts-base, x11-xserver-utils and python3-numpy is a *Recommends*,
+# and this guest installs with --no-install-recommends. xfonts-base carries the
+# `fixed` and `cursor` fonts without which Xvnc aborts at startup; numpy is the
+# difference between usable and painful websockify frame rates.
+NEED="tigervnc-standalone-server tigervnc-common xfonts-base x11-xserver-utils
+      xauth x11-utils openbox xterm dbus-x11 scrot novnc websockify python3-numpy
+      epiphany-browser wmctrl"
+if ! dpkg-query -W tigervnc-standalone-server >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -qq
+  # shellcheck disable=SC2086
+  sudo apt-get install -y -qq --no-install-recommends $NEED
+fi
+
+log "2/5 counter server"
+# Serves "<N>.<six digits>" where the integer part identifies the workspace and
+# the decimals advance 100x a second, computed server-side. The page refreshes
+# itself once a second, which works in any browser without JavaScript.
+cat > "$STATE/counter.py" <<'PYEOF'
+import sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+NUMBER = int(sys.argv[1]); PORT = int(sys.argv[2]); START = time.time()
+
+def value():
+    return f"{NUMBER}.{int((time.time() - START) * 100) % 1000000:06d}"
+
+PAGE = """<!doctype html><meta charset=utf-8>
+<meta http-equiv="refresh" content="1">
+<title>workspace {n}</title>
+<style>
+ html,body{{height:100%;margin:0;background:#11141a;color:#e6edf3;
+   font:600 15px/1.4 ui-sans-serif,system-ui,sans-serif;
+   display:flex;flex-direction:column;align-items:center;justify-content:center}}
+ .tag{{letter-spacing:.28em;text-transform:uppercase;color:#7d8590;font-size:13px}}
+ .v{{font:700 96px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+   margin:.18em 0;color:#58a6ff;font-variant-numeric:tabular-nums}}
+ .m{{color:#7d8590;font-size:13px}}
+</style>
+<div class=tag>workspace {n}</div>
+<div class=v>{v}</div>
+<div class=m>served by {h} &middot; counting since start</div>
+"""
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        import socket
+        if self.path == "/raw":
+            body = value().encode()
+            ctype = "text/plain"
+        else:
+            body = PAGE.format(n=NUMBER, v=value(), h=socket.gethostname()).encode()
+            ctype = "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_):
+        pass
+
+HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+PYEOF
+pkill -f "[c]ounter.py $NUMBER " 2>/dev/null || true
+nohup python3 "$STATE/counter.py" "$NUMBER" "$PORT" > "$STATE/counter.log" 2>&1 &
+sleep 1
+# Two samples, asserted strictly increasing. A single successful request proves
+# only that something is listening; it passes just as happily on a counter frozen
+# at its start value, which is the one failure this demo exists to rule out.
+verify_counter() {
+  python3 - "$PORT" <<'CHECK'
+import sys, time, urllib.request
+url = f"http://127.0.0.1:{sys.argv[1]}/raw"
+read = lambda: float(urllib.request.urlopen(url, timeout=5).read())
+a = read(); time.sleep(1.2); b = read()
+if not b > a:
+    sys.exit(f"counter is not advancing: {a} then {b}")
+print(f"  counter serving {sys.argv[1]}: {a:.6f} -> {b:.6f} (advancing)")
+CHECK
+}
+verify_counter
+
+log "3/5 X session"
+pkill -f "[X]vnc :$DISPLAY_NUM" 2>/dev/null || true
+sleep 1
+# -localhost: the framebuffer listens on loopback and no other interface, so it
+# is never reachable by accident. Every route in is therefore explicit and
+# auditable: `tailscale serve` in the guest, or workenv-desk-forward on the VM
+# host. SecurityTypes None means there is NO VNC password on either route — the
+# tailnet ACL is the whole access control, and anyone on the tailnet can drive
+# this desktop. See "Access control" in provisioning/README.md.
+Xvnc "$DISPLAY" -geometry "$GEOMETRY" -depth 24 -rfbport "$((5900 + DISPLAY_NUM))" \
+  -localhost -SecurityTypes None -desktop "workspace-$NUMBER" \
+  > "$STATE/xvnc.log" 2>&1 &
+for _ in $(seq 1 40); do [ -e "/tmp/.X11-unix/X$DISPLAY_NUM" ] && break; sleep 0.25; done
+[ -e "/tmp/.X11-unix/X$DISPLAY_NUM" ] || { echo "Xvnc failed:"; tail -20 "$STATE/xvnc.log"; exit 1; }
+eval "$(dbus-launch --sh-syntax)" 2>/dev/null || true
+xsetroot -solid "#11141a" 2>/dev/null || true
+openbox > "$STATE/openbox.log" 2>&1 &
+sleep 1
+# A terminal tailing the raw value, so the number is visible even if the
+# browser fails to start. Belt and braces on a demo that must be seen.
+xterm -geometry 46x6+16+16 -fa DejaVuSansMono -fs 11 -bg "#11141a" -fg "#7ee787" \
+  -T "workspace-$NUMBER raw" \
+  -e "watch -n1 -t curl -fsS http://127.0.0.1:$PORT/raw" > "$STATE/xterm.log" 2>&1 &
+
+log "4/5 browser"
+pkill -f "[e]piphany.*127.0.0.1:$PORT" 2>/dev/null || true
+sleep 1
+# Epiphany asks to become the default browser on first run and the modal covers
+# the page, which is precisely what we are here to look at. Answer it in advance.
+# restore-session-policy takes 'always' or 'crashed' and there is NO 'never'.
+# Setting it to one fails with "value is outside of the valid range", which the
+# old 2>/dev/null swallowed whole — so the browser kept restoring every previous
+# tab, failed loads included, while the script reported success. Set the valid
+# value, delete the saved session outright, and confirm the set actually stuck.
+set_gsetting() {
+  local schema="$1" key="$2" value="$3" expect="$4" err now
+  if ! err="$(gsettings set "$schema" "$key" "$value" 2>&1)"; then
+    echo "  WARNING: gsettings $key=$value rejected: $err" >&2
+    return 0
+  fi
+  now="$(gsettings get "$schema" "$key")"
+  [ "$now" = "$expect" ] || echo "  WARNING: $key did not stick (now $now)" >&2
+}
+set_gsetting org.gnome.Epiphany ask-for-default false false
+set_gsetting org.gnome.Epiphany restore-session-policy crashed "'crashed'"
+# Belt and braces: 'crashed' still restores when epiphany decides it crashed, and
+# a pkill looks exactly like a crash to it.
+rm -f "$HOME/.local/share/epiphany/session_state.xml"
+# No --new-window: epiphany already opens one, and passing it produced two.
+nohup epiphany-browser "http://127.0.0.1:$PORT/" > "$STATE/browser.log" 2>&1 &
+sleep 8
+# Epiphany intermittently opens a second window on first run, and it lands on top
+# of the one showing the page. Close every browser window but the last, maximize
+# that, then raise the raw-value terminal so the rendered page and the underlying
+# number are both visible in a single frame.
+tidy_windows() {
+  command -v wmctrl >/dev/null 2>&1 || return 0
+  local ids keep id
+  ids="$(wmctrl -l | awk -v t=" workspace $NUMBER$" '$0 ~ t {print $1}')"
+  [ -n "$ids" ] || return 0
+  keep="$(printf '%s\n' "$ids" | tail -1)"
+  for id in $ids; do
+    [ "$id" = "$keep" ] || wmctrl -i -c "$id" 2>/dev/null || true
+  done
+  sleep 2
+  wmctrl -i -r "$keep" -b add,maximized_vert,maximized_horz 2>/dev/null || true
+  sleep 1
+  wmctrl -a "workspace-$NUMBER raw" 2>/dev/null || true
+}
+tidy_windows
+
+log "5/5 noVNC"
+pkill -f "[w]ebsockify.*127.0.0.1:$WEB_PORT" 2>/dev/null || true
+# Serving noVNC's own web root means the page and the websocket share one
+# origin, so noVNC's defaults are already correct and no query parameters are
+# needed — which sidesteps the Tailscale Serve bug that strips them.
+nohup websockify --web=/usr/share/novnc "127.0.0.1:$WEB_PORT" \
+  "127.0.0.1:$((5900 + DISPLAY_NUM))" > "$STATE/websockify.log" 2>&1 &
+sleep 2
+curl -fsS -o /dev/null "http://127.0.0.1:$WEB_PORT/vnc.html" && echo "  noVNC on $WEB_PORT"
+
+if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+  if serve_err="$(sudo tailscale serve --bg --https=443 "http://127.0.0.1:$WEB_PORT" 2>&1)"; then
+    echo "  published: https://$(tailscale status --json |
+      python3 -c 'import sys,json;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')/"
+  else
+    # Not fatal: the VM host can publish this guest with workenv-desk-forward
+    # instead. But it must be said out loud, or a failed publish reads as a
+    # successful one that simply printed no URL.
+    echo "  WARNING: tailscale serve failed, guest is not published on the tailnet" >&2
+    printf '  %s\n' "$serve_err" >&2
+  fi
+else
+  echo "  note: no tailscale in this guest; publish from the VM host with workenv-desk-publish"
+fi
+# Recording this is the difference between asking the desktop what port it uses
+# and guessing. Guessing cost three wrong probes before /proc/net/tcp gave it up.
+python3 - "$STATE/desktop.json" <<MANIFEST
+import json, sys
+json.dump({
+    "number": $NUMBER, "counter_port": $PORT, "web_port": $WEB_PORT,
+    "display": "$DISPLAY", "rfb_port": $((5900 + DISPLAY_NUM)),
+    "geometry": "$GEOMETRY", "state_dir": "$STATE",
+}, open(sys.argv[1], "w"), indent=2)
+MANIFEST
+echo "DESKTOP_READY number=$NUMBER port=$PORT display=$DISPLAY web=$WEB_PORT"

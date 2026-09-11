@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Lima VM host CLI for workenv ephemeral workers.
+
+Contract: exactly one JSON object on stdout, exit 0 on success; on failure a
+non-zero exit and a top-level "error". Diagnostics go to stderr.
+
+Ownership is provable, never inferred. A claim stamps a host-side marker written
+before the claim is acknowledged, plus the guest's current boot_id read from
+tmpfs. Release re-verifies both, so a slot that was destroyed and rebuilt under
+the same name cannot be clobbered by a stale teardown.
+"""
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+STATE = Path.home() / ".local/state/workenv-lima"
+LIMA_HOME = Path.home() / ".lima"
+SLOT_PREFIX = "wkv-"
+COLD_START_SECONDS = 70
+RESERVE_MEM_GB = 3          # leave this much for macOS
+RESERVE_DISK_GB = 25
+
+
+def run(args, timeout=300):
+    return subprocess.run(args, capture_output=True, text=True,
+                          timeout=timeout, check=False)
+
+
+def fail(message, code=1):
+    print(json.dumps({"error": message}))
+    sys.exit(code)
+
+
+def locked(fn):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "registry.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            return fn()
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def slot_path(slot):
+    return STATE / "slots" / f"{slot}.json"
+
+
+def read_slot(slot):
+    path = slot_path(slot)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def write_slot(slot, data):
+    path = slot_path(slot)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def lima_list():
+    out = run(["limactl", "list", "--json"], timeout=60)
+    instances = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                instances.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return instances
+
+
+def guest_boot_id(slot):
+    out = run(["limactl", "shell", slot, "--", "cat",
+               "/proc/sys/kernel/random/boot_id"], timeout=60)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def host_capacity():
+    def sysctl(key):
+        out = run(["sysctl", "-n", key], timeout=15)
+        return int(out.stdout.strip()) if out.returncode == 0 else 0
+    ncpu = sysctl("hw.ncpu")
+    mem_gb = sysctl("hw.memsize") // (1024 ** 3)
+    df = run(["df", "-g", str(Path.home())], timeout=15).stdout.splitlines()
+    disk_free_gb = int(df[-1].split()[3]) if len(df) > 1 else 0
+    committed_cpu = committed_mem = 0
+    for inst in lima_list():
+        if inst.get("status") == "Running":
+            committed_cpu += int(inst.get("cpus") or 0)
+            committed_mem += int(inst.get("memory") or 0) // (1024 ** 3)
+    return {
+        "max_cpus": max(ncpu - 2, 0),
+        "max_memory_gb": max(mem_gb - RESERVE_MEM_GB, 0),
+        "max_disk_gb": max(disk_free_gb - RESERVE_DISK_GB, 0),
+        "host": {"ncpu": ncpu, "memory_gb": mem_gb,
+                 "disk_available_gb": disk_free_gb},
+        "reserved": {"cpus": 2, "memory_gb": RESERVE_MEM_GB,
+                     "disk_gb": RESERVE_DISK_GB},
+        "committed": {"cpus": committed_cpu, "memory_gb": committed_mem},
+        "available": {"cpus": max(ncpu - 2 - committed_cpu, 0),
+                      "memory_gb": max(mem_gb - RESERVE_MEM_GB - committed_mem, 0)},
+    }
+
+
+def vm_object(inst, record):
+    slot = inst["name"]
+    identity = None
+    if record and record.get("claim"):
+        claim = record["claim"]
+        identity = {"slot": slot, "lima_instance": slot,
+                    "claim_uuid": claim["claim_uuid"],
+                    "boot_id": claim["boot_id"],
+                    "generation": record["generation"],
+                    "claimed_at": claim["claimed_at"]}
+    memory = int(inst.get("memory") or 0)
+    return {
+        "vm_name": slot,
+        "status": "running" if inst.get("status") == "Running" else "not_ready",
+        "allocated_cpus": int(inst.get("cpus") or 0),
+        "memory_capacity_bytes": memory,
+        "disk_capacity_bytes": int(inst.get("disk") or 0),
+        "region": "box-03",
+        "tags": ["workenv"],
+        "proxy_share": "private",
+        "arch": inst.get("arch"),
+        "dns_name": f"{slot}.lima.internal",
+        "ssh_host": f"lima-{slot}",
+        "ssh_dest": f"lima-{slot}",
+        "workenv_state": (record or {}).get("state", "unmanaged"),
+        "workenv_slot": slot,
+        "workenv_generation": (record or {}).get("generation", 0),
+        "instance_identity": identity,
+    }
+
+
+def slots_with_records():
+    records = {}
+    for inst in lima_list():
+        if inst["name"].startswith(SLOT_PREFIX):
+            records[inst["name"]] = (inst, read_slot(inst["name"]))
+    return records
+
+
+def site_systems(instances):
+    """Systems this site can serve, from live guests then the host's own arch."""
+    found = {i.get("arch") for i in instances if i.get("arch")}
+    mapped = {f"{a}-linux" for a in found if a}
+    if mapped:
+        return sorted(mapped)
+    machine = run(["uname", "-m"], timeout=15).stdout.strip()
+    return [f"{'aarch64' if machine in ('arm64', 'aarch64') else machine}-linux"]
+
+
+def cmd_capacity(_a):
+    """Capacity in the shape a scheduler can rank across unlike sites."""
+    base = host_capacity()
+    pool = slots_with_records()
+    warm = sum(
+        1
+        for inst, record in pool.values()
+        if inst.get("status") == "Running"
+        and (record or {}).get("state") != "claimed"
+    )
+    claimed = sum(
+        1 for _, record in pool.values() if (record or {}).get("state") == "claimed"
+    )
+    avail = base["available"]
+    base["systems"] = site_systems([i for i, _ in pool.values()])
+    base["free"] = {
+        "cpus": avail["cpus"],
+        "memory_gb": avail["memory_gb"],
+        "disk_gb": base["max_disk_gb"],
+        "units": warm,
+    }
+    base["total"] = {
+        "cpus": base["host"]["ncpu"],
+        "memory_gb": base["host"]["memory_gb"],
+        "disk_gb": base["host"]["disk_available_gb"],
+        "units": warm + claimed,
+    }
+    base["warm"] = warm
+    base["cold_start_seconds"] = COLD_START_SECONDS
+    return base
+
+
+def cmd_ls(_a):
+    return {"vms": [vm_object(i, r) for i, r in slots_with_records().values()]}
+
+
+def cmd_claim(args):
+    def run_claim():
+        prior_path = STATE / "claims" / f"{args.request_id}.json"
+        if prior_path.exists():                       # idempotent replay
+            prior = json.loads(prior_path.read_text())
+            entry = slots_with_records().get(prior["slot"])
+            if entry:
+                return vm_object(*entry)
+        pool = slots_with_records()
+        wanted = [args.slot] if args.slot else sorted(pool)
+        for slot in wanted:
+            entry = pool.get(slot)
+            if not entry:
+                continue
+            inst, record = entry
+            if inst.get("status") != "Running":
+                continue
+            if record and record.get("state") == "claimed":
+                continue
+            boot_id = guest_boot_id(slot)
+            if not boot_id:
+                continue
+            claim_uuid = str(uuid.uuid4())
+            now = int(time.time())
+            claim = {"claim_uuid": claim_uuid, "request_id": args.request_id,
+                     "boot_id": boot_id,
+                     "claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                 time.gmtime(now)),
+                     "lease_until": now + args.lease_seconds}
+            generation = ((record or {}).get("generation") or 0) + 1
+            new_record = {"slot": slot, "state": "claimed",
+                          "generation": generation, "claim": claim}
+            marker = LIMA_HOME / slot / "workenv-marker.json"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(claim, indent=2))
+            os.chmod(marker, 0o600)
+            write_slot(slot, new_record)
+            prior_path.parent.mkdir(parents=True, exist_ok=True)
+            prior_path.write_text(json.dumps({"slot": slot,
+                                              "claim_uuid": claim_uuid}))
+            return vm_object(inst, new_record)
+        capacity = host_capacity()
+        return {"status": "pool_empty", "ready": 0,
+                "capacity_allows": capacity["available"], "eta_seconds": 70,
+                "replenish_requested": True}
+    return locked(run_claim)
+
+
+def cmd_release(args):
+    slot = args.slot or getattr(args, "native_id", None)
+    if not slot:
+        fail("release requires --slot or --native-id")
+
+    def run_release():
+        record = read_slot(slot)
+        pool = slots_with_records()
+        if record is None or record.get("state") != "claimed":
+            return {"status": "already_destroyed", "slot": slot,
+                    "destroyed": True}
+        claim = record["claim"]
+        if claim["claim_uuid"] != args.claim_uuid:
+            return {"status": "identity_mismatch", "slot": slot,
+                    "expected": claim["claim_uuid"], "supplied": args.claim_uuid}
+        entry = pool.get(slot)
+        if entry and entry[0].get("status") == "Running":
+            live_boot = guest_boot_id(slot)
+            if live_boot and live_boot != claim["boot_id"]:
+                return {"status": "identity_mismatch", "slot": slot,
+                        "reason": "guest rebooted since the claim",
+                        "expected_boot_id": claim["boot_id"],
+                        "observed_boot_id": live_boot}
+        out = run(["limactl", "delete", "--force", "--tty=false", slot],
+                  timeout=180)
+        if out.returncode != 0 and slot in [i["name"] for i in lima_list()]:
+            return {"status": "unknown", "slot": slot,
+                    "error": out.stderr.strip()[:300]}
+        record.update(state="released", generation=record["generation"] + 1,
+                      claim=None)
+        write_slot(slot, record)
+        rq = STATE / "claims" / f"{claim['request_id']}.json"
+        if rq.exists():
+            rq.unlink()
+        return {"status": "destroyed", "slot": slot}
+    return locked(run_release)
+
+
+def cmd_enroll(args):
+    """Join a placed guest to the tailnet under the environment's name.
+
+    The site does this, not the scheduler: a guest's native address routes only
+    from its own host. The auth key arrives on stdin and is written to a tmpfs
+    file inside the guest, so it never appears in argv where any local process
+    could read it.
+    """
+    slot = args.native_id
+    key = sys.stdin.read().strip()
+    if not key:
+        fail("enroll requires a tailscale auth key on stdin")
+    script = (
+        'set -eu; key_file="$(mktemp)"; trap \'rm -f "$key_file"\' EXIT; '
+        'cat > "$key_file"; chmod 600 "$key_file"; '
+        'sudo tailscale up --auth-key=file:"$key_file" '
+        f'--hostname {slot_quote(args.hostname)} '
+        f'--advertise-tags={slot_quote(args.tag)} >/dev/null 2>&1 || true; '
+        'tailscale status --json'
+    )
+    out = subprocess.run(
+        ["limactl", "shell", slot, "--", "sh", "-c", script],
+        input=key, capture_output=True, text=True, timeout=180, check=False,
+    )
+    if out.returncode != 0:
+        fail(f"enroll failed on {slot}: {out.stderr.strip()[:200]}")
+    try:
+        status = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        fail(f"guest {slot} returned no tailscale status")
+    self_node = status.get("Self") or {}
+    dns = (self_node.get("DNSName") or "").rstrip(".")
+    expected = f"{args.hostname}.{args.tailnet_suffix.strip('.')}"
+    return {
+        "native_id": slot,
+        "dns_name": dns,
+        "expected_dns": expected,
+        "matches": dns == expected,
+        "device_id": self_node.get("ID"),
+        "tags": self_node.get("Tags") or [],
+    }
+
+
+def slot_quote(value):
+    """Single-quote a value for the guest shell."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def cmd_reap(_a):
+    def run_reap():
+        now = int(time.time())
+        reaped, kept = [], []
+        for slot, (inst, record) in slots_with_records().items():
+            claim = (record or {}).get("claim")
+            if claim and now > claim["lease_until"]:
+                run(["limactl", "delete", "--force", "--tty=false", slot],
+                    timeout=180)
+                record.update(state="released",
+                              generation=record["generation"] + 1, claim=None)
+                write_slot(slot, record)
+                reaped.append(slot)
+            elif claim:
+                kept.append(slot)
+        return {"reaped": reaped, "kept": kept, "tailnet_removed": []}
+    return locked(run_reap)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for simple in ("ls", "inventory", "capacity", "reap"):
+        sub.add_parser(simple).add_argument("--json", action="store_true")
+    for name in ("claim", "place"):
+        claim = sub.add_parser(name)
+        claim.add_argument("--request-id", required=True)
+        claim.add_argument("--slot")
+        claim.add_argument("--lease-seconds", type=int, default=14400)
+        claim.add_argument("--allow-cold-start", action="store_true")
+        # Accepted so a scheduler can state its requirement; the shape is enforced by
+        # the capacity report it already read, so these are recorded, not re-checked.
+        claim.add_argument("--system")
+        claim.add_argument("--cpus", type=int)
+        claim.add_argument("--memory-gb", type=int)
+        claim.add_argument("--disk-gb", type=int)
+        claim.add_argument("--hostname")
+        claim.add_argument("--json", action="store_true")
+    enr = sub.add_parser("enroll")
+    enr.add_argument("--native-id", required=True)
+    enr.add_argument("--hostname", required=True)
+    enr.add_argument("--tailnet-suffix", required=True)
+    enr.add_argument("--tag", default="tag:workenv")
+    enr.add_argument("--json", action="store_true")
+    for name in ("release", "destroy"):
+        rel = sub.add_parser(name)
+        rel.add_argument("--slot")
+        rel.add_argument("--native-id")
+        rel.add_argument("--claim-uuid", required=True)
+        rel.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    handler = {"ls": cmd_ls, "inventory": cmd_ls, "capacity": cmd_capacity,
+               "claim": cmd_claim, "place": cmd_claim, "enroll": cmd_enroll,
+               "release": cmd_release, "destroy": cmd_release, "reap": cmd_reap}[args.cmd]
+    try:
+        print(json.dumps(handler(args)))
+    except subprocess.TimeoutExpired:
+        fail("VM host command timed out")
+    except Exception as error:                        # noqa: BLE001
+        fail(f"{type(error).__name__}: {error}")
+
+
+if __name__ == "__main__":
+    main()

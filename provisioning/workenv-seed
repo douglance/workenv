@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Seed a provisioned guest with skills, agent configs, and credentials.
+# Runs on the CONTROLLER. Secrets stream over ssh and are never printed.
+set -euo pipefail
+TARGET="${1:?usage: workenv-seed <ssh-target>}"
+SSH=(ssh -o BatchMode=yes)
+RS=(rsync -az --delete -e "ssh -o BatchMode=yes")
+log() { printf '\n=== %s ===\n' "$*"; }
+
+"${SSH[@]}" "$TARGET" 'mkdir -p ~/.claude ~/.codex ~/.agents ~/.grok'
+
+log "source trees the provisioner builds from"
+# The provisioner builds apoc and reads the tool definitions from the workenv
+# repo, so those sources must be present before it runs. Excludes are what keep
+# this small: apoc's .build is 2.3G and its `target` is a symlink into a host
+# cache that cargo then chokes on.
+WORKENV_SRC="${WORKENV_SRC:-$HOME/Developer/src/workenv}"
+APOC_SRC="${APOC_SRC:-$HOME/Developer/src/apoc}"
+if [ -d "$WORKENV_SRC/modules" ]; then
+  "${SSH[@]}" "$TARGET" 'mkdir -p ~/src/workenv'
+  "${RS[@]}" --exclude '.state/' --exclude 'target/' --exclude '.git/' \
+    "$WORKENV_SRC/" "$TARGET:src/workenv/"
+  printf '  %-26s -> src/workenv\n' "workenv repo"
+fi
+if [ -d "$APOC_SRC/src" ]; then
+  "${SSH[@]}" "$TARGET" 'mkdir -p ~/src/apoc'
+  "${RS[@]}" --exclude '.build/' --exclude '.git/' --exclude 'target' --exclude '.state/' \
+    "$APOC_SRC/" "$TARGET:src/apoc/"
+  "${SSH[@]}" "$TARGET" 'rm -f ~/src/apoc/target'
+  printf '  %-26s -> src/apoc\n' "apoc source"
+fi
+
+log "skills and agent definitions"
+# Only the durable material. Caches, logs, session archives and artifacts are
+# deliberately excluded: ~/.agents/artifacts alone is 33G.
+for spec in \
+  "$HOME/.claude/skills/:.claude/skills/" \
+  "$HOME/.claude/commands/:.claude/commands/" \
+  "$HOME/.claude/agents/:.claude/agents/" \
+  "$HOME/.codex/skills/:.codex/skills/" \
+  "$HOME/.codex/agents/:.codex/agents/" \
+  "$HOME/.agents/skills/:.agents/skills/" ; do
+  src="${spec%%:*}"; dst="${spec##*:}"
+  if [ -d "$src" ]; then
+    "${SSH[@]}" "$TARGET" "mkdir -p ~/$dst"
+    "${RS[@]}" "$src" "$TARGET:$dst"
+    printf '  %-26s -> %s\n' "$(basename "$(dirname "$src")")/$(basename "$src")" "$dst"
+  fi
+done
+
+log "instruction files and configs"
+for spec in \
+  "$HOME/.claude/CLAUDE.md:.claude/CLAUDE.md" \
+  "$HOME/.claude/settings.json:.claude/settings.json" \
+  "$HOME/.codex/AGENTS.md:.codex/AGENTS.md" \
+  "$HOME/.codex/config.toml:.codex/config.toml" \
+  "$HOME/.agents/AGENTS.md:.agents/AGENTS.md" ; do
+  src="${spec%%:*}"; dst="${spec##*:}"
+  [ -f "$src" ] && { "${RS[@]}" "$src" "$TARGET:$dst"; printf '  %s\n' "$dst"; }
+done
+
+log "credentials (streamed, never displayed)"
+put_secret() { # $1 = local file, $2 = remote path
+  [ -f "$1" ] || { printf '  %-28s (absent locally)\n' "$2"; return 0; }
+  "${SSH[@]}" "$TARGET" "install -d -m 700 \$(dirname ~/$2) && cat > ~/$2 && chmod 600 ~/$2" < "$1"
+  printf '  %-28s installed 0600 (%s bytes)\n' "$2" "$(wc -c < "$1" | tr -d ' ')"
+}
+put_secret "$HOME/.codex/auth.json" ".codex/auth.json"
+put_secret "$HOME/.grok/auth.json"  ".grok/auth.json"
+
+# Claude Code keeps credentials in the macOS Keychain; Linux reads a file.
+if security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+  if security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+     | "${SSH[@]}" "$TARGET" 'cat > ~/.claude/.credentials.json && chmod 600 ~/.claude/.credentials.json'; then
+    n=$("${SSH[@]}" "$TARGET" 'wc -c < ~/.claude/.credentials.json' 2>/dev/null | tr -d ' ')
+    printf '  %-28s installed 0600 (%s bytes, from Keychain)\n' ".claude/.credentials.json" "$n"
+  else
+    printf '  %-28s Keychain read denied\n' ".claude/.credentials.json"
+  fi
+else
+  printf '  %-28s no Keychain entry\n' ".claude/.credentials.json"
+fi
+
+log "seed summary"
+"${SSH[@]}" "$TARGET" 'for p in .claude/skills .claude/commands .codex/skills .agents/skills; do
+    [ -d ~/$p ] && printf "  %-20s %s entries\n" "$p" "$(find ~/$p -mindepth 1 -maxdepth 1 | wc -l | tr -d " ")"
+  done
+  echo "  --- credentials present ---"
+  for f in .codex/auth.json .grok/auth.json .claude/.credentials.json; do
+    [ -f ~/$f ] && printf "  %-28s %s\n" "$f" "$(stat -c %a ~/$f)"
+  done'
+echo SEED_DONE

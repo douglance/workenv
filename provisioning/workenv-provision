@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Provision a fresh Linux guest into a ready-to-use workenv worker.
+# Arch-aware (x86_64 / aarch64), idempotent, safe to re-run.
+set -euo pipefail
+
+NIX_URL="https://releases.nixos.org/nix/nix-2.35.2/install"
+NIX_SHA="9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c"
+DEVENV_FLAKE="github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2"
+BIN="$HOME/.local/bin"
+log() { printf '\n=== %s ===\n' "$*"; }
+
+case "$(uname -m)" in
+  aarch64|arm64) ARCH_GNU=aarch64-unknown-linux-gnu; A_NPM=arm64; A_DASH=aarch64; A_X=arm64 ;;
+  x86_64)        ARCH_GNU=x86_64-unknown-linux-gnu;  A_NPM=x64;   A_DASH=x86_64;  A_X=x64 ;;
+  *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+mkdir -p "$BIN"
+
+log "1/8 base packages"
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update -qq
+sudo apt-get install -y -qq --no-install-recommends \
+  bash coreutils ca-certificates curl xz-utils git jq rsync sudo openssh-client tar gzip \
+  build-essential pkg-config libssl-dev \
+  libpipewire-0.3-dev libclang-dev libegl-dev libgl-dev libgles-dev \
+  libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libgbm-dev
+
+log "1b/8 tailscale"
+# The apt package carries tailscaled.service, /var/lib/tailscale and the apparmor
+# profile. A nix profile install would give binaries and leave us hand-writing a
+# unit pinned to a store path that moves on every upgrade.
+# Enrolment is deliberately NOT done here: it needs a secret, and provisioning is
+# the stage that gets re-run casually.
+if ! command -v tailscale >/dev/null 2>&1; then
+  . /etc/os-release
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.noarmor.gpg" \
+    | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.tailscale-keyring.list" \
+    | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq --no-install-recommends tailscale
+fi
+sudo systemctl enable --now tailscaled
+# Without /dev/net/tun, tailscaled falls back to userspace networking, which does
+# not carry listening sockets the way `tailscale serve` needs.
+[ -e /dev/net/tun ] || echo "WARN no /dev/net/tun; tailscaled will use userspace networking"
+
+log "2/8 nix"
+if ! [ -e /nix/var/nix/profiles/default/bin/nix ]; then
+  curl -fsSL -o /tmp/install-nix "$NIX_URL"
+  echo "$NIX_SHA  /tmp/install-nix" | sha256sum -c -
+  sudo sh /tmp/install-nix --daemon --yes --no-channel-add
+fi
+# Without trusted-users, --accept-flake-config silently ignores devenv's cachix
+# and Nix compiles cachix-api from source: hours instead of seconds.
+printf '%s\n' \
+  "build-users-group = nixbld" \
+  "experimental-features = nix-command flakes" \
+  "trusted-users = root $(id -un)" \
+  "substituters = https://cache.nixos.org https://devenv.cachix.org https://cachix.cachix.org" \
+  "trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw= cachix.cachix.org-1:eWNHQldwUO7G2VkjpnjDbWwy4KQ/HNxht7H4SSoMckM=" \
+  | sudo tee /etc/nix/nix.conf >/dev/null
+sudo systemctl restart nix-daemon; sleep 3
+. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+log "3/8 devenv"
+if ! [ -x /opt/workenv/nix-profile/bin/devenv ]; then
+  sudo install -d -m 0755 /opt/workenv
+  sudo chown "$(id -u):$(id -g)" /opt/workenv
+  nix profile install --accept-flake-config --profile /opt/workenv/nix-profile "$DEVENV_FLAKE"
+fi
+sudo ln -sfn /opt/workenv/nix-profile/bin/devenv /usr/local/bin/devenv
+
+log "4/8 workenv toolchain via devenv (single source of truth: tools.json)"
+# The tools are declared in tools.json and built by modules/tools.nix, which now
+# carries per-architecture artifacts under `by_system`. Materialising them through
+# devenv keeps one pinned, hash-verified definition for every target instead of a
+# parallel set of hand-downloaded binaries that drift from the controller.
+WORKENV_SRC="${WORKENV_SRC:-$HOME/src/workenv}"
+if [ -d "$WORKENV_SRC/modules" ]; then
+  mkdir -p "$HOME/.workenv-toolshell"
+  cp "$WORKENV_SRC/devenv.yaml" "$WORKENV_SRC/devenv.lock" "$HOME/.workenv-toolshell/" 2>/dev/null || true
+  cat > "$HOME/.workenv-toolshell/devenv.nix" <<NIXEOF
+{ ... }:
+{
+  imports = [ $WORKENV_SRC/modules/tools.nix ];
+  workenv.tools = {
+    enable = true;
+    packageNames = [ "devsql" "codex" "claude" "grok" "pi" "herdr" ];
+  };
+}
+NIXEOF
+  ( cd "$HOME/.workenv-toolshell" && devenv shell -- bash -c '
+      for t in devsql codex claude grok pi herdr; do
+        b=$(type -a "$t" 2>/dev/null | grep -o "/nix/store[^ ]*" | head -1)
+        [ -n "$b" ] && ln -sfn "$b" "$HOME/.local/bin/$t"
+      done' )
+  echo "  linked from the nix store: $(ls "$HOME/.local/bin" | tr "\n" " ")"
+else
+  echo "WARN workenv source absent at $WORKENV_SRC; tools not installed"
+  echo "     sync the repo there, then re-run"
+fi
+
+log "5/8 runtimes (node, rg, fd, gh, uv)"
+
+# MCP servers launch through npx, and Claude Code shells out to ripgrep, so a
+# worker without node is only half a worker.
+nix profile install --profile /opt/workenv/nix-profile \
+  nixpkgs#nodejs_22 nixpkgs#ripgrep nixpkgs#fd nixpkgs#gh nixpkgs#uv || echo "WARN runtime install incomplete"
+
+log "6/8 apoc and nib (built from source)"
+# rustc needs well over the 3 GB a small guest gets; without swap the OOM killer
+# takes it (SIGKILL) partway through the crate graph. Cheap insurance on disk.
+MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+if [ "$MEM_MB" -lt 6000 ] && ! swapon --show 2>/dev/null | grep -q swapfile; then
+  echo "low memory (${MEM_MB}MB): adding 8G swap for the build"
+  sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
+    && sudo mkswap -q /swapfile && sudo swapon /swapfile
+fi
+BUILD_JOBS=2; [ "$MEM_MB" -lt 6000 ] && BUILD_JOBS=1
+
+if [ -x "$BIN/apoc" ]; then
+  echo "apoc present: $($BIN/apoc --version 2>&1 | head -1)"
+elif [ -d "$HOME/src/apoc" ]; then
+  [ -L "$HOME/src/apoc/target" ] && rm -f "$HOME/src/apoc/target"
+  if ! command -v cargo >/dev/null 2>&1; then
+    curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.95.0 --no-modify-path
+  fi
+  . "$HOME/.cargo/env"
+  ( cd "$HOME/src/apoc" && CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release --locked -j"$BUILD_JOBS" )
+  install -m 0755 "$HOME/src/apoc/target/release/apoc" "$BIN/apoc"
+else
+  echo "WARN apoc source absent at ~/src/apoc; seed it then re-run"
+fi
+
+# nib publishes no linux-aarch64 release, so build it. It is a screen-capture
+# tool and links pipewire, EGL, gbm and xkbcommon-x11 even headless.
+if [ -x "$BIN/nib" ]; then
+  echo "nib present: $($BIN/nib --version 2>&1 | head -1)"
+elif command -v cargo >/dev/null 2>&1 || [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+  [ -d "$HOME/src/nib" ] || git clone --depth 1 https://github.com/douglance/nib.git "$HOME/src/nib"
+  # nib ships no Cargo.lock, so --locked cannot be used here.
+  ( cd "$HOME/src/nib" && CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release -j"$BUILD_JOBS" ) \
+    && install -m 0755 "$HOME/src/nib/target/release/nib" "$BIN/nib" || echo "WARN nib build failed"
+fi
+
+log "6b/8 python-based MCP tooling"
+if ! [ -x "$BIN/code-review-graph" ]; then
+  bash -lc 'uv tool install code-review-graph==2.3.2' >/dev/null 2>&1 \
+    && echo "  code-review-graph installed" || echo "WARN code-review-graph install failed"
+fi
+
+log "7/8 PATH for login shells"
+grep -q 'workenv PATH' "$HOME/.profile" 2>/dev/null || cat >> "$HOME/.profile" <<'PROF'
+# workenv PATH
+export PATH="$HOME/.local/bin:/opt/workenv/nix-profile/bin:/usr/local/bin:$PATH"
+[ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+PROF
+grep -q 'workenv PATH' "$HOME/.bashrc" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:/opt/workenv/nix-profile/bin:/usr/local/bin:$PATH"  # workenv PATH' >> "$HOME/.bashrc"
+
+log "provision summary"
+for t in nix devenv tailscale codex claude herdr grok pi devsql apoc nib node npx rg fd gh uv code-review-graph; do
+  printf '%-9s %s\n' "$t" "$(bash -lc "command -v $t >/dev/null 2>&1 && $t --version 2>&1 | head -1" || echo MISSING)"
+done
+echo PROVISION_DONE
