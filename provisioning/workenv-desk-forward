@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Publish one Lima guest's noVNC port on this host's tailnet address, and keep it up.
+#
+#   workenv-desk-forward start  <slot> <port> [guest-port]
+#   workenv-desk-forward stop   <slot>
+#   workenv-desk-forward status [slot]
+#
+# Runs on the VM host (macOS). Lima forwards a guest port to the host's loopback
+# only when nothing else has claimed it, so four guests all serving 6080 collide
+# and only the first is reachable. This gives each slot its own host port instead.
+#
+# The forward is supervised: ssh is restarted if it drops, which it does whenever
+# the guest restarts. It is deliberately NOT a launchd job — a host reboot destroys
+# the Lima guests too, so a forward that outlived the reboot would point at nothing.
+set -euo pipefail
+
+STATE="$HOME/.local/state/workenv-desk"
+mkdir -p "$STATE"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# macOS has no setsid. nohup plus a redirected stdin is what actually detaches a
+# process from a closing ssh session here; setsid fails silently and takes the
+# whole launch with it.
+bind_address() { tailscale ip -4 2>/dev/null | head -1; }
+
+# Kill by listening port, never by command-line pattern. macOS truncates the
+# argv that pkill -f matches against, so a pattern anchored on the tail of a long
+# ssh invocation silently matches nothing — which reads exactly like a process
+# that was already stopped. Found by running it: the forwards outlived their pkill.
+listener_pids() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null || true; }
+
+cmd_start() {
+  local slot="$1" port="$2" guest_port="${3:-6080}"
+  local bind; bind="$(bind_address)"
+  [ -n "$bind" ] || { echo "no tailscale address on this host" >&2; exit 1; }
+  [ -f "$HOME/.lima/$slot/ssh.config" ] || { echo "no such lima guest: $slot" >&2; exit 1; }
+
+  if probe "$bind" "$port"; then
+    echo "$slot already published on $bind:$port"
+    return 0
+  fi
+  cmd_stop "$slot" >/dev/null 2>&1 || true
+  nohup "$SELF" _supervise "$slot" "$port" "$guest_port" "$bind" \
+    < /dev/null > "$STATE/$slot.log" 2>&1 &
+  local supervisor=$!
+  disown 2>/dev/null || true
+
+  for _ in $(seq 1 20); do
+    probe "$bind" "$port" && break
+    sleep 1
+  done
+  probe "$bind" "$port" || { echo "forward for $slot never answered on $port" >&2
+                             tail -5 "$STATE/$slot.log" >&2; exit 1; }
+  printf '{"slot":"%s","bind":"%s","port":%s,"guest_port":%s,"supervisor":%s}\n' \
+    "$slot" "$bind" "$port" "$guest_port" "$supervisor" > "$STATE/$slot.json"
+  echo "$slot published on $bind:$port"
+}
+
+# Restarts ssh when it drops. ExitOnForwardFailure keeps a half-open forward from
+# looking healthy: without it ssh stays up having failed to bind, and the port
+# answers nothing while the supervisor believes it is serving.
+cmd_supervise() {
+  local slot="$1" port="$2" guest_port="$3" bind="$4"
+  while true; do
+    ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no \
+        -L "$bind:$port:127.0.0.1:$guest_port" \
+        -F "$HOME/.lima/$slot/ssh.config" "lima-$slot" || true
+    sleep 5
+  done
+}
+
+cmd_stop() {
+  local slot="$1" pid port
+  if [ -f "$STATE/$slot.json" ]; then
+    pid="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('supervisor',''))" "$STATE/$slot.json")"
+    port="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['port'])" "$STATE/$slot.json")"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  fi
+  port="${port:-${2:-}}"
+  # Kill the supervisor first, then the ssh it is holding open. In the other order
+  # the supervisor notices the death and immediately dials a replacement.
+  if [ -n "$port" ]; then
+    sleep 1
+    for pid in $(listener_pids "$port"); do kill "$pid" 2>/dev/null || true; done
+  fi
+  rm -f "$STATE/$slot.json"
+  echo "$slot unpublished"
+}
+
+probe() {
+  curl -fsS -o /dev/null --max-time 5 "http://$1:$2/vnc.html" 2>/dev/null
+}
+
+cmd_status() {
+  local f slot bind port
+  for f in "$STATE"/*.json; do
+    [ -e "$f" ] || { echo "nothing published"; return 0; }
+    slot="$(basename "$f" .json)"
+    [ $# -eq 0 ] || [ "$1" = "$slot" ] || continue
+    bind="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['bind'])" "$f")"
+    port="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['port'])" "$f")"
+    if probe "$bind" "$port"; then
+      printf '%s  http://%s:%s/vnc.html  up\n' "$slot" "$bind" "$port"
+    else
+      printf '%s  http://%s:%s/vnc.html  DOWN\n' "$slot" "$bind" "$port"
+    fi
+  done
+}
+
+case "${1:-}" in
+  start)      shift; cmd_start "$@" ;;
+  stop)       shift; cmd_stop "$@" ;;
+  status)     shift; cmd_status "$@" ;;
+  _supervise) shift; cmd_supervise "$@" ;;
+  *) echo "usage: workenv-desk-forward start|stop|status <slot> [port]" >&2; exit 2 ;;
+esac

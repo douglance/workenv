@@ -1,0 +1,24 @@
+[package]
+name = "workenv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Development environment setup through devenv and optional native adapters"
+
+[dependencies]
+anyhow.workspace = true
+incurs.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+workenv-core.workspace = true
+workenv-protocol.workspace = true
+workenv-platform.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

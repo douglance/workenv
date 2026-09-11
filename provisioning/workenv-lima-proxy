@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# ssh ProxyCommand for Lima-hosted ephemeral slots.
+#
+# Lima assigns a fresh forwarded port every time an instance is created, so
+# pinning one in ~/.ssh/config breaks on each rebuild. This resolves the port at
+# connect time instead and pipes the stream, so a slot's ssh alias stays valid
+# for the life of the slot name rather than the life of one VM.
+#
+#   Host wkv-*
+#     ProxyCommand ~/path/workenv-lima-proxy %h
+set -euo pipefail
+SLOT="${1:?usage: workenv-lima-proxy <slot> [vm-host]}"
+VM_HOST="${2:-${WORKENV_VM_HOST:-box-03.example.ts.net}}"
+VM_USER="${WORKENV_VM_USER:-box-03}"
+KEY="${WORKENV_VM_KEY:-$HOME/.ssh/id_ed25519_dave}"
+
+exec ssh -o BatchMode=yes -o ConnectTimeout=15 -i "$KEY" -o IdentitiesOnly=yes \
+  "$VM_USER@$VM_HOST" \
+  "port=\$(awk '/^ *Port /{print \$2; exit}' ~/.lima/$SLOT/ssh.config 2>/dev/null); \
+   [ -n \"\$port\" ] || { echo 'slot $SLOT has no ssh.config on the VM host' >&2; exit 1; }; \
+   exec nc 127.0.0.1 \$port"

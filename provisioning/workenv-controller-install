@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Install the Orchard controller as a supervised launchd agent on this Mac.
+#
+#   workenv-controller-install [--port N]
+#
+# Replaces `orchard dev`, which is not a deployment:
+#
+#   * `orchard dev --help` says "for development purposes" and bundles a worker
+#     into the controller process, so the controller cannot be restarted without
+#     taking a worker down with it.
+#   * its --data-dir defaults to the RELATIVE path `.dev-data`, so the cluster
+#     database lands wherever the process happened to be started. Measured: the
+#     live cluster's db sat under a per-session scratchpad in /private/tmp,
+#     which is reaped. Every worker registration and service account with it.
+#   * it binds `*:6120`. Measured with lsof against the running process. On a
+#     tailnet whose grant is dst:["*"] that is the whole fleet's control plane
+#     offered to every device on it.
+#
+# This agent fixes all three: a real controller, an absolute data dir under
+# $HOME, and a loopback-only listener. Workers reach it through the ssh tunnel
+# that workenv-worker-enroll installs, so nothing needs the open port.
+set -euo pipefail
+
+PORT="${WORKENV_ORCHARD_PORT:-6120}"
+[ "${1:-}" = "--port" ] && PORT="$2"
+
+LABEL="dev.workenv.orchard-controller"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DATA_DIR="$HOME/.orchard/controller"
+LOG_DIR="$HOME/Library/Logs/workenv"
+ORCHARD="$HOME/.local/bin/orchard"
+step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
+
+[ -x "$ORCHARD" ] || { echo "orchard is not installed at $ORCHARD" >&2; exit 1; }
+mkdir -p "$DATA_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
+# A first run with no service accounts makes the controller mint a random
+# "bootstrap-admin" account and print the token to its log, so the log is a
+# credential at rest from the very first boot and cannot be world-readable.
+# This replaces `orchard dev`'s default admin:admin, which was not a secret at
+# all -- it announced itself on the stderr of every command.
+chmod 700 "$LOG_DIR" "$HOME/.orchard" 2>/dev/null || true
+
+step "1/4 stop any development controller"
+# `orchard dev` holds the port. Killed by listening port, never by argv pattern:
+# macOS truncates the argv pkill -f matches against, so a pattern anchored on a
+# long invocation silently matches nothing, which reads exactly like a process
+# that was already stopped.
+for pid in $(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true); do
+  echo "  stopping pid $pid holding :$PORT"
+  kill "$pid" 2>/dev/null || true
+done
+for _ in $(seq 1 20); do
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1 || break
+  sleep 0.5
+done
+
+step "2/4 write the launchd agent"
+cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$ORCHARD</string>
+    <string>controller</string>
+    <string>run</string>
+    <string>--listen</string><string>127.0.0.1:$PORT</string>
+    <string>--data-dir</string><string>$DATA_DIR</string>
+    <string>--insecure-no-tls</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$LOG_DIR/orchard-controller.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/orchard-controller.log</string>
+</dict>
+</plist>
+PLIST_EOF
+# --insecure-no-tls is safe only because --listen is loopback. The pair is load
+# bearing: widen the listener and this becomes a plaintext control plane.
+grep -q '127.0.0.1' "$PLIST" || { echo "refusing to load a non-loopback agent" >&2; exit 1; }
+
+step "3/4 load it"
+launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$UID" "$PLIST"
+launchctl kickstart -k "gui/$UID/$LABEL"
+
+step "4/4 verify"
+# A real controller answers 401 to an unauthenticated probe, and that 401 is the
+# deliverable: `orchard dev` answered these calls with default admin:admin
+# credentials, which it announced on stderr of every command. So readiness is
+# "the port speaks HTTP", not "the request succeeded" -- an earlier version of
+# this check used `curl -f` and reported a working, authenticated controller as
+# a controller that never came up.
+probe() { curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/v1/workers" 2>/dev/null; }
+for _ in $(seq 1 30); do
+  case "$(probe)" in 200|401|403) break ;; esac
+  sleep 1
+done
+case "$(probe)" in
+  200|401|403) ;;
+  *) echo "controller did not come up; see $LOG_DIR/orchard-controller.log" >&2; exit 1 ;;
+esac
+# Prove the exposure is actually closed rather than assuming the flag worked.
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -qE '\*:|\[::\]:'; then
+  echo "controller is still listening on all interfaces" >&2; exit 1
+fi
+echo "controller supervised as $LABEL, loopback only, data in $DATA_DIR"

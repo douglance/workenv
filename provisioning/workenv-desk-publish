@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Publish the desktops of one or more guests on the tailnet, and prove they answer.
+#
+#   workenv-desk-publish wkv-01 wkv-02 wkv-03 wkv-04
+#   workenv-desk-publish --status
+#
+# Runs on the controller. Ships workenv-desk-forward to the VM host, starts one
+# supervised forward per slot, then verifies each URL from *here* — the host
+# proving to itself that it can reach its own guest is not evidence that you can.
+set -euo pipefail
+
+VM_HOST="${WORKENV_VM_HOST:-box-03.example.ts.net}"
+VM_USER="${WORKENV_VM_USER:-box-03}"
+VM_KEY="${WORKENV_VM_KEY:-$HOME/.ssh/id_ed25519_dave}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VM=(ssh -o BatchMode=yes -o ConnectTimeout=20 -i "$VM_KEY" -o IdentitiesOnly=yes "$VM_USER@$VM_HOST")
+STATUS_ONLY=0
+SLOTS=()
+for a in "$@"; do
+  case "$a" in
+    --status) STATUS_ONLY=1 ;;
+    -*) echo "unknown argument: $a" >&2; exit 2 ;;
+    *) SLOTS+=("$a") ;;
+  esac
+done
+
+install_forwarder() {
+  "${VM[@]}" 'mkdir -p ~/.local/bin'
+  scp -q -o BatchMode=yes -i "$VM_KEY" -o IdentitiesOnly=yes \
+    "$HERE/workenv-desk-forward" "$VM_USER@$VM_HOST:.local/bin/workenv-desk-forward"
+  "${VM[@]}" 'chmod +x ~/.local/bin/workenv-desk-forward'
+}
+
+# 6400 + the slot's trailing digits, so wkv-03 is always 6403. A derived port means
+# the URL is predictable from the slot name and survives a republish unchanged.
+port_for() {
+  local n; n="$(printf '%s' "$1" | tr -dc '0-9' | sed 's/^0*//')"
+  [ -n "$n" ] || { echo "cannot derive a port from slot name: $1" >&2; exit 1; }
+  echo $((6400 + n))
+}
+
+install_forwarder
+if [ "$STATUS_ONLY" = 1 ]; then
+  "${VM[@]}" '~/.local/bin/workenv-desk-forward status'
+  exit 0
+fi
+[ "${#SLOTS[@]}" -gt 0 ] || { echo "usage: workenv-desk-publish <slot>... | --status" >&2; exit 2; }
+
+failed=0
+for slot in "${SLOTS[@]}"; do
+  port="$(port_for "$slot")"
+  "${VM[@]}" "~/.local/bin/workenv-desk-forward start $slot $port" | sed 's/^/  /'
+  url="http://$VM_HOST:$port/vnc.html"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" || true)"
+  if [ "$code" = "200" ]; then
+    printf '  \033[32mok\033[0m       %s\n' "$url"
+  else
+    printf '  \033[31mFAILED\033[0m   %s (HTTP %s)\n' "$url" "$code"
+    failed=1
+  fi
+done
+exit "$failed"

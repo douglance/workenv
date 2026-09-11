@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Bring up a fully-provisioned ephemeral worker from nothing, in one command.
+#
+#   workenv-up wkv-01 [vm-host]
+#
+# Creates the guest, authorises the controller key, seeds sources/skills/auth,
+# provisions the toolchain, and verifies. Idempotent: re-running against an
+# existing slot re-seeds and re-provisions rather than recreating.
+set -euo pipefail
+SLOT="${1:?usage: workenv-up <slot> [vm-host]}"
+VM_HOST="${2:-${WORKENV_VM_HOST:-box-03.example.ts.net}}"
+VM_USER="${WORKENV_VM_USER:-box-03}"
+VM_KEY="${WORKENV_VM_KEY:-$HOME/.ssh/id_ed25519_dave}"
+PUBKEY="${WORKENV_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VM=(ssh -o BatchMode=yes -o ConnectTimeout=20 -i "$VM_KEY" -o IdentitiesOnly=yes "$VM_USER@$VM_HOST")
+step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
+START=$(date +%s)
+
+step "1/6 host capacity"
+"${VM[@]}" '~/.local/bin/workenv-lima capacity --json' | python3 -c "
+import sys, json
+c = json.load(sys.stdin)
+a = c['available']
+print(f\"  host {c['host']['ncpu']} cpu / {c['host']['memory_gb']}GB / {c['host']['disk_available_gb']}GB free\")
+print(f\"  available after reserve: {a['cpus']} cpu, {a['memory_gb']}GB\")
+if a['memory_gb'] < 2: sys.exit('  refusing: not enough memory for a worker')
+"
+
+step "2/6 create guest"
+if "${VM[@]}" "limactl list --json 2>/dev/null | grep -q '\"name\":\"$SLOT\"'"; then
+  echo "  $SLOT already exists; reusing"
+else
+  "${VM[@]}" "nohup limactl start --tty=false --name=$SLOT --vm-type=vz \
+      --cpus=2 --memory=3 --disk=30 template:ubuntu-24.04 > /tmp/$SLOT.log 2>&1 &" || true
+  for _ in $(seq 1 60); do
+    "${VM[@]}" "grep -q READY /tmp/$SLOT.log 2>/dev/null" && break
+    sleep 5
+  done
+  "${VM[@]}" "grep -q READY /tmp/$SLOT.log" || { echo "  guest did not become READY" >&2; exit 1; }
+  echo "  $SLOT is READY"
+fi
+
+step "3/6 authorise controller key"
+PUB="$(cat "$PUBKEY")"
+"${VM[@]}" "limactl shell $SLOT -- sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+   grep -qF \"$PUB\" ~/.ssh/authorized_keys 2>/dev/null || echo \"$PUB\" >> ~/.ssh/authorized_keys; \
+   chmod 600 ~/.ssh/authorized_keys'"
+ssh -o BatchMode=yes -o ConnectTimeout=25 "$SLOT" true && echo "  controller reaches $SLOT"
+
+step "4/6 seed sources, skills, credentials"
+"$HERE/workenv-seed" "$SLOT" | sed 's/^/  /'
+
+step "5/6 provision toolchain"
+scp -q -o BatchMode=yes "$HERE/workenv-provision" "$SLOT:/tmp/workenv-provision"
+ssh -o BatchMode=yes "$SLOT" 'chmod +x /tmp/workenv-provision && /tmp/workenv-provision' \
+  2>&1 | sed 's/^/  /' | tail -40
+
+step "6/6 verify"
+ssh -o BatchMode=yes "$SLOT" 'for t in nix devenv apoc nib codex claude herdr grok pi devsql node npx rg gh uv; do
+    printf "  %-8s %s\n" "$t" "$(bash -lc "command -v $t >/dev/null 2>&1 && $t --version 2>&1 | head -1 | cut -c1-28" || echo MISSING)"
+  done'
+printf '\n\033[32mworkenv-up complete in %ss\033[0m\n' "$(( $(date +%s) - START ))"
