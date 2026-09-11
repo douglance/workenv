@@ -16,15 +16,22 @@ pub(super) trait HostRunner {
 pub(super) struct SshHostRunner {
     vm_host: String,
     command: String,
+    request_id: String,
     timeout_ms: u64,
 }
 
 impl SshHostRunner {
-    /// Build a runner for one VM host and host-CLI command name.
-    pub(super) fn new(vm_host: String, command: String, timeout_ms: u64) -> Self {
+    /// Build a runner bound to one VM host and one controller request.
+    pub(super) fn new(
+        vm_host: String,
+        command: String,
+        request_id: String,
+        timeout_ms: u64,
+    ) -> Self {
         Self {
             vm_host,
             command,
+            request_id,
             timeout_ms,
         }
     }
@@ -56,7 +63,7 @@ impl HostRunner for SshHostRunner {
                 cwd: Some(root),
                 stdin: None,
                 timeout_ms: self.timeout_ms,
-                idempotency_key: format!("workenv-lima:v1:{}", digest_args(&command)),
+                idempotency_key: idempotency_key(&self.request_id, &command),
                 purpose: "Run Lima VM host command through the APoC executor.".into(),
             })
             .map_err(|error| error.to_string())?;
@@ -78,9 +85,19 @@ fn parse_output(output: &ExecutionOutput) -> HostResult<Value> {
         .to_owned())
 }
 
-fn digest_args(args: &[String]) -> String {
-    let body = serde_json::to_vec(args).unwrap_or_default();
-    format!("{:x}", Sha256::digest(body))
+/// Bind the execution identity to the controller request, not just the argv.
+///
+/// Keying only on the argv lets a replayed execution answer a genuinely
+/// different operation from cache. A stale teardown and the original teardown
+/// share an identical argv, so an argv-only key returns the earlier success and
+/// the VM host never gets to reject the stale claim.
+pub(super) fn idempotency_key(request_id: &str, argv: &[String]) -> String {
+    let body = serde_json::to_vec(argv).unwrap_or_default();
+    format!(
+        "workenv-lima:v1:{:x}:{:x}",
+        Sha256::digest(request_id.as_bytes()),
+        Sha256::digest(body)
+    )
 }
 
 fn stderr_message(stderr: &str, fallback: &str) -> String {
@@ -89,5 +106,40 @@ fn stderr_message(stderr: &str, fallback: &str) -> String {
         fallback.into()
     } else {
         format!("{fallback}: {text}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idempotency_key;
+
+    fn argv() -> Vec<String> {
+        [
+            "release",
+            "--slot",
+            "wkv-01",
+            "--claim-uuid",
+            "8f1c",
+            "--json",
+        ]
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn identical_argv_from_different_requests_does_not_replay() {
+        assert_ne!(
+            idempotency_key("destroy-1", &argv()),
+            idempotency_key("destroy-stale", &argv())
+        );
+    }
+
+    #[test]
+    fn the_same_request_and_argv_stays_replayable() {
+        assert_eq!(
+            idempotency_key("destroy-1", &argv()),
+            idempotency_key("destroy-1", &argv())
+        );
     }
 }

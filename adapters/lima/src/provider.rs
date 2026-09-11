@@ -34,6 +34,7 @@ pub(crate) fn handle(request: &AdapterRequest) -> Result<AdapterResponse> {
     let runner = SshHostRunner::new(
         resolved.vm_host.clone(),
         resolved.command.clone(),
+        request.request_id.clone(),
         HOST_TIMEOUT_MS,
     );
     let mut provider = Provider::new(runner);
