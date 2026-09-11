@@ -1,5 +1,17 @@
 { pkgs, ... }:
 
+let
+  # One binding config, reused. `workenv.orchard` is bound three ways for the
+  # fast host -- as its provider, its transport and its connection -- and core
+  # refuses an environment whose repeated bindings of one extension carry
+  # different configuration ("ambiguous bindings with different configuration").
+  # Writing it once is what keeps them identical.
+  orchardBinding = {
+    extension = "workenv.orchard";
+    config = { };
+  };
+in
+
 {
   imports = [ ../modules/default.nix ];
 
@@ -21,7 +33,12 @@
     herdr.enable = true;
     tailscale.enable = true;
     identity.enable = true;
-    clipboard.enable = true;
+    # workenv.clipboard is not enabled. It is an xclip/xsel integration whose
+    # package set and extension are both declared `systems = [ "x86_64-linux" ]`,
+    # so on an Apple Silicon controller enabling it does not merely make the
+    # integration unusable -- it puts an unbuildable package in the devenv shell
+    # and every command fails with "Refusing to evaluate package
+    # 'ssh-clipboard-unsupported-on-aarch64-darwin'". This fleet is Macs only.
     exedev.enable = true;
     lima.enable = true;
     # Read-only cluster inventory. Declares no hosts, so it cannot affect the
@@ -52,6 +69,23 @@
       };
     };
 
+    # An address-free host. This is the whole point of the Orchard path: the
+    # scheduler chooses the machine after this manifest is written, so there is
+    # no address to declare, and `workenv.orchard` is both the provider that
+    # creates the guest and the transport that reaches it by name through the
+    # controller. Nothing here names a machine, so the same environment lands on
+    # whichever worker has capacity.
+    hosts."wkv-fast" = {
+      address = null;
+      transport = "workenv.orchard";
+      system = "aarch64-linux";
+      # The controller URL is not repeated here. The adapter defaults to the
+      # loopback controller, which is the only place it can be once the
+      # controller is bound to 127.0.0.1, and an unset value cannot disagree
+      # with the transport and connection bindings.
+      provider = orchardBinding;
+    };
+
     hosts.local = {
       address = null;
       transport = null;
@@ -78,6 +112,23 @@
       };
     };
 
+    # Measured at 7s from create to ssh-ready against a 4354s baseline, because
+    # the image carries the toolchain. Credentials are deliberately not baked:
+    # a Tart image is cloned and can be pushed to a registry.
+    environments."wkv-fast" = {
+      host = "wkv-fast";
+      directory = "/home/admin/workenv";
+      source = toString ../.;
+      ephemeral = true;
+      integrations = [
+        { extension = "workenv.identity"; }
+        { extension = "workenv.bootstrap"; }
+      ];
+      # Reaching in is the provider's own job here. Every other connection
+      # extension needs target.address, which this host does not have.
+      connection = orchardBinding;
+    };
+
     environments.workenv = {
       host = "local";
       directory = toString ../.;
@@ -85,7 +136,11 @@
       integrations = [
         { extension = "workenv.tailscale"; }
         { extension = "workenv.identity"; }
-        { extension = "workenv.clipboard"; }
+        # workenv.clipboard is deliberately absent. It is an xclip/xsel
+        # integration declared `systems = [ "x86_64-linux" ]`, and this host is
+        # the controller Mac, so listing it made the whole manifest fail to load
+        # with "workenv.clipboard does not support aarch64-darwin" -- every
+        # command, not just the ones that would have used it.
         { extension = "workenv.bootstrap"; }
         { extension = "workenv.herdr"; }
       ];
