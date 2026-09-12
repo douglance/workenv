@@ -128,7 +128,7 @@ impl PriorReceipts {
     }
 }
 
-fn setup_operations(controller: &Controller, binding: &Binding) -> Result<Vec<String>> {
+pub(crate) fn setup_operations(controller: &Controller, binding: &Binding) -> Result<Vec<String>> {
     let extension = controller
         .manifest
         .extensions

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use workenv_protocol::{AdapterResponse, Binding, Manifest};
+use workenv_protocol::{AdapterResponse, Binding, Extension, Manifest};
 
 pub(crate) struct BindingCall<'a> {
     pub(crate) binding: &'a Binding,
@@ -169,11 +169,70 @@ pub(crate) fn identity(environment: &str, extension: &str, operation: &str) -> R
     }
 }
 
+/// The extension's contract with `executable` removed.
+///
+/// `executable` is a `/nix/store` path, so it changes on every rebuild -- and
+/// editing any `.rs` file in this workspace rebuilds it. It was part of the
+/// create fingerprint that `Environment::destroy` requires the recorded receipt
+/// to match, so a single source edit made `destroy` and `down` fail with
+/// "latest receipt fingerprint does not match current operation" and stranded
+/// the claimed resource until its lease expired.
+///
+/// Nothing else is dropped. The fingerprint answers "is this the same operation
+/// against the same resource?", and the adapter's version, protocol, declared
+/// operations, location and systems all still count toward that. Where the
+/// binary happens to live on disk does not.
+fn contract_fingerprint(extension: Option<&Extension>) -> Result<Option<Value>> {
+    let Some(extension) = extension else {
+        return Ok(None);
+    };
+    let mut value = serde_json::to_value(extension)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("executable");
+    }
+    Ok(Some(value))
+}
+
 fn fingerprint(manifest: &Manifest, call: &Invocation<'_>) -> Result<String> {
     let environment = manifest.environments.get(call.environment);
     let value = json!({"schema_version":manifest.schema_version,"extension":call.extension_id,
         "operation":call.operation,"environment":environment,"config":call.config,"input":call.input,
-        "prior_resource":call.previous,"extension_contract":manifest.extensions.get(call.extension_id),
+        "prior_resource":call.previous,
+        "extension_contract":contract_fingerprint(manifest.extensions.get(call.extension_id))?,
         "host":environment.and_then(|env|manifest.hosts.get(&env.host))});
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
+}
+
+#[cfg(test)]
+mod mutation_key_tests {
+    use super::mutation_key;
+    use anyhow::{Result, bail};
+
+    #[test]
+    fn a_mutating_call_without_a_key_is_refused() -> Result<()> {
+        // Nothing asserted this anywhere: the whole body of `mutation_key` could be
+        // replaced with `Ok(key.unwrap_or(""))` and the suite stayed green, which
+        // would collapse every mutating operation's receipts onto one identity.
+        let Err(error) = mutation_key(None) else {
+            bail!("a missing key was accepted");
+        };
+        assert!(error.to_string().contains("idempotency key"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_or_blank_key_is_refused() {
+        for key in ["", "   ", "\t"] {
+            assert!(
+                mutation_key(Some(key)).is_err(),
+                "key {key:?} was accepted, so unrelated operations share a receipt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_key_is_returned_unchanged() -> Result<()> {
+        assert_eq!(mutation_key(Some("up-1"))?, "up-1");
+        Ok(())
+    }
 }
