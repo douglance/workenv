@@ -26,6 +26,19 @@ printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
 "#,
     )?;
     write_helper(&bin.join("uname"), "#!/bin/sh\necho Linux\n")?;
+    // A pass-through sudo, because the Linux reload path runs
+    // `sudo -n systemctl restart nix-daemon.service` and -- unlike the Darwin
+    // branch -- does not swallow its failure. Without this stub the test reached
+    // the real sudo; it only ever passed because the harness used a login shell,
+    // whose profile replaced this PATH so the real `uname` answered Darwin and
+    // this branch was never taken at all.
+    write_helper(
+        &bin.join("sudo"),
+        r#"#!/bin/sh
+if [ "$1" = -n ]; then shift; fi
+exec "$@"
+"#,
+    )?;
 
     let conf_arg = path_arg(&conf)?;
     let script = format!(
@@ -33,7 +46,7 @@ printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
         scripts::devenv_cache_setup_script()
     );
     let output = Command::new("bash")
-        .arg("-lc")
+        .arg("-c")
         .arg(script)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("SYSTEMCTL_LOG", root.join("systemctl.log"))
@@ -89,7 +102,7 @@ printf systemctl >> "$SYSTEMCTL_LOG"
         path_arg(&conf)?
     );
     let output = Command::new("bash")
-        .arg("-lc")
+        .arg("-c")
         .arg(script)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("SYSTEMCTL_LOG", root.join("systemctl.log"))

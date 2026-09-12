@@ -168,7 +168,7 @@ fn target_seed_stage_script_validates_sha_before_atomic_rename() -> Result<()> {
     fs::create_dir_all(&root)?;
 
     let output = Command::new("bash")
-        .arg("-lc")
+        .arg("-c")
         .arg(remote_seed_stage_script(&sha))
         .env("HOME", &root)
         .output_with_stdin(bytes)?;
@@ -184,7 +184,7 @@ fn target_seed_stage_script_validates_sha_before_atomic_rename() -> Result<()> {
     );
 
     let failed = Command::new("bash")
-        .arg("-lc")
+        .arg("-c")
         .arg(remote_seed_stage_script(&sha))
         .env("HOME", &root)
         .output_with_stdin(b"wrong")?;

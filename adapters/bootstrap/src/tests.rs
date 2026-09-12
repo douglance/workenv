@@ -122,7 +122,7 @@ fn seed_install_creates_new_user_link_dir_when_devenv_is_ready() -> Result<()> {
 
     assert!(
         Command::new("bash")
-            .arg("-lc")
+            .arg("-c")
             .arg(script)
             .status()?
             .success()
@@ -174,7 +174,7 @@ while [ "$#" -gt 0 ]; do if [ "$1" = --profile ]; then profile=$2; mkdir -p "$pr
             &format!("PATH={}:$link_dir:$PATH", shell_arg(&path_arg(&fake_bin)?)),
         );
 
-    let status = Command::new("bash").arg("-lc").arg(script).status()?;
+    let status = Command::new("bash").arg("-c").arg(script).status()?;
 
     fs::set_permissions(&prefix_parent, Permissions::from_mode(0o755))?;
     assert!(status.success());
@@ -214,7 +214,7 @@ fn config_with_paths(
 }
 
 fn run_bash(script: &str) -> Result<std::process::ExitStatus> {
-    Ok(Command::new("bash").arg("-lc").arg(script).status()?)
+    Ok(Command::new("bash").arg("-c").arg(script).status()?)
 }
 
 fn write_helper(path: &std::path::Path, body: &str) -> Result<()> {
