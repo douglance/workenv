@@ -12,9 +12,10 @@
 
   # nix is listed, not assumed. `workenv-check` calls `nix-instantiate` for the
   # module assertion suites, and relied on the ambient PATH carrying it: run the
-  # script from a context whose PATH lacks the nix profile and those three steps
-  # die with "nix-instantiate: command not found" after everything before them
-  # has already passed.
+  # script from a context whose PATH lacks the nix profile and every one of those
+  # steps dies with "nix-instantiate: command not found" after everything before
+  # them has already passed. Counting them here would be a number someone has to
+  # remember to update -- it was already wrong once -- so it is not counted.
   packages = [
     pkgs.nixfmt-rfc-style
     pkgs.nix
@@ -34,6 +35,7 @@
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/exedev-ephemeral.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/herdr-platforms.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/orchard-schemas.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
+    nix-instantiate --eval --strict --json --expr 'import ./modules/tests/adapter-coverage.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nixfmt --check \
       devenv.nix \
       modules/*.nix \

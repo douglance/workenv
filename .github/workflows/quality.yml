@@ -24,55 +24,59 @@ jobs:
         run: nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- shell -- workenv-check
       - name: Evaluate Devenv Modules
         run: |
+          # The point of this step is the one thing workenv-check cannot do:
+          # evaluate the modules from a directory that is not the repository, so
+          # an import that only resolves relative to the source tree is caught.
+          #
+          # The enable list and the expected extension list are derived from
+          # adapters/ rather than written out. Both were hand-kept and both were
+          # stale: this step enabled eight adapters and named nine extensions,
+          # never mentioning orchard or project, so a manifest missing both
+          # entirely passed green -- verified by feeding this step's own jq a
+          # manifest with neither in it.
+          #
+          # Versions are deliberately not asserted here. The list used to pin
+          # "0.2.0", which turns CI red on a version bump with no defect behind
+          # it, and re-reading Cargo.toml instead would only check that the
+          # modules agree with the file they already read. That assertion lives
+          # in modules/tests/adapter-coverage.nix, against Cargo.lock.
+          adapters="$(cd "${GITHUB_WORKSPACE}/adapters" && ls -d */ | sed 's#/##' | sort)"
+          test "$(printf '%s\n' "$adapters" | wc -l)" -ge 10
+
           check_dir="$(mktemp -d)"
           cp "${GITHUB_WORKSPACE}/devenv.yaml" "$check_dir/devenv.yaml"
           cp "${GITHUB_WORKSPACE}/devenv.lock" "$check_dir/devenv.lock"
-          cat > "$check_dir/devenv.nix" <<EOF
-          { config, ... }:
           {
-            imports = [
-              ${GITHUB_WORKSPACE}/modules/default.nix
-              ${GITHUB_WORKSPACE}/examples/external-extension/module.nix
-            ];
+            echo '{ config, ... }:'
+            echo '{'
+            echo '  imports = ['
+            echo "    ${GITHUB_WORKSPACE}/modules/default.nix"
+            echo "    ${GITHUB_WORKSPACE}/examples/external-extension/module.nix"
+            echo '  ];'
+            echo '  workenv = {'
+            echo '    base.enable = true;'
+            echo '    apoc.enable = true;'
+            echo '    tools.enable = true;'
+            echo '    rust.enable = false;'
+            echo '    rust.rustPackage = config.languages.rust.toolchainPackage;'
+            printf '    %s.enable = true;\n' $adapters
+            echo '  };'
+            echo '  exampleExtension.enable = true;'
+            echo '}'
+          } > "$check_dir/devenv.nix"
+          cat "$check_dir/devenv.nix"
 
-            workenv = {
-              base.enable = true;
-              apoc.enable = true;
-              bootstrap.enable = true;
-              clipboard.enable = true;
-              exedev.enable = true;
-              herdr.enable = true;
-              identity.enable = true;
-              lima.enable = true;
-              rust.enable = false;
-              rust.rustPackage = config.languages.rust.toolchainPackage;
-              ssh.enable = true;
-              tailscale.enable = true;
-              tools.enable = true;
-            };
-            exampleExtension.enable = true;
-          }
-          EOF
+          expected="$( { echo example.independent; printf 'workenv.%s\n' $adapters; } | jq -R . | jq -sc .)"
+          echo "expecting: $expected"
+
           nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- eval --from "path:$check_dir" workenv.manifestJSON > "$check_dir/manifest.json"
-          nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- shell -- jq -e '
-            ."workenv.manifestJSON" | fromjson | .extensions as $extensions |
-            [
-              "example.independent",
-              "workenv.bootstrap",
-              "workenv.clipboard",
-              "workenv.exedev",
-              "workenv.herdr",
-              "workenv.identity",
-              "workenv.lima",
-              "workenv.ssh",
-              "workenv.tailscale"
-            ] as $expected |
-            ($expected - ($extensions | keys)) as $missing |
-            if ($missing | length) == 0 then
-              ($extensions["example.independent"].version == "1.0.0") and
-              ($expected | map(select(. != "example.independent")) |
-                all(. as $name | $extensions[$name].version == "0.2.0"))
-            else
-              "missing extensions: \($missing | join(", "))" | halt_error(1)
-            end
+          nix run github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2 -- shell -- jq -e --argjson expected "$expected" '
+            ."workenv.manifestJSON" | fromjson | .extensions | keys as $declared |
+            (($expected - $declared) as $missing |
+             ($declared - $expected) as $extra |
+             if ($missing | length) > 0 then
+               "missing extensions: \($missing | join(", "))" | halt_error(1)
+             elif ($extra | length) > 0 then
+               "undeclared extensions: \($extra | join(", "))" | halt_error(1)
+             else true end)
           ' "$check_dir/manifest.json"
