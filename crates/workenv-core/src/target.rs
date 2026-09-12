@@ -10,6 +10,10 @@ use std::path::PathBuf;
 use workenv_platform::ExecutionSpec;
 use workenv_protocol::{AdapterResponse, PROTOCOL_VERSION, ResponseStatus};
 
+/// How long one command on a target is given, whether it travels through a
+/// transport or runs directly.
+const TARGET_TIMEOUT_MS: u64 = 900_000;
+
 pub(crate) struct TargetCommand {
     pub(crate) arguments: Vec<String>,
     pub(crate) directory: PathBuf,
@@ -59,7 +63,7 @@ impl Controller {
             arg: arguments.to_vec(),
             cwd: Some(command.directory.clone()),
             stdin: None,
-            timeout_ms: 900_000,
+            timeout_ms: TARGET_TIMEOUT_MS,
             idempotency_key: command.key.clone(),
             purpose: format!("Workenv {} for {name}.", command.stage),
         })?;
@@ -85,7 +89,13 @@ impl Controller {
             operation: "execute",
             environment: name,
             config: json!({}),
-            input: json!({"argv":command.arguments,"cwd":command.directory}),
+            // The same budget the direct path uses. Omitting it left the transport
+            // to apply its own default -- orchard's is 300_000 ms -- so the identical
+            // command got a third of the time simply for travelling through a
+            // transport, and a slow `devenv shell` in a guest was reported as the
+            // carrier writing nothing.
+            input: json!({"argv":command.arguments,"cwd":command.directory,
+                "timeout_ms":TARGET_TIMEOUT_MS}),
             key: command.key.clone(),
             previous,
             allow_internal: true,

@@ -74,7 +74,11 @@ pub(super) fn transport_response(
         return Ok(pending);
     }
     if data["exit_code"].as_i64() != Some(0) {
-        bail!("transport execution failed: {}", data["stderr"]);
+        // Everything the transport actually said, because it used to say none of
+        // it: `data["stderr"]` alone prints the JSON literal `null` whenever the
+        // transport reported a failure without one, which is how every orchard
+        // carrier failure surfaced as "transport execution failed: null".
+        bail!("{}", transport_failure(output, data));
     }
     let stdout = data["stdout"]
         .as_str()
@@ -88,4 +92,32 @@ pub(super) fn transport_response(
         bail!("target adapter response request ID mismatch");
     }
     Ok(response)
+}
+
+/// One message naming the exit code, the transport's own error, and its stderr.
+///
+/// Each part is included only when present, so nothing renders as `null`.
+fn transport_failure(output: &AdapterResponse, data: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut message = String::from("transport execution failed");
+    match data["exit_code"].as_i64() {
+        Some(code) => {
+            let _ = write!(message, " with exit code {code}");
+        }
+        None => message.push_str(" without reporting an exit code"),
+    }
+    if let Some(error) = output.error.as_deref().filter(|error| !error.is_empty()) {
+        let _ = write!(message, "; {error}");
+    }
+    if let Some(stderr) = data["stderr"].as_str().filter(|stderr| !stderr.is_empty()) {
+        let _ = write!(message, "; stderr: {stderr}");
+    }
+    if let Some(execution) = output
+        .execution_id
+        .as_deref()
+        .filter(|execution| !execution.is_empty())
+    {
+        let _ = write!(message, "; execution {execution}");
+    }
+    message
 }

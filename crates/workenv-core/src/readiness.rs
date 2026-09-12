@@ -102,3 +102,30 @@ fn needs_apply(mut response: AdapterResponse, reason: &str) -> AdapterResponse {
 #[cfg(test)]
 #[path = "readiness_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod needs_apply_tests {
+    use super::needs_apply;
+    use serde_json::json;
+    use workenv_protocol::{AdapterResponse, PROTOCOL_VERSION, ResponseStatus};
+
+    #[test]
+    fn a_not_applied_answer_carries_no_execution_to_poll() {
+        // The observation's execution has finished; keeping its id on a Pending
+        // answer invites a caller to poll a completed execution and read its result
+        // as this one's. Nothing asserted the id was cleared.
+        let observed = AdapterResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "status-1".to_owned(),
+            status: ResponseStatus::Ready,
+            data: json!({"devenv": "2.3.0"}),
+            error: None,
+            execution_id: Some("exec-finished".to_owned()),
+        };
+        let answer = needs_apply(observed, "environment_not_applied");
+        assert_eq!(answer.status, ResponseStatus::Pending);
+        assert_eq!(answer.execution_id, None);
+        assert_eq!(answer.data["reason"], json!("environment_not_applied"));
+        assert_eq!(answer.data["observation"]["devenv"], json!("2.3.0"));
+    }
+}

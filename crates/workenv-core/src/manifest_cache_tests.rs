@@ -143,3 +143,48 @@ fn a_manifest_spanning_lines_survives_the_round_trip() {
     write(&tree.root(), &pretty);
     assert!(read(&tree.root()).is_some());
 }
+
+#[test]
+fn editing_one_file_twice_invalidates_it() {
+    // The existing invalidation test writes, commits, then edits once, which flips
+    // `git status` from empty to " M modules.nix" -- and the status string alone is
+    // enough to change the fingerprint. So deleting the whole per-file
+    // content-hashing loop left it green. The case the loop actually exists for is
+    // the one named in the code comment at manifest_cache.rs: editing the same file
+    // a second time leaves the status line identical while changing what the
+    // manifest evaluates to.
+    let tree = Tree::new("twice");
+    let executable = existing_executable(&tree);
+    tree.touch("first edit");
+    write(&tree.root(), &manifest_json(&executable));
+    assert!(
+        read(&tree.root()).is_some(),
+        "the manifest just written was not reused"
+    );
+    // Same " M modules.nix" status line, different contents.
+    tree.touch("second edit");
+    assert!(
+        read(&tree.root()).is_none(),
+        "a second edit to an already-dirty file served a stale manifest"
+    );
+}
+
+#[test]
+fn deleting_a_tracked_file_invalidates_it() {
+    // Deletion invalidation is real and this covers it. What it does NOT cover is
+    // the `status` bytes in the digest: measured, dropping them leaves this green,
+    // because the loop below still hashes the changed *path name* and a deletion
+    // puts the path into `git status`. Nor is that a hole -- the only thing the
+    // status bytes add beyond the path set is the status code itself, and a file
+    // moving between staged and unstaged does not change its contents, so it cannot
+    // change the manifest. They are a redundant input, not a guard.
+    let tree = Tree::new("deleted");
+    let executable = existing_executable(&tree);
+    write(&tree.root(), &manifest_json(&executable));
+    assert!(read(&tree.root()).is_some(), "baseline was not reused");
+    std::fs::remove_file(tree.repository.join("modules.nix")).expect("removing the module");
+    assert!(
+        read(&tree.root()).is_none(),
+        "a deleted tracked file served a stale manifest"
+    );
+}

@@ -45,3 +45,32 @@ fn status_compares_current_derivation_with_applied_configuration() -> Result<()>
     }
     Ok(())
 }
+
+#[test]
+fn recording_the_same_applied_state_twice_reports_no_change() -> Result<()> {
+    // `record_applied` had no test at all. Inverting its comparison makes `apply`
+    // never converge: a real change stops being recorded, so `status` reports
+    // environment_configuration_changed forever, while an unchanged state is
+    // rewritten and reported as changed.
+    let root = tempfile::tempdir()?;
+    let controller = Controller::with_executor(
+        root.path().into(),
+        provider_manifest(false),
+        Arc::new(MockExecutor::default()),
+    )?;
+    let state = serde_json::json!({"shellDerivation": "/nix/store/a.drv"});
+    assert!(
+        controller.record_applied("dev", &state)?,
+        "the first recording must report a change"
+    );
+    assert!(
+        !controller.record_applied("dev", &state)?,
+        "recording the identical state again reported a change"
+    );
+    let changed = serde_json::json!({"shellDerivation": "/nix/store/b.drv"});
+    assert!(
+        controller.record_applied("dev", &changed)?,
+        "a genuinely changed state reported no change"
+    );
+    Ok(())
+}

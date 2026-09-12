@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use workenv_protocol::{Extension, Location};
 
-use crate::adapter_invocation::{controller_command, runs_unwrapped};
+use crate::adapter_invocation::{
+    DIRECT_TIMEOUT_MS, WRAPPED_TIMEOUT_MS, controller_command, controller_timeout_ms,
+    runs_unwrapped, wrapper_reason,
+};
 
 /// One controller-located extension with the given executable and inputs.
 fn extension(executable: &Path, runtime_inputs: Option<Vec<&str>>) -> Extension {
@@ -102,4 +105,90 @@ fn an_executable_outside_the_nix_store_is_never_wrapped() {
     let (executable, args) = controller_command(&extension(&adapter, None));
     assert_eq!(executable, adapter.to_string_lossy());
     assert!(args.is_empty());
+}
+
+#[test]
+fn the_reason_names_the_executable_that_did_not_resolve() {
+    // The cost of wrapping is ~100 s against 39 ms and nothing said which
+    // precondition failed, so the symptom was a command that looked hung. Measured
+    // in this tree: `bootstrap` declared `nix`, which resolves in an interactive
+    // shell but not in the PATH apoc hands its children -- and that is the PATH
+    // this check reads, because workenv runs under apoc.
+    let adapter = real_file("reason-probe");
+    let reason = wrapper_reason(&extension(
+        &adapter,
+        Some(vec!["sh", "definitely-not-on-path-xyz"]),
+    ))
+    .expect("a missing executable must refuse the fast path");
+    assert!(
+        reason.contains("definitely-not-on-path-xyz"),
+        "the reason does not name the culprit: {reason}"
+    );
+    assert!(
+        !reason.contains("\"sh\""),
+        "the reason blames an executable that did resolve: {reason}"
+    );
+}
+
+#[test]
+fn an_undeclared_extension_says_so_rather_than_naming_a_file() {
+    let adapter = real_file("reason-undeclared");
+    let reason = wrapper_reason(&extension(&adapter, None))
+        .expect("an extension stating nothing keeps the shell");
+    assert!(
+        reason.contains("runtime_inputs"),
+        "unexpected reason: {reason}"
+    );
+}
+
+#[test]
+fn an_unbuilt_adapter_says_it_is_not_built_and_names_the_path() {
+    let missing = std::path::PathBuf::from("/nix/store/not-built-yet/bin/adapter");
+    let reason = wrapper_reason(&extension(&missing, Some(Vec::new())))
+        .expect("an unbuilt adapter keeps the shell");
+    assert!(reason.contains("not built"), "unexpected reason: {reason}");
+    assert!(
+        reason.contains("not-built-yet"),
+        "the reason does not say which adapter: {reason}"
+    );
+}
+
+#[test]
+fn a_fully_resolvable_extension_has_no_reason_to_be_wrapped() {
+    let adapter = real_file("reason-clean");
+    assert_eq!(wrapper_reason(&extension(&adapter, Some(vec!["sh"]))), None);
+}
+
+#[test]
+fn a_wrapped_call_is_given_time_to_build_not_just_to_run() {
+    // The shell builds the adapter as a side effect of being entered, so the budget
+    // has to cover a compile. Measured before this: the first call after any Rust
+    // edit took 346 s against a 300 s budget, was cancelled, and surfaced as
+    // "exited with 128 and wrote nothing to either stream".
+    let unbuilt = std::path::PathBuf::from("/nix/store/not-built-yet/bin/adapter");
+    assert_eq!(
+        controller_timeout_ms(&extension(&unbuilt, Some(Vec::new()))),
+        WRAPPED_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn a_direct_call_keeps_the_shorter_budget() {
+    // The control: raising the budget for everything would let a genuinely stuck
+    // adapter hang for half an hour instead of five minutes.
+    let adapter = real_file("budget-direct");
+    assert_eq!(
+        controller_timeout_ms(&extension(&adapter, Some(vec!["sh"]))),
+        DIRECT_TIMEOUT_MS
+    );
+}
+
+#[test]
+fn an_adapter_outside_the_store_is_never_given_the_build_budget() {
+    // Nothing outside /nix/store is ever wrapped, so it can never need to build.
+    let adapter = real_file("budget-outside-store");
+    assert_eq!(
+        controller_timeout_ms(&extension(&adapter, None)),
+        DIRECT_TIMEOUT_MS
+    );
 }

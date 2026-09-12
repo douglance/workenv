@@ -20,6 +20,7 @@ mod manifest_cache_tests;
 mod outcome;
 mod readiness;
 mod receipts;
+mod receipts_selection;
 mod target;
 mod validate;
 
@@ -49,6 +50,8 @@ mod environment_cleanup_tests;
 mod environment_cleanup_validation_tests;
 #[cfg(test)]
 mod environment_lifecycle_tests;
+#[cfg(test)]
+mod environment_ownership_tests;
 #[cfg(test)]
 mod environment_tests;
 #[cfg(test)]

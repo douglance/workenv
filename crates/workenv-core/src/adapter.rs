@@ -22,7 +22,7 @@ mod adapter_transport;
 use adapter_target::{local_target_command, target_command};
 use adapter_transport::{pending_transport, request_for_transport, transport_response};
 
-pub(crate) use crate::adapter_invocation::controller_command;
+pub(crate) use crate::adapter_invocation::{controller_command, controller_timeout_ms};
 
 pub(crate) struct Invocation<'a> {
     pub(crate) extension_id: &'a str,
@@ -136,7 +136,9 @@ fn invoke_controller_with_previous(
         arg,
         cwd: Some(runtime.root.to_path_buf()),
         stdin: Some(serde_json::to_vec(request)?),
-        timeout_ms: 300_000,
+        // Asked of the extension, because a wrapped call has to build before it can
+        // run and the direct budget cannot cover that.
+        timeout_ms: controller_timeout_ms(extension),
         idempotency_key: execution_key(request, previous),
         purpose: format!(
             "Run workenv adapter {} {}.",
@@ -163,13 +165,34 @@ fn invoke_target(
         let previous = json!(pending.response);
         let output =
             invoke_controller_with_previous(runtime, transport, &pending.request, Some(&previous))?;
+        let output = validate_transport_output(transport, &pending.request, output)?;
         return transport_response(&output, request, &pending.request);
     }
     let input = transport_input(extension, request)?;
     let fresh = request.previous.is_some();
     let transport_request = request_for_transport(request, transport_id, input, fresh);
     let output = invoke_controller_with_previous(runtime, transport, &transport_request, None)?;
+    let output = validate_transport_output(transport, &transport_request, output)?;
     transport_response(&output, request, &transport_request)
+}
+
+/// Hold the transport's own `execute` answer to its declared output schema.
+///
+/// Only the inner response unwrapped from `stdout` was ever validated, so the
+/// transport's own contract -- `required: ["exit_code"]` on orchard's `execute`,
+/// for one -- was inert on this path. A transport answering without an exit code
+/// got as far as `transport_response`, which reads `exit_code` to decide success.
+fn validate_transport_output(
+    transport: &Extension,
+    transport_request: &AdapterRequest,
+    output: AdapterResponse,
+) -> Result<AdapterResponse> {
+    validate_response(
+        transport,
+        &transport_request.operation,
+        transport_request,
+        output,
+    )
 }
 
 fn invoke_local_target(
@@ -261,6 +284,10 @@ mod tests;
 #[cfg(test)]
 #[path = "adapter_remote_tests.rs"]
 mod remote_tests;
+
+#[cfg(test)]
+#[path = "adapter_transport_tests.rs"]
+mod transport_contract_tests;
 
 #[cfg(test)]
 #[path = "adapter_prepare_tests.rs"]

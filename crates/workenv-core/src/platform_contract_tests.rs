@@ -117,3 +117,53 @@ fn target_extension_uses_target_host_system() -> Result<()> {
     )?;
     Ok(())
 }
+
+#[test]
+fn a_stage_through_a_transport_keeps_the_direct_paths_time_budget() -> Result<()> {
+    // `transport_command` sent only argv and cwd, so the transport applied its own
+    // default timeout -- orchard's is 300_000 ms against the 900_000 ms this path
+    // budgets directly. The same command therefore got a third of the time purely
+    // for travelling through a transport, and a slow `devenv shell` inside a guest
+    // came back as the carrier having written nothing.
+    let root = tempfile::tempdir()?;
+    let executor = std::sync::Arc::new(MockExecutor::default());
+    {
+        let mut responses = executor.responses.lock().map_err(lock_error)?;
+        for _ in 0..6 {
+            responses.push(transport_response("apply-1"));
+        }
+    }
+    let controller = Controller::with_executor(
+        root.path().to_path_buf(),
+        target_manifest(),
+        executor.clone(),
+    )?;
+    // The stage may or may not run to completion with these canned answers; what
+    // matters is the transport input of whichever stage calls first.
+    let _ = controller.environment("apply", "dev", Some("apply-1"));
+    let calls = executor.calls.lock().map_err(lock_error)?;
+    let mut budgets = Vec::new();
+    for call in calls.iter() {
+        let Some(stdin) = call.stdin.as_ref() else {
+            continue;
+        };
+        let Ok(request) = serde_json::from_slice::<workenv_protocol::AdapterRequest>(stdin) else {
+            continue;
+        };
+        if request.operation == "execute" && request.input.get("argv").is_some() {
+            budgets.push(request.input["timeout_ms"].clone());
+        }
+    }
+    assert!(
+        !budgets.is_empty(),
+        "no transport execute call was made, so nothing was asserted"
+    );
+    for budget in budgets {
+        assert_eq!(
+            budget,
+            json!(900_000),
+            "a stage reached the transport without this path's time budget"
+        );
+    }
+    Ok(())
+}

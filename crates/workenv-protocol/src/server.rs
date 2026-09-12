@@ -36,7 +36,11 @@ pub fn respond(
     let response = handler(&request).unwrap_or_else(|error| {
         let mut response =
             AdapterResponse::new(&request, ResponseStatus::Failed, serde_json::Value::Null);
-        response.error = Some(error.to_string());
+        // `{error:#}` rather than `to_string()`: anyhow's Display prints only the
+        // outermost layer, so "reading workers: requesting http://..." arrived with
+        // the `Connection refused` underneath it dropped, and DNS, TLS and timeout
+        // failures all printed identically.
+        response.error = Some(format!("{error:#}"));
         response
     });
     Ok(response)

@@ -10,18 +10,22 @@ use workenv_protocol::{Operation, PROTOCOL_VERSION, ResponseStatus};
 
 use super::*;
 
-enum MockExecution {
-    TransportPending(Value, String),
-    TransportTarget(AdapterResponse),
+// Named without a shared prefix: clippy rejects one, and these are three kinds
+// of transport answer rather than three transports.
+pub(super) enum MockExecution {
+    Pending(Value, String),
+    Target(AdapterResponse),
+    /// Exactly this `data`, so a test can answer off-contract on purpose.
+    Raw(Value, Option<String>),
 }
 
-struct MockExecutor {
+pub(super) struct MockExecutor {
     outputs: Mutex<VecDeque<MockExecution>>,
     requests: Mutex<Vec<AdapterRequest>>,
 }
 
 impl MockExecutor {
-    fn new(outputs: Vec<MockExecution>) -> Self {
+    pub(super) fn new(outputs: Vec<MockExecution>) -> Self {
         Self {
             outputs: Mutex::new(outputs.into()),
             requests: Mutex::new(Vec::new()),
@@ -44,7 +48,7 @@ impl Executor for MockExecutor {
             .pop_front()
             .context("missing mock output")?;
         match output {
-            MockExecution::TransportPending(data, execution_id) => output_for(&AdapterResponse {
+            MockExecution::Pending(data, execution_id) => output_for(&AdapterResponse {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: request.request_id,
                 status: ResponseStatus::Pending,
@@ -52,7 +56,15 @@ impl Executor for MockExecutor {
                 error: None,
                 execution_id: Some(execution_id),
             }),
-            MockExecution::TransportTarget(target) => transport_output(&request, &target),
+            MockExecution::Target(target) => transport_output(&request, &target),
+            MockExecution::Raw(data, error) => output_for(&AdapterResponse {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: request.request_id,
+                status: ResponseStatus::Changed,
+                data,
+                error,
+                execution_id: None,
+            }),
         }
     }
 }
@@ -60,11 +72,8 @@ impl Executor for MockExecutor {
 #[test]
 fn transport_pending_retry_reuses_exact_transport_request_payload() -> Result<()> {
     let executor = MockExecutor::new(vec![
-        MockExecution::TransportPending(
-            json!({"remote": "running"}),
-            "transport-exec-1".to_owned(),
-        ),
-        MockExecution::TransportTarget(target_response("remote-1", ResponseStatus::Changed)),
+        MockExecution::Pending(json!({"remote": "running"}), "transport-exec-1".to_owned()),
+        MockExecution::Target(target_response("remote-1", ResponseStatus::Changed)),
     ]);
     let mut call = invocation("remote-1");
     let first = invoke(Path::new("/tmp"), &manifest(), &executor, &call)?;
@@ -82,8 +91,8 @@ fn transport_pending_retry_reuses_exact_transport_request_payload() -> Result<()
 #[test]
 fn inner_target_pending_retry_uses_fresh_transport_id_and_stable_target_id() -> Result<()> {
     let executor = MockExecutor::new(vec![
-        MockExecution::TransportTarget(target_response("remote-2", ResponseStatus::Pending)),
-        MockExecution::TransportTarget(target_response("remote-2", ResponseStatus::Changed)),
+        MockExecution::Target(target_response("remote-2", ResponseStatus::Pending)),
+        MockExecution::Target(target_response("remote-2", ResponseStatus::Changed)),
     ]);
     let mut call = invocation("remote-2");
     let first = invoke(Path::new("/tmp"), &manifest(), &executor, &call)?;
@@ -152,7 +161,7 @@ fn target_response(request_id: &str, status: ResponseStatus) -> AdapterResponse 
     }
 }
 
-fn manifest() -> Manifest {
+pub(super) fn manifest() -> Manifest {
     Manifest {
         schema_version: PROTOCOL_VERSION,
         hosts: [("remote".to_owned(), host())].into(),
@@ -215,7 +224,7 @@ fn extension(operation: &str, location: Location, internal: bool) -> Extension {
     }
 }
 
-fn invocation(key: &str) -> Invocation<'static> {
+pub(super) fn invocation(key: &str) -> Invocation<'static> {
     Invocation {
         extension_id: "adapter",
         operation: "status",

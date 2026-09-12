@@ -120,3 +120,30 @@ fn handler_failure_is_bound_to_the_original_request() -> Result<()> {
     assert!(!response.complete());
     Ok(())
 }
+
+#[test]
+fn a_failing_handler_reports_the_whole_error_chain() -> Result<()> {
+    // anyhow's Display shows only the outermost layer, so `error.to_string()` threw
+    // away every cause: an unreachable controller reported "reading workers:
+    // requesting http://127.0.0.1:6120/v1/workers" with the `Connection refused`
+    // underneath it dropped, and DNS, TLS and timeout failures read identically.
+    let request: AdapterRequest = serde_json::from_value(request())?;
+    let input = serde_json::to_vec(&request)?;
+    let response = workenv_protocol::respond(&input, |_request| {
+        Err(anyhow::anyhow!("connection refused")
+            .context("requesting /v1/workers")
+            .context("reading workers"))
+    })?;
+    let error = response
+        .error
+        .ok_or_else(|| anyhow::anyhow!("a failed handler reported no error"))?;
+    assert!(
+        error.contains("reading workers"),
+        "outer layer lost: {error}"
+    );
+    assert!(
+        error.contains("connection refused"),
+        "the root cause is still being dropped: {error}"
+    );
+    Ok(())
+}
