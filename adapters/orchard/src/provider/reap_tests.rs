@@ -103,3 +103,40 @@ fn a_dry_run_reports_without_removing() {
     assert_eq!(data["reaped"], json!(["wkv-old"]));
     assert!(removed.is_empty(), "a dry run must not remove anything");
 }
+
+#[test]
+fn the_lease_boundary_reaps_rather_than_keeps() {
+    // The direction of this comparison is covered above; the boundary itself was
+    // not, so `<` could become `<=` unnoticed. That is not cosmetic: a lease is a
+    // promise the guest is gone once it elapses, and `<=` keeps a guest that has
+    // exactly reached it, so a slot held at the boundary never frees on the sweep
+    // that was supposed to free it.
+    //
+    // `aged` builds `createdAt` from the clock, so by the time reap reads it the
+    // guest is a shade older than asked for -- which is what makes "exactly at the
+    // lease" testable at all from outside.
+    let (status, data, removed) = reap(
+        json!({"lease_seconds": 600, "name_prefix": "wkv-"}),
+        vec![aged("wkv-exactly-due", 600)],
+    );
+    assert_eq!(status, ResponseStatus::Changed);
+    assert_eq!(
+        data["reaped"],
+        json!(["wkv-exactly-due"]),
+        "a guest that has reached its lease was kept instead of reaped"
+    );
+    assert_eq!(removed, vec!["wkv-exactly-due".to_owned()]);
+}
+
+#[test]
+fn one_second_short_of_the_lease_is_still_kept() {
+    // The paired control, so the test above cannot be satisfied by a sweep that
+    // simply reaps everything.
+    let (status, data, removed) = reap(
+        json!({"lease_seconds": 600, "name_prefix": "wkv-"}),
+        vec![aged("wkv-nearly-due", 598)],
+    );
+    assert_eq!(status, ResponseStatus::Ready);
+    assert_eq!(data["kept"], json!(["wkv-nearly-due"]));
+    assert!(removed.is_empty(), "reaped a guest still inside its lease");
+}

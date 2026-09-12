@@ -173,10 +173,26 @@ pub(super) fn run(
                     request,
                     ResponseStatus::Failed,
                     json!({}),
-                    Some(&error.to_string()),
+                    Some(&format!("{error:#}")),
                 );
             }
         };
+        // APoC has not seen this command finish, so the outcome is unknown rather
+        // than failed. Reporting Failed here closed the receipt while the work was
+        // still running inside the guest: the reader was sent to the tunnel with
+        // "guest did not return a transport result", and the next attempt ran the
+        // command a second time. A slow `devenv shell` in a fresh guest reaches
+        // this every time.
+        if output.exit_code.is_none() {
+            let mut pending = response(
+                request,
+                ResponseStatus::Pending,
+                json!({"guest": guest, "kind": "guest_command"}),
+                Some("the guest command has not finished; observe the execution to resume"),
+            );
+            pending.execution_id = Some(output.execution_id.clone());
+            return pending;
+        }
         let interpreted = interpret(&output.stdout);
         // `orchard ssh` sets up a port-forward before running anything, and that
         // setup intermittently fails with a WebSocket 500. The command provably

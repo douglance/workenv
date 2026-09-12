@@ -141,7 +141,7 @@ fn await_running<C: Cluster>(
         // Reporting "still pending" would hide that entirely.
         let guest = cluster
             .guest(name)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("{error:#}"))?
             .ok_or_else(|| format!("guest {name} disappeared while starting"))?;
         match status_of(&guest).as_str() {
             "running" => return Ok(Created::Running(guest)),

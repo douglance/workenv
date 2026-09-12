@@ -58,7 +58,7 @@ pub(super) enum Destroyed {
 
 /// Remove the named guest.
 pub(super) fn run<C: Cluster>(cluster: &C, name: &str) -> Result<Destroyed, String> {
-    match cluster.remove(name).map_err(|error| error.to_string())? {
+    match cluster.remove(name).map_err(|error| format!("{error:#}"))? {
         Removal::Removed => Ok(Destroyed::Removed),
         Removal::Absent => Ok(Destroyed::AlreadyGone),
     }

@@ -64,7 +64,12 @@ impl FakeCluster {
 impl Cluster for FakeCluster {
     fn collection(&self, name: &str) -> Result<Vec<Value>> {
         if self.fails(name) {
-            return Err(anyhow!("controller unreachable"));
+            // Layered on purpose. A single-layer error cannot tell whether the
+            // adapter prints the whole chain or only its outermost line, and
+            // `{error}` silently drops everything below the top.
+            return Err(anyhow!("connection refused")
+                .context("dialling http://127.0.0.1:6120")
+                .context("controller unreachable"));
         }
         Ok(self.collections.get(name).cloned().unwrap_or_default())
     }

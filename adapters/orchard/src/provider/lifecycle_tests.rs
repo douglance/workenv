@@ -70,6 +70,60 @@ fn a_guest_that_vanishes_while_starting_fails_rather_than_pending() {
     assert!(response.error.unwrap_or_default().contains("disappeared"));
 }
 
+/// The exact condition `Environment::destroy` gates on, asserted against the
+/// real create response.
+///
+/// Spelled out here rather than as a field check so it cannot drift from
+/// `workenv-core/src/environment.rs:114`. Both halves of that gate were
+/// unsatisfiable for Orchard: `inventory::guest` emits neither field, so every
+/// `environment down` on an Orchard guest bailed "was adopted or has no verified
+/// owned resource", and the integration cleanup behind that gate never ran.
+fn destroy_gate_would_accept(data: &serde_json::Value) -> bool {
+    !(data["owned"] != json!(true) || data["resource_id"].as_str().is_none())
+}
+
+#[test]
+fn a_created_guest_can_actually_be_torn_down() {
+    let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
+    let response = handle_with(&request("create"), &cluster);
+    assert_eq!(response.status, ResponseStatus::Changed);
+    assert!(
+        destroy_gate_would_accept(&response.data),
+        "create receipt is rejected by the destroy ownership gate: {}",
+        response.data
+    );
+    assert_eq!(response.data["resource_id"], json!("env"));
+}
+
+#[test]
+fn a_second_up_still_leaves_a_tearable_down() {
+    // The already-running outcome is the one that matters most: it is what every
+    // `up` after the first reports, and reporting `owned: false` here would keep
+    // teardown impossible for exactly that case.
+    let cluster = FakeCluster::new().guests(vec![Some(running("env"))]);
+    let response = handle_with(&request("create"), &cluster);
+    assert_eq!(response.status, ResponseStatus::Ready);
+    assert!(
+        destroy_gate_would_accept(&response.data),
+        "an already-running guest cannot be torn down: {}",
+        response.data
+    );
+}
+
+#[test]
+fn a_create_that_times_out_is_still_tearable() {
+    // A timed-out create may well have left a guest running, so the pending
+    // receipt has to carry ownership too or the leak is unreachable.
+    let cluster = FakeCluster::new().guests(vec![Some(pending("env"))]);
+    let response = handle_with(&request("create"), &cluster);
+    assert_eq!(response.status, ResponseStatus::Pending);
+    assert!(
+        destroy_gate_would_accept(&response.data),
+        "a pending create leaves an unreachable guest: {}",
+        response.data
+    );
+}
+
 #[test]
 fn destroy_removes_and_reports_changed() {
     let cluster = FakeCluster::new();
@@ -151,5 +205,25 @@ fn create_declares_the_worker_slot_it_consumes() {
     assert_eq!(
         cluster.created.borrow()[0]["resources"]["org.cirruslabs.tart-vms"],
         json!(1)
+    );
+}
+
+#[test]
+fn an_unreachable_controller_reports_the_whole_cause_chain() {
+    // `{error}` on an anyhow error prints only its outermost layer, so an
+    // unreachable controller reported "reading workers: controller unreachable"
+    // and dropped the `connection refused` underneath -- leaving refusal, DNS,
+    // TLS and timeout failures indistinguishable in the one place a reader looks.
+    let cluster = FakeCluster::new().failing("workers");
+    let response = handle_with(&request("inventory"), &cluster);
+    assert_eq!(response.status, ResponseStatus::Failed);
+    let error = response.error.unwrap_or_default();
+    assert!(
+        error.contains("reading workers"),
+        "lost the outer context: {error}"
+    );
+    assert!(
+        error.contains("connection refused"),
+        "the root cause is still being dropped: {error}"
     );
 }

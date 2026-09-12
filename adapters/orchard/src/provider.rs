@@ -5,6 +5,12 @@ mod access;
 mod access_tests;
 mod carrier;
 mod client;
+#[cfg(test)]
+// Test-only, and only these: a fixture that cannot unwrap says less than one that
+// panics loudly when the fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "provider/client_tests.rs"]
+mod client_tests;
 mod create;
 mod credentials;
 #[cfg(test)]
@@ -18,6 +24,11 @@ mod execute;
 #[cfg(test)]
 // Test-only, and only these: a transport test that cannot unwrap its own
 // fixtures says less than one that panics loudly when a fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "provider/execute_budget_tests.rs"]
+mod execute_budget_tests;
+#[cfg(test)]
+// Same reasoning as its sibling above.
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[path = "provider/execute_tests.rs"]
 mod execute_tests;
@@ -56,7 +67,7 @@ pub(crate) fn handle(request: &AdapterRequest) -> AdapterResponse {
     let base = controller_url(request);
     match HttpCluster::new(base) {
         Ok(cluster) => handle_with(request, &cluster),
-        Err(error) => failed(request, &error.to_string()),
+        Err(error) => failed(request, &format!("{error:#}")),
     }
 }
 
@@ -191,13 +202,30 @@ fn sweep<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
     }
 }
 
-/// Shape one guest for a receipt, always carrying the name teardown needs.
+/// Shape one guest for a receipt, always carrying what teardown needs.
+///
+/// `owned` and `resource_id` are what `Environment::destroy` actually gates on
+/// (`workenv-core/src/environment.rs:114`): a receipt without both makes it bail
+/// `environment <name> was adopted or has no verified owned resource`. Neither
+/// field was set here, so `environment down` could never tear down an Orchard
+/// guest and the integration cleanup behind that gate never ran either.
+///
+/// `owned` is true for every create outcome, including an already-running guest.
+/// Orchard has no adoption flag the way Lima does, and the guest is named after
+/// the environment, so a guest under that name is this environment's own -- from
+/// an earlier `up`, in the ordinary case. Reporting `owned: false` for the
+/// already-running outcome would leave exactly the original bug in place for the
+/// second and every later `up`. The cost of this choice is that a foreign guest
+/// colliding on the environment's name is treated as this environment's, which
+/// is already how `create` treats it before reaching here.
 fn guest_data(name: &str, guest: &Value) -> Value {
     let mut data = inventory::guest(guest);
     if let Some(object) = data.as_object_mut() {
         // The controller may answer a create with an empty echo; the name is the
         // one field teardown cannot do without, so it is set from the request.
         object.insert("name".into(), json!(name));
+        object.insert("owned".into(), json!(true));
+        object.insert("resource_id".into(), json!(name));
     }
     data
 }
@@ -210,11 +238,15 @@ fn guest_data(name: &str, guest: &Value) -> Value {
 fn report<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
     let workers = match cluster.collection("workers") {
         Ok(workers) => workers,
-        Err(error) => return failed(request, &format!("reading workers: {error}")),
+        // `{error:#}`, not `{error}`: anyhow's Display prints only the outermost
+        // layer, so an unreachable controller reported "reading workers: requesting
+        // http://127.0.0.1:6120/v1/workers" and dropped the `Connection refused`
+        // underneath it -- leaving DNS, TLS, timeout and refusal indistinguishable.
+        Err(error) => return failed(request, &format!("reading workers: {error:#}")),
     };
     let guests = match cluster.collection("vms") {
         Ok(guests) => guests,
-        Err(error) => return failed(request, &format!("reading vms: {error}")),
+        Err(error) => return failed(request, &format!("reading vms: {error:#}")),
     };
     let data = json!({
         "workers": workers.iter().map(inventory::worker).collect::<Vec<_>>(),

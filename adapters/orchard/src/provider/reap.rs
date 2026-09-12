@@ -36,7 +36,7 @@ pub(super) fn run<C: Cluster>(
 ) -> Result<Swept, String> {
     let guests = cluster
         .collection("vms")
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("{error:#}"))?;
     let mut swept = Swept {
         reaped: Vec::new(),
         kept: Vec::new(),
@@ -70,7 +70,7 @@ pub(super) fn run<C: Cluster>(
             Ok(Removal::Removed | Removal::Absent) => swept.reaped.push(candidate.name),
             Err(error) => swept
                 .skipped
-                .push(json!({"name": candidate.name, "reason": error.to_string()})),
+                .push(json!({"name": candidate.name, "reason": format!("{error:#}")})),
         }
     }
     Ok(swept)

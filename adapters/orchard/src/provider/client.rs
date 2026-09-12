@@ -12,6 +12,24 @@ use std::time::Duration;
 /// Seconds allowed for a single controller request.
 const TIMEOUT_SECS: u64 = 15;
 
+/// Extra attempts allowed for a read that timed out.
+///
+/// Measured on this fleet: the first request to an idle controller exceeds the
+/// 15 s budget, and the immediately following one answers instantly -- `orchard
+/// list workers` timed out once and then returned in under a second, and a live
+/// `inventory` through the CLI failed with "error sending request for url ...
+/// operation timed out" against the loopback controller, on a controller that was
+/// up and healthy. With one attempt and no retry, every first observation after an
+/// idle period failed.
+///
+/// Reads only. A GET has no side effect, so repeating it cannot do anything
+/// twice; `create` and `remove` are deliberately left alone, because a POST or
+/// DELETE that timed out may well have been applied, and retrying it is how a
+/// guest gets created or destroyed twice. That is the same rule
+/// `provider/execute.rs` follows when it retries only a carrier that provably
+/// never started.
+const READ_RETRIES: u32 = 2;
+
 /// What a delete found when it ran.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Removal {
@@ -56,20 +74,44 @@ impl HttpCluster {
             credentials: super::credentials::load(),
         })
     }
+
+    /// One GET, retried while it is still only a timeout.
+    ///
+    /// Retried on a timeout and on nothing else: a 404, a 401 or a malformed body
+    /// is an answer, and repeating the request cannot improve it.
+    fn read(&self, url: &str) -> Result<(u16, String)> {
+        with_read_retries(|| send(self.authed(self.client.get(url)), url))
+    }
+}
+
+/// Run one read, repeating it only while it is still nothing but a timeout.
+///
+/// Taking the attempt as a closure keeps this testable without a socket: driving it
+/// through real HTTP would cost `TIMEOUT_SECS` per attempt, so the retry would have
+/// gone untested, which is how a retry that silently never fires happens.
+pub(super) fn with_read_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut tries = 0;
+    loop {
+        match attempt() {
+            Ok(answer) => return Ok(answer),
+            Err(error) if tries < READ_RETRIES && timed_out(&error) => tries += 1,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether this failure is a timeout rather than an answer.
+fn timed_out(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("operation timed out"))
 }
 
 impl Cluster for HttpCluster {
     fn collection(&self, name: &str) -> Result<Vec<Value>> {
         let url = format!("{}/v1/{name}", self.base.trim_end_matches('/'));
-        let response = self
-            .authed(self.client.get(&url))
-            .send()
-            .with_context(|| format!("requesting {url}"))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .with_context(|| format!("reading the response body from {url}"))?;
-        if !status.is_success() {
+        let (status, body) = self.read(&url)?;
+        if !(200..300).contains(&status) {
             anyhow::bail!("{url} answered {status}: {}", body.trim());
         }
         // An empty cluster answers `null`, not `[]`. Treating that as an error
@@ -86,7 +128,7 @@ impl Cluster for HttpCluster {
 
     fn guest(&self, name: &str) -> Result<Option<Value>> {
         let url = self.url(&format!("vms/{name}"));
-        let (status, body) = send(self.authed(self.client.get(&url)), &url)?;
+        let (status, body) = self.read(&url)?;
         if status == 404 {
             return Ok(None);
         }
