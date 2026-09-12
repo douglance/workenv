@@ -10,6 +10,13 @@ mod dispatch;
 mod environment;
 mod environment_cleanup;
 mod environment_lifecycle;
+mod manifest_cache;
+#[cfg(test)]
+// Test-only, and only these: a cache test that cannot unwrap its own temporary
+// tree says less than one that panics loudly when the fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "manifest_cache_tests.rs"]
+mod manifest_cache_tests;
 mod outcome;
 mod readiness;
 mod receipts;
