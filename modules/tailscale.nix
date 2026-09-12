@@ -102,6 +102,7 @@ in
         location = "target";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
         runtime_inputs = [
+          "apoc"
           "tailscale"
           "ssh"
           "sh"

@@ -97,6 +97,25 @@ assert extension.operations.destroy.input_schema.additionalProperties == false;
 # reap must not be callable without stating which guests it owns.
 assert lib.elem "name_prefix" extension.operations.reap.input_schema.required;
 assert lib.elem "lease_seconds" extension.operations.reap.input_schema.required;
+# Required is only half the guard, and the half that was asserted. `name_prefix`
+# is what scopes the sweep -- `name.starts_with("")` is true of every guest in the
+# cluster -- so an empty string passes "required" while meaning "delete
+# everything". Measured: setting minLength to 0 left every suite green, which made
+# the module comment about refusing that call a claim with nothing behind it.
+assert extension.operations.reap.input_schema.properties.name_prefix.minLength == 1;
+# The guest minima. Lima's `lease_seconds.minimum` is pinned in input-schemas.nix
+# and Orchard's were not, so a 1 MB guest or a zero-CPU guest validated.
+assert extension.operations.create.input_schema.properties.memory.minimum == 512;
+assert extension.operations.create.input_schema.properties.cpu.minimum == 1;
+assert extension.operations.create.input_schema.properties.disk_size.minimum == 1;
+assert extension.operations.create.input_schema.properties.lease_seconds.minimum == 60;
+# create must report ownership or `Environment::destroy` refuses to tear the guest
+# down at all (workenv-core/src/environment.rs:114). Stated on create only:
+# destroy's own answer has no owner to report, which is why one shared output
+# schema could not say it.
+assert lib.elem "owned" extension.operations.create.output_schema.required;
+assert lib.elem "resource_id" extension.operations.create.output_schema.required;
+assert !(lib.elem "owned" extension.operations.destroy.output_schema.required);
 assert extension.operations.reap.mutating;
 assert lib.elem "skipped" extension.operations.reap.output_schema.required;
 # Reaching a guest is an observation, and it must take no address: the whole

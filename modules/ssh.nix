@@ -43,7 +43,23 @@ let
           minimum = 1;
         };
       } [ "argv" ];
-      output_schema = output;
+      # `exit_code` is required because the caller's correctness depends on it:
+      # target.rs maps an absent exit code to Pending, so a transport answering
+      # without one silently turns a finished command into an unfinished one. The
+      # ssh adapter holds this by construction today, which is exactly why it was
+      # never stated -- and an unstated contract is the one a new transport
+      # breaks. workenv-core now validates a transport's own execute output, so
+      # this is enforced rather than documented.
+      output_schema = {
+        type = "object";
+        additionalProperties = true;
+        required = [ "exit_code" ];
+        properties = {
+          exit_code.type = "integer";
+          stdout.type = "string";
+          stderr.type = "string";
+        };
+      };
     };
   };
 in

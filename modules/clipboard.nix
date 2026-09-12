@@ -150,7 +150,7 @@ in
             executable = "${cfg.package}/bin/${cfg.binaryName}";
             location = "target";
             systems = [ "x86_64-linux" ];
-            runtime_inputs = [ ];
+            runtime_inputs = [ "apoc" ];
             operations = cfg.operations;
           };
         };

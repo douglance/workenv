@@ -155,7 +155,23 @@ let
       worker.type = "string";
       removed.type = "boolean";
       reason.type = "string";
+      owned.type = "boolean";
+      resource_id.type = "string";
     };
+  };
+  # create carries two fields destroy does not, for the same reason the inputs
+  # are split per operation: `Environment::destroy` bails unless the create
+  # receipt has `owned == true` and a string `resource_id`
+  # (workenv-core/src/environment.rs:114). Shared with destroy, this `required`
+  # could not be stated -- destroy's own answer has no owner to report -- and
+  # while it was unstated the adapter simply omitted both and teardown was
+  # impossible. Declared here, a regression fails before the receipt is written.
+  createOutput = guestOutput // {
+    required = [
+      "name"
+      "owned"
+      "resource_id"
+    ];
   };
   # name_prefix is REQUIRED, not defaulted. An omitted prefix would otherwise
   # mean "every guest in the cluster is mine to delete", so the schema refuses
@@ -288,7 +304,7 @@ let
       description = "Schedule one ephemeral guest for this environment.";
       mutating = true;
       input_schema = createInput;
-      output_schema = guestOutput;
+      output_schema = createOutput;
     };
     destroy = {
       description = "Remove this environment's guest from the cluster.";
@@ -376,6 +392,7 @@ in
         location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
         runtime_inputs = [
+          "apoc"
           "orchard"
           "ssh"
         ];

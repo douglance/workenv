@@ -67,7 +67,10 @@ in
         executable = "${cfg.package}/bin/${cfg.binaryName}";
         location = "target";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
-        runtime_inputs = [ "git" ];
+        runtime_inputs = [
+          "apoc"
+          "git"
+        ];
         operations = cfg.operations;
       };
     };

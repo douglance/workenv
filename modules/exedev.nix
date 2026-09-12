@@ -120,7 +120,10 @@ in
         executable = "${cfg.package}/bin/${cfg.binaryName}";
         location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
-        runtime_inputs = [ "ssh" ];
+        runtime_inputs = [
+          "apoc"
+          "ssh"
+        ];
         operations = cfg.operations;
       };
     };

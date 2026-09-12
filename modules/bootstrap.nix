@@ -73,9 +73,24 @@ in
         executable = "${cfg.package}/bin/${cfg.binaryName}";
         location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
+        # Measured against the adapter, not guessed. `nix` and `devenv` were
+        # declared here and are never executed on the controller: they appear only
+        # inside the script text sent to the target (src/scripts.rs), which sets
+        # its own PATH and installs nix itself when the version does not match.
+        #
+        # The cost was real, and measuring it needs the right PATH. `runs_unwrapped`
+        # resolves these names against the PATH of the *workenv process*, and
+        # workenv runs under apoc, whose child PATH carries no nix profile: `nix`
+        # resolves in an interactive shell and does NOT resolve there. So one
+        # undeclarable name made every bootstrap call take the devenv shell --
+        # about 100 s against 39 ms by this repo's own measurement in
+        # adapter_invocation.rs, and a 252 s instance observed in this tree. With
+        # `nix` gone, no module declares a name that fails to resolve under apoc.
+        #
+        # `apoc` replaces them because every shell-out in every adapter goes
+        # through `Command::new("apoc")` in workenv-platform/src/execution_code.rs.
         runtime_inputs = [
-          "devenv"
-          "nix"
+          "apoc"
           "ssh"
           "bash"
         ];
