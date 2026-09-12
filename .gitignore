@@ -1,4 +1,5 @@
 .state/
+.claude/
 artifacts/
 dist/
 .venv/
