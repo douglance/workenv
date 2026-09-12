@@ -596,6 +596,72 @@ acceptance" -- but `project.enable` appears only in
 never in `presets/personal.nix`. It should be wired into the shipped preset, not
 removed.
 
+## The desktop is supervised, and what that exposed
+
+Developed and verified inside a guest workenv created, reached through workenv's
+own transport. Every component is a systemd user unit; `--status` asks systemd by
+unit name rather than guessing with a `pgrep` pattern.
+
+Proven in the guest rather than asserted:
+
+| claim | evidence |
+|---|---|
+| components are supervised | `kill -9` on all six, all six back with new PIDs |
+| survives a reboot | rebooted: `up 0 minutes`, six active with **no re-run** |
+| re-run is idempotent | `all 15 packages already present` |
+| the desktop is live, not merely listening | counter advanced `3.000036 -> 3.000157` |
+
+Three bugs only a real guest surfaced:
+
+- **A sentinel guard skipped fourteen installs.** The whole apt step was behind
+  `if ! dpkg-query -W tigervnc-standalone-server` -- one package standing in for
+  fifteen. With tigervnc present from any other source, nothing else installed,
+  and the first symptom was `xterm` failing to exec minutes later in a log nobody
+  reads. Every package is checked now, and the set is re-asserted after install
+  because `apt-get` exits 0 when a package is held back.
+- **`nohup` was hiding a pre-existing bug.** The old script launched `xterm`
+  without installing it; `nohup ... &` swallows that silently. systemd reported it
+  immediately as `status=203/EXEC`. Supervision did not introduce the bug, it
+  revealed it.
+- **`$(seq 1 80)` expanded at write time.** The readiness probe was inline in a
+  unit written with an unquoted heredoc, so bash expanded it into an 80-line
+  `ExecStartPost` and systemd refused the unit with "bad unit file setting".
+  systemd performs no command substitution; the probe is a file now.
+
+## `orchard ssh` fails its own setup intermittently
+
+Measured while using the transport to do the work above: `orchard ssh` sets up a
+port-forward before running anything, and that setup answers
+
+```
+failed to setup port-forwarding to the VM "g": failed to WebSocket dial:
+expected handshake response status code 101 but got 500
+```
+
+transiently -- six consecutive attempts succeeded straight afterwards. This is
+the same gRPC path that makes `orchard port-forward` useless (see above), so the
+transport treats it as a retryable condition rather than a result.
+
+A retry is only safe because the failure provably happened **before** the command
+ran: stdout must be empty, since any output at all means the wrapper started and
+the command may have run. Each attempt also takes its own idempotency key,
+because APoC returns the original receipt for a repeated key -- a retry sharing
+the first key would replay that first failure forever.
+
+## Two false alarms, for the record
+
+Both looked like serious defects and were not. Recorded because the *reasoning*
+is reusable, and because each nearly became a wrong fix.
+
+- **"The transport corrupted two bytes."** A 13,587-byte script arrived as
+  13,589. The sha256 matched exactly on both sides: Python's `len()` counts
+  characters and `wc -c` counts bytes, and the script holds two non-ASCII
+  characters. The measurement was wrong, not the transport.
+- **"The controller accepts admin:admin."** `orchard ssh` prints "no credentials
+  specified or found, trying default admin:admin credentials..." and then
+  succeeds. Tested directly, `admin:admin` answers **401** -- the CLI message is
+  emitted before it reads its context, and the credential is genuinely rejected.
+
 ## Traps this encodes
 
 Each of these cost real time to find; the scripts handle them so you don't rediscover them.
