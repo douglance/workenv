@@ -184,15 +184,39 @@ while [ "$#" -gt 0 ]; do if [ "$1" = --profile ]; then profile=$2; mkdir -p "$pr
     // and reading its log failed with ENOENT. It passed here only because this
     // machine's devenv (2.2.2) is older than the pin (2.3). `fake_bin` holds only
     // `sudo` and `nix`, so `devenv` does not resolve and the gate always opens.
-    let status = Command::new("bash")
+    // `output`, not `status`: this assertion used to fail with a bare
+    // "No such file or directory (os error 2)" from reading the stub's log, which
+    // says nothing about why the script never invoked the stub. On a runner that was
+    // the only evidence available, and it cost two wrong diagnoses.
+    let run = Command::new("bash")
         .arg("-c")
         .arg(script)
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-        .status()?;
+        // The script sources /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+        // when it is readable, and that prepends $HOME/.nix-profile/bin -- where a
+        // runner keeps devenv -- ahead of the stub directory, so the version gate
+        // closes and the install block never runs. nix-daemon.sh returns immediately
+        // when this variable is set, which is its own documented guard. It happens to
+        // be set in an interactive shell, which is the second reason this test passed
+        // here and not on a runner; setting it explicitly stops that being luck.
+        .env("__ETC_PROFILE_NIX_SOURCED", "1")
+        .output()?;
 
     fs::set_permissions(&prefix_parent, Permissions::from_mode(0o755))?;
-    assert!(status.success());
-    assert!(fs::read_to_string(nix_log)?.starts_with(&path_arg(&fake_bin.join("nix"))?));
+    let context = format!(
+        "exit={:?}\nstdout:\n{}\nstderr:\n{}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.status.success(), "install script failed\n{context}");
+    let logged = fs::read_to_string(&nix_log).unwrap_or_else(|error| {
+        panic!("the stub nix was never invoked ({error})\n{context}");
+    });
+    assert!(
+        logged.starts_with(&path_arg(&fake_bin.join("nix"))?),
+        "the nix that ran was not the stub: {logged}\n{context}"
+    );
     fs::remove_dir_all(root)?;
     Ok(())
 }
