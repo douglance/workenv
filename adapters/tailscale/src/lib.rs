@@ -144,55 +144,54 @@ fn command_json<const N: usize>(
     Ok(CommandJson::Ready(output_json(&output)?))
 }
 
+/// One refusal, carrying whatever the branch already recorded.
+///
+/// Extracted because five branches repeated the same four lines, which put
+/// `evaluate` over this repository's 60-line block limit and buried the actual
+/// decision in each arm under boilerplate.
+fn refused(mut data: Map<String, Value>, status: &str) -> Report {
+    data.insert("status".to_string(), json!(status));
+    Report {
+        status: ResponseStatus::Failed,
+        data,
+    }
+}
+
 fn evaluate(request: &AdapterRequest, status: &Value, prefs: Option<&Value>) -> Report {
     let mut data = Map::new();
     data.insert("tailscale".to_string(), status.clone());
     if let Some(prefs) = prefs {
         data.insert("prefs".to_string(), prefs.clone());
     }
-    let expected_dns = expected_dns(request);
     let dns = dns_name(status);
     let tailnet = tailnet(status);
     let device_id = device_id(status);
     let required_tag =
         optional_string(&request.config, "tag").unwrap_or_else(|| "tag:workenv".to_string());
     if status.get("BackendState") != Some(&json!("Running")) {
-        data.insert("status".to_string(), json!("tailscale_not_ready"));
-        return Report {
-            status: ResponseStatus::Failed,
-            data,
-        };
+        return refused(data, "tailscale_not_ready");
     }
-    if dns != expected_dns || Some(tailnet.as_str()) != expected_tailnet(request).as_deref() {
-        data.insert("status".to_string(), json!("tailscale_mismatch"));
+    // Without a configured suffix there is nothing to compare the node against,
+    // and calling that a mismatch sent the operator to mint an auth key for a
+    // node that was already enrolled and healthy.
+    let Some(expected_tailnet) = expected_tailnet(request) else {
+        data.insert("dns_name".to_string(), json!(dns));
+        data.insert("tailnet".to_string(), json!(tailnet));
+        return refused(data, "tailscale_tailnet_suffix_not_configured");
+    };
+    let expected_dns = format!("{}.{}", request.target.host, expected_tailnet);
+    if dns != expected_dns || tailnet != expected_tailnet {
         data.insert("dns_name".to_string(), json!(dns));
         data.insert("expected_dns".to_string(), json!(expected_dns));
         data.insert("tailnet".to_string(), json!(tailnet));
-        return Report {
-            status: ResponseStatus::Failed,
-            data,
-        };
+        return refused(data, "tailscale_mismatch");
     }
     if !tags(status).iter().any(|tag| tag == &required_tag) {
-        data.insert(
-            "status".to_string(),
-            json!("tailscale_configuration_blocked"),
-        );
         data.insert("required_tag".to_string(), json!(required_tag));
-        return Report {
-            status: ResponseStatus::Failed,
-            data,
-        };
+        return refused(data, "tailscale_configuration_blocked");
     }
     if !prefs_ready(prefs) {
-        data.insert(
-            "status".to_string(),
-            json!("tailscale_configuration_blocked"),
-        );
-        return Report {
-            status: ResponseStatus::Failed,
-            data,
-        };
+        return refused(data, "tailscale_configuration_blocked");
     }
     status::ready(data, device_id, &dns, &tailnet)
 }
@@ -201,14 +200,6 @@ fn prefs_ready(prefs: Option<&Value>) -> bool {
     prefs.is_some_and(|prefs| {
         prefs.get("WantRunning") == Some(&json!(true)) && prefs.get("RunSSH") == Some(&json!(true))
     })
-}
-
-fn expected_dns(request: &AdapterRequest) -> String {
-    format!(
-        "{}.{}",
-        request.target.host,
-        expected_tailnet(request).unwrap_or_default()
-    )
 }
 
 fn expected_tailnet(request: &AdapterRequest) -> Option<String> {

@@ -95,6 +95,56 @@ fn enroll_propagates_pending_execution() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn inspect_reports_an_unconfigured_tailnet_suffix_rather_than_a_mismatch() -> Result<()> {
+    // presets/personal.nix declares `{ extension = "workenv.tailscale"; }` with
+    // no config at all. While the suffix was compared as `Some(..) != None` the
+    // readiness test could never be satisfied on that configuration, whatever
+    // the node's real state, and the operator was told to enrol a healthy node.
+    let mut request = request("inspect");
+    request.config = json!({});
+    let runner = Outputs::new(vec![
+        ready_status(),
+        json!({"WantRunning":true,"RunSSH":true}),
+    ]);
+    let result = handle_with(&request, &runner)?;
+    assert_eq!(result.status, ResponseStatus::Failed);
+    assert_eq!(
+        result.data["status"],
+        "tailscale_tailnet_suffix_not_configured"
+    );
+    assert!(result.data.get("expected_dns").is_none());
+    Ok(())
+}
+
+#[test]
+fn inspect_is_ready_when_the_configured_suffix_matches_the_node() -> Result<()> {
+    let runner = Outputs::new(vec![
+        ready_status(),
+        json!({"WantRunning":true,"RunSSH":true}),
+    ]);
+    let result = handle_with(&request("inspect"), &runner)?;
+    assert_eq!(result.status, ResponseStatus::Ready);
+    assert_eq!(result.data["status"], "tailscale_ready");
+    assert_eq!(result.data["tailnet"], "tail.example.ts.net");
+    Ok(())
+}
+
+#[test]
+fn inspect_reports_a_mismatch_against_the_configured_suffix() -> Result<()> {
+    let mut request = request("inspect");
+    request.config["tailnet_suffix"] = json!("other.ts.net");
+    let runner = Outputs::new(vec![
+        ready_status(),
+        json!({"WantRunning":true,"RunSSH":true}),
+    ]);
+    let result = handle_with(&request, &runner)?;
+    assert_eq!(result.status, ResponseStatus::Failed);
+    assert_eq!(result.data["status"], "tailscale_mismatch");
+    assert_eq!(result.data["expected_dns"], "workenv-01.other.ts.net");
+    Ok(())
+}
+
 fn ready_status() -> Value {
     json!({
         "BackendState":"Running",

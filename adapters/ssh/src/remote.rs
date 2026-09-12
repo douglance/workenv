@@ -48,7 +48,7 @@ fn execute_remote_with(
     local_cwd: &Path,
 ) -> Result<ExecuteResult> {
     let id = start_remote(input, executor, local_cwd)?;
-    let Some(waited) = wait_remote(input, executor, local_cwd, &id) else {
+    let Some(waited) = wait_remote(input, executor, local_cwd, &id)? else {
         return Ok(pending(id));
     };
     if outcome(&waited).is_none() {
@@ -84,9 +84,12 @@ fn wait_remote(
     executor: &dyn Executor,
     local_cwd: &Path,
     id: &str,
-) -> Option<Value> {
+) -> Result<Option<Value>> {
     let wait_argv = wait_argv(id, input.purpose, remote_wait_timeout(input.timeout));
-    let Ok(waited) = remote_json(
+    // A transport failure is not a pending observation: reporting one hides the
+    // ssh stderr and makes every retry take this same path forever. Only the
+    // daemon's own waiting states below mean "ask again later".
+    let waited = remote_json(
         RemoteCommand {
             address: input.address,
             remote: &wait_argv,
@@ -98,13 +101,11 @@ fn wait_remote(
         },
         executor,
         local_cwd,
-    ) else {
-        return None;
-    };
+    )?;
     if observation_waits(&waited) {
-        return None;
+        return Ok(None);
     }
-    Some(waited)
+    Ok(Some(waited))
 }
 
 fn completed_result(

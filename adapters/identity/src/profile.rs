@@ -9,7 +9,7 @@ use crate::profile_files::{
     Spec, envrc, existing_digest, explicit_replacement, gitconfig, managed_dirs, private_dir,
     profile_json, profile_root, reject_inside_workenv, runtime_json, spec, wrangler, write_file,
 };
-use crate::profile_response::response;
+use crate::profile_response::{excerpt, response};
 
 pub fn apply(request: &AdapterRequest) -> Result<AdapterResponse> {
     let spec = spec(request)?;
@@ -102,10 +102,25 @@ fn github_status(request: &AdapterRequest, runner: &impl Executor, spec: &Spec) 
         timeout_ms: 30_000,
     })?;
     let actual = output.stdout.trim().to_string();
-    let matches = output.exit_code == Some(0) && actual.eq_ignore_ascii_case(expected);
-    Ok(
-        json!({"expected":expected,"actual":actual,"matches":matches,"reason":if matches {"matched"} else {"identity_mismatch"}}),
-    )
+    // A probe that never spoke for the node's identity is not a rename: no exit
+    // code means `gh` is still running, and a non-zero exit means `gh` itself
+    // failed, which tells the operator something other than "log in as someone
+    // else".
+    let (matches, reason) = match output.exit_code {
+        None => (false, "github_probe_pending"),
+        Some(0) if actual.eq_ignore_ascii_case(expected) => (true, "matched"),
+        Some(0) => (false, "identity_mismatch"),
+        Some(_) => (false, "github_probe_failed"),
+    };
+    Ok(json!({
+        "expected": expected,
+        "actual": actual,
+        "matches": matches,
+        "reason": reason,
+        "exit_code": output.exit_code,
+        "stderr": excerpt(&output.stderr),
+        "execution_id": output.execution_id,
+    }))
 }
 
 #[cfg(test)]

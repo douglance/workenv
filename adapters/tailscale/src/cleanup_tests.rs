@@ -7,7 +7,7 @@ use workenv_protocol::{AdapterRequest, PROTOCOL_VERSION, ResponseStatus, Target}
 use super::{
     Credentials,
     api::{ApiClient, ApiResponse, TailscaleApi},
-    previous_device_id, run_with_api,
+    previous_device_id, run_with_api, validate_credential,
 };
 
 #[test]
@@ -183,4 +183,39 @@ impl workenv_platform::Executor for NoopExecutor {
     ) -> Result<workenv_platform::ExecutionOutput> {
         unreachable!("cleanup must reject before executing")
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn oauth_credential_file_must_be_mode_0600() -> Result<()> {
+    // The OAuth client secret deletes devices from the tailnet, so the file it
+    // comes from is read only at exactly owner read-write -- 0o700 included,
+    // since execute bits on a secret are a sign it is not the file we think.
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("oauth.json");
+    std::fs::write(&path, r#"{"client_id":"id","client_secret":"secret"}"#)?;
+    for mode in [0o644, 0o640, 0o604, 0o660, 0o666, 0o700] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        assert!(
+            Credentials::from_file(path.clone()).is_err(),
+            "mode {mode:o} was accepted"
+        );
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let credentials = Credentials::from_file(path)?;
+    assert_eq!(credentials.client_id, "id");
+    assert_eq!(credentials.client_secret, "secret");
+    Ok(())
+}
+
+#[test]
+fn credentials_reject_empty_and_whitespace_values() {
+    // An empty or whitespace-bearing credential produces a malformed
+    // Authorization header rather than a clear refusal, so both are refused here.
+    assert!(validate_credential(String::new()).is_err());
+    assert!(validate_credential(" ".to_string()).is_err());
+    assert!(validate_credential("has space".to_string()).is_err());
+    assert!(validate_credential("secret\n".to_string()).is_err());
+    assert!(validate_credential("tskey-client-abc".to_string()).is_ok());
 }

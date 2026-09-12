@@ -45,5 +45,27 @@ pub(crate) fn redacted(text: &str) -> String {
 }
 
 pub(crate) fn output_json(output: &ExecutionOutput) -> Result<Value> {
-    serde_json::from_str(&output.stdout).context("stdout was not JSON")
+    serde_json::from_str(&output.stdout).with_context(|| {
+        format!(
+            "stdout was not JSON (execution {}): stdout {:?}, stderr {:?}",
+            output.execution_id,
+            excerpt(&output.stdout),
+            excerpt(&output.stderr)
+        )
+    })
 }
+
+/// Keep a diagnostic excerpt short so a large payload cannot flood the message.
+fn excerpt(text: &str) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(EXCERPT_CHARS) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_string(),
+    }
+}
+
+const EXCERPT_CHARS: usize = 200;
+
+#[cfg(test)]
+#[path = "util_tests.rs"]
+mod tests;

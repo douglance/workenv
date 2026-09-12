@@ -36,6 +36,13 @@ impl RecordingExecutor {
         })
     }
 
+    fn with_outputs(outputs: Vec<ExecutionOutput>) -> Self {
+        Self {
+            outputs: Mutex::new(outputs.into()),
+            specs: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     fn specs(&self) -> Result<Vec<ExecutionSpec>> {
         Ok(self
             .specs
@@ -103,6 +110,39 @@ fn daemon_wait_failure_preserves_remote_execution_for_resume() -> Result<()> {
     assert_eq!(result.execution_id.as_deref(), Some("remote-1"));
     assert!(result.data.get("exit_code").is_none());
     assert_eq!(executor.specs()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn wait_transport_failure_surfaces_ssh_stderr_instead_of_pending() -> Result<()> {
+    // A dropped route or a rebooting guest used to read as `status: pending`
+    // with no cause, and the pending receipt sent every retry down this same
+    // path forever. Daemon waiting states are still pending; this is not one.
+    let request = request("remote-transport-failure");
+    let argv = vec!["devenv".into(), "shell".into()];
+    let executor = RecordingExecutor::with_outputs(vec![
+        ExecutionOutput {
+            stdout: serde_json::to_string(&json!({"id":"remote-1"}))?,
+            stderr: String::new(),
+            exit_code: Some(0),
+            execution_id: "ssh-exec-0".into(),
+        },
+        ExecutionOutput {
+            stdout: String::new(),
+            stderr: "ssh: connect to host host.example port 22: Connection refused".into(),
+            exit_code: Some(255),
+            execution_id: "ssh-exec-1".into(),
+        },
+    ]);
+
+    let error = execute_remote_with(remote_execute(&request, &argv), &executor, ".".as_ref())
+        .err()
+        .context("a dropped ssh connection must not be reported as pending")?;
+
+    assert!(
+        format!("{error:#}").contains("Connection refused"),
+        "{error:#}"
+    );
     Ok(())
 }
 

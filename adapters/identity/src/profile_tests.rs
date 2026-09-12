@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::{Value, json};
+use workenv_platform::ExecutionOutput;
 use workenv_protocol::{AdapterRequest, PROTOCOL_VERSION, ResponseStatus, Target};
 
 use super::*;
@@ -99,4 +100,83 @@ fn replace_in_input_overrides_a_digest_conflict() -> Result<()> {
     )?)?;
     assert_eq!(profile["digest"], "digest-b");
     Ok(())
+}
+
+#[test]
+fn a_failed_github_probe_is_not_an_identity_mismatch() -> Result<()> {
+    // `gh` missing from PATH, unauthenticated, or answered 503 all exit non-zero
+    // with nothing on stdout. Reported as a mismatch they tell the operator to
+    // log in as somebody else, which is the one thing that cannot fix them.
+    let github = github(&probe(Some(127), "", "gh: command not found"))?;
+    assert_eq!(github["reason"], "github_probe_failed");
+    assert_eq!(github["matches"], false);
+    assert_eq!(github["exit_code"], 127);
+    assert_eq!(github["stderr"], "gh: command not found");
+    assert_eq!(github["execution_id"], "execution-1");
+    Ok(())
+}
+
+#[test]
+fn a_github_probe_still_running_is_not_an_identity_mismatch() -> Result<()> {
+    // No exit code is APoC reporting that the 30s probe has not finished.
+    let github = github(&probe(None, "", ""))?;
+    assert_eq!(github["reason"], "github_probe_pending");
+    assert_eq!(github["matches"], false);
+    assert_eq!(github["exit_code"], Value::Null);
+    assert_eq!(github["execution_id"], "execution-1");
+    Ok(())
+}
+
+#[test]
+fn a_different_login_is_reported_as_an_identity_mismatch() -> Result<()> {
+    let github = github(&probe(Some(0), "someone-else", ""))?;
+    assert_eq!(github["reason"], "identity_mismatch");
+    assert_eq!(github["matches"], false);
+    assert_eq!(github["actual"], "someone-else");
+    assert_eq!(github["exit_code"], 0);
+    Ok(())
+}
+
+#[test]
+fn the_configured_login_matches_case_insensitively() -> Result<()> {
+    let github = github(&probe(Some(0), "OctoCat", ""))?;
+    assert_eq!(github["reason"], "matched");
+    assert_eq!(github["matches"], true);
+    Ok(())
+}
+
+fn github(runner: &StubExecutor) -> Result<Value> {
+    let temp = tempfile::tempdir()?;
+    let profiles = tempfile::tempdir()?;
+    let mut call = request(temp.path(), profiles.path());
+    call.operation = "inspect".to_string();
+    call.config["profile"] =
+        json!({"name":"profile-a","digest":"digest-a","github_login":"octocat"});
+    Ok(inspect(&call, runner)?.data["details"]["github"].clone())
+}
+
+fn probe(exit_code: Option<i32>, stdout: &str, stderr: &str) -> StubExecutor {
+    StubExecutor {
+        output: ExecutionOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code,
+            execution_id: "execution-1".to_string(),
+        },
+    }
+}
+
+struct StubExecutor {
+    output: ExecutionOutput,
+}
+
+impl Executor for StubExecutor {
+    fn execute(&self, _spec: ExecutionSpec) -> Result<ExecutionOutput> {
+        Ok(ExecutionOutput {
+            stdout: self.output.stdout.clone(),
+            stderr: self.output.stderr.clone(),
+            exit_code: self.output.exit_code,
+            execution_id: self.output.execution_id.clone(),
+        })
+    }
 }

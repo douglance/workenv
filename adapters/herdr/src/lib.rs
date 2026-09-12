@@ -74,7 +74,11 @@ fn inspect(request: &AdapterRequest, runner: &impl Executor) -> Result<AdapterRe
         return Ok(pending_response(request, output.execution_id, data));
     }
     if output.exit_code != Some(0) {
+        // A probe that could not run at all reads as "server not up" unless the
+        // exit code and stderr travel with it.
         data.insert("status".to_string(), json!("herdr_not_ready"));
+        data.insert("stderr".to_string(), json!(output.stderr));
+        data.insert("exit_code".to_string(), json!(output.exit_code));
         return Ok(response(request, ResponseStatus::Failed, data));
     }
     let server = output_json(&output)?;

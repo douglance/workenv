@@ -83,8 +83,26 @@ pub(crate) fn atomic_json(path: &std::path::Path, value: &Value) -> Result<bool>
 }
 
 pub(crate) fn output_json(output: &ExecutionOutput) -> Result<Value> {
-    serde_json::from_str(&output.stdout).context("stdout was not JSON")
+    serde_json::from_str(&output.stdout).with_context(|| {
+        format!(
+            "stdout was not JSON (execution {}): stdout {:?}, stderr {:?}",
+            output.execution_id,
+            excerpt(&output.stdout),
+            excerpt(&output.stderr)
+        )
+    })
 }
+
+/// Keep a diagnostic excerpt short so a large payload cannot flood the message.
+fn excerpt(text: &str) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(EXCERPT_CHARS) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_string(),
+    }
+}
+
+const EXCERPT_CHARS: usize = 200;
 
 fn uuid_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -93,3 +111,7 @@ fn uuid_token() -> String {
         .map_or(0, |duration| duration.as_nanos())
         .to_string()
 }
+
+#[cfg(test)]
+#[path = "util_tests.rs"]
+mod tests;
