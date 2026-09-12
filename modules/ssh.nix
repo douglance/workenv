@@ -8,33 +8,28 @@
 let
   cfg = config.workenv.ssh;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
-  output = {
-    type = "object";
-    additionalProperties = true;
-  };
+  inherit (import ./schema.nix) closed none output;
   operations = {
     inspect = {
       description = "Inspect SSH target reachability and command shape.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     connect = {
       description = "Return SSH and Herdr connection argv for the target.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     execute = {
       description = "Start and observe one exact argv command through remote APoC.";
       mutating = true;
       internal = true;
-      input_schema = object {
+      # The transport contract. These five are what main.rs and remote/argv.rs
+      # read; a sixth field in a caller's request is a mistake, and before this
+      # was closed it was accepted and then ignored.
+      input_schema = closed {
         argv = {
           type = "array";
           items.type = "string";

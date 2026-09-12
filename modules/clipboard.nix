@@ -8,36 +8,37 @@
 let
   cfg = config.workenv.clipboard;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
-  output = {
-    type = "object";
-    additionalProperties = true;
-  };
+  inherit (import ./schema.nix) closed none output;
+  # What lib.rs reads out of input: the node label, an explicit peer list, and
+  # permission to overwrite an existing config. `peers` and the two replacement
+  # spellings were honoured without ever being declared, which a closed schema
+  # would have rejected had it been written from the module instead of the code.
+  clipboardInput = closed {
+    node_name.type = "string";
+    peers = {
+      type = "array";
+      description = "Explicit peer list, replacing whatever the existing config holds.";
+    };
+    replace_existing.type = "boolean";
+    replace.type = "boolean";
+  } [ ];
   operations = {
     config = {
       description = "Prepare ssh-clipboard configuration and state files.";
       mutating = true;
-      input_schema = object {
-        node_name.type = "string";
-      } [ ];
+      input_schema = clipboardInput;
       output_schema = output;
     };
     apply = {
       description = "Apply ssh-clipboard configuration and state files.";
       mutating = true;
-      input_schema = object {
-        node_name.type = "string";
-      } [ ];
+      input_schema = clipboardInput;
       output_schema = output;
     };
     inspect = {
       description = "Inspect ssh-clipboard runtime status.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
   };

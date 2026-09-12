@@ -194,6 +194,29 @@ fn inspect_requires_detached_daemon_capability() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn register_falls_back_to_the_target_in_input_when_the_host_has_no_address() -> Result<()> {
+    // An address-free host is the normal case for a scheduled guest, and `target`
+    // in input is the documented fallback: lib.rs prefers target.address, then
+    // input, then config. modules/herdr.nix declares it for this path alone, and
+    // a closed schema makes that declaration load-bearing rather than decorative.
+    let temp = tempfile::tempdir()?;
+    let runner = Outputs::new(vec![
+        json!([]),
+        json!({}),
+        json!([
+            {"id":"profile-1","label":"workenv-01","target":"exedev@scheduled","session":"workenv","enabled":true}
+        ]),
+    ]);
+    let mut call = request(temp.path(), "register");
+    call.target.address = None;
+    call.input = json!({"target": "exedev@scheduled"});
+    let result = handle_with(&call, &runner)?;
+    assert_eq!(result.status, ResponseStatus::Changed);
+    assert_eq!(result.data["target"], "exedev@scheduled");
+    Ok(())
+}
+
 fn request(path: &std::path::Path, operation: &str) -> AdapterRequest {
     AdapterRequest {
         protocol_version: PROTOCOL_VERSION,

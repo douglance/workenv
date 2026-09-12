@@ -30,7 +30,7 @@
     cargo fmt --manifest-path examples/external-extension/Cargo.toml --check
     cargo clippy --manifest-path examples/external-extension/Cargo.toml --all-targets -- -D warnings
     cargo test --manifest-path examples/external-extension/Cargo.toml --all-targets
-    nix-instantiate --eval --strict --json --expr 'import ./modules/tests/provider-schemas.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
+    nix-instantiate --eval --strict --json --expr 'import ./modules/tests/input-schemas.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/exedev-ephemeral.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/herdr-platforms.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/orchard-schemas.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'

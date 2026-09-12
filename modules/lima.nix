@@ -7,10 +7,7 @@
 let
   cfg = config.workenv.lima;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  output = {
-    type = "object";
-    additionalProperties = true;
-  };
+  inherit (import ./schema.nix) closed none output;
   # Per-operation schemas, not one shared `providerInput`.
   #
   # The shared schema had to accept both create's `{}` and destroy's
@@ -26,12 +23,6 @@ let
   # both were honoured anyway, because nothing was being checked. Tightening the
   # schema from the documentation rather than from the code would turn that into
   # a rejection of input the adapter accepts.
-  noInput = {
-    type = "object";
-    additionalProperties = false;
-    properties = { };
-    required = [ ];
-  };
   # Which slot, on which host, through which host CLI. Read on every operation,
   # because `spec` runs before the operation is dispatched.
   slotSelector = {
@@ -48,24 +39,20 @@ let
     dave_address.type = "string";
     command.type = "string";
   };
-  createInput = {
-    type = "object";
-    additionalProperties = false;
-    required = [ ];
-    properties = slotSelector // {
+  createInput = closed (
+    slotSelector
+    // {
       lease_seconds = {
         type = "integer";
         minimum = 60;
       };
       allow_cold_start.type = "boolean";
       adopt.type = "boolean";
-    };
-  };
-  destroyInput = {
-    type = "object";
-    additionalProperties = false;
-    required = [ ];
-    properties = slotSelector // {
+    }
+  ) [ ];
+  destroyInput = closed (
+    slotSelector
+    // {
       # Annotation only: the controller passes the create receipt here so the
       # claim identity can be recovered. Named explicitly so create cannot
       # receive it, and so destroy cannot receive the claim-time knobs
@@ -73,19 +60,14 @@ let
       create = {
         description = "Previous create receipt supplied by the controller.";
       };
-    };
-  };
-  reapInput = {
-    type = "object";
-    additionalProperties = false;
-    required = [ ];
-    properties = hostSelector;
-  };
+    }
+  ) [ ];
+  reapInput = closed hostSelector [ ];
   operations = {
     inventory = {
       description = "Inspect Lima pool slots and host capacity.";
       mutating = false;
-      input_schema = noInput;
+      input_schema = none;
       output_schema = output;
     };
     create = {

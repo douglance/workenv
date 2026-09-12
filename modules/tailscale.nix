@@ -8,45 +8,52 @@
 let
   cfg = config.workenv.tailscale;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
-  output = {
-    type = "object";
-    additionalProperties = true;
-  };
+  inherit (import ./schema.nix) closed none output;
+  # Exactly what the controller sends: see cleanup_input in
+  # workenv-core/src/environment_cleanup.rs. Declared in full even where this
+  # adapter reads only some of it, because the schema describes the call, not the
+  # reader -- an adapter that later starts reading `provider_destroy` must not
+  # need a schema change to receive it.
+  cleanupInput = closed {
+    provider_create.description = "Provider create receipt for the destroyed resource.";
+    provider_destroy.description = "Provider destroy receipt for the destroyed resource.";
+    integration_receipts = {
+      type = "array";
+      description = "Prior integration receipts, newest last.";
+    };
+    apply.description = "Data from this integration's own apply receipt.";
+    receipt.description = "Data from this integration's most recent receipt.";
+  } [ ];
   operations = {
     inspect = {
       description = "Inspect Tailscale readiness and expected tailnet identity.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     enroll = {
       description = "Enroll Tailscale using a caller-supplied auth key reference.";
       mutating = true;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     cleanup = {
       description = "Delete the exact Tailscale device registration from the controller.";
       mutating = true;
       location = "controller";
-      input_schema = object { } [ ];
+      input_schema = cleanupInput;
       output_schema = output;
     };
     connect = {
       description = "Connect Tailscale using the enrollment contract.";
       mutating = true;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     apply = {
       description = "Apply Tailscale enrollment and configuration.";
       mutating = true;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
   };

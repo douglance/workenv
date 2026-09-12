@@ -8,26 +8,18 @@
 let
   cfg = config.workenv.project;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
-  output = {
-    type = "object";
-    additionalProperties = true;
-  };
+  inherit (import ./schema.nix) closed none output;
   operations = {
     inspect = {
       description = "Inspect whether the target directory is an editable checkout for the configured project repository.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     prepare = {
       description = "Prepare an editable project checkout in the target directory without overwriting existing files.";
       mutating = true;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
   };

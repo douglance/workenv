@@ -1,11 +1,17 @@
-# Per-operation input schemas for the Lima and exe.dev providers.
+# Every adapter operation's input schema refuses what it does not declare.
 #
-# Both shipped one shared `providerInput` reused across create, destroy and reap.
-# It had to accept create's `{}` and destroy's `{"create": <receipt>}`, so it
-# degraded to the union of the two with `additionalProperties = true`, and the
-# validation in workenv-core/src/adapter.rs had nothing left to reject. Orchard
-# was written with per-operation schemas from the start; this suite is the same
-# assertion for the two providers that were not.
+# Every module but orchard shipped its own copy of a helper that set
+# `additionalProperties = true`, so the validation in
+# workenv-core/src/adapter.rs had nothing to reject: a misspelled input key was
+# accepted and then silently ignored, and an operation whose declared properties
+# were incomplete still validated. Measured on the real fleet manifest before
+# this change, 24 of 37 operations accepted arbitrary input.
+#
+# The two providers were the worst of it -- one `providerInput` reused across
+# create, destroy and reap, which had to accept create's `{}` and destroy's
+# `{"create": <receipt>}` and so degraded to the union of both -- so they get
+# the specific assertions further down. The sweep at the top is what stops the
+# next module reintroducing the permissive helper.
 { pkgs }:
 let
   inherit (pkgs) lib;
@@ -31,6 +37,16 @@ let
               default = [ ];
             };
             languages = lib.mkOption {
+              type = lib.types.attrs;
+              default = { };
+            };
+            # clipboard declares a long-running process; devenv supplies this
+            # option in the real evaluation, so the stub has to as well.
+            processes = lib.mkOption {
+              type = lib.types.attrs;
+              default = { };
+            };
+            scripts = lib.mkOption {
               type = lib.types.attrs;
               default = { };
             };
@@ -81,14 +97,46 @@ let
         source = "path:/tmp/config";
       };
     }).config.workenv.extensions."workenv.exedev".operations;
+  # Every adapter module, each evaluated on its own with only its own enable set.
+  # A single combined evaluation would need every host and provider configured at
+  # once, and a module left out of this list is a module the sweep stops covering,
+  # so the count below is asserted too.
+  modules = [
+    "bootstrap"
+    "project"
+    "ssh"
+    "identity"
+    "clipboard"
+    "tailscale"
+    "herdr"
+    "orchard"
+  ];
+  operationsOf =
+    name:
+    (evaluate (../. + "/${name}.nix") {
+      workenv.${name} = {
+        enable = true;
+        package = pkgs.hello;
+      };
+    }).config.workenv.extensions."workenv.${name}".operations;
+  swept = map operationsOf modules;
+  operationCount = lib.foldl' (
+    total: operations: total + lib.length (lib.attrNames operations)
+  ) 0 swept;
   closed =
     operations:
     lib.all (name: operations.${name}.input_schema.additionalProperties == false) (
       lib.attrNames operations
     );
 in
-# Every operation, not a chosen few: one permissive schema anywhere is a hole
-# the others cannot close, and the shared schema was reached from three of four.
+# The sweep: eight modules, every operation in each. One permissive schema
+# anywhere is a hole the rest cannot close.
+assert lib.all closed swept;
+# And the count, so a module whose operation set silently became empty cannot
+# satisfy the sweep vacuously -- `lib.all` over nothing is true.
+assert operationCount >= 30;
+# The two providers, which are configured above with hosts the sweep cannot give
+# them. The shared schema was reached from three of four of Lima's operations.
 assert closed lima;
 assert closed exedev;
 # The split itself. A single schema cannot both require the receipt on destroy
@@ -128,6 +176,8 @@ assert lima.create.mutating && lima.destroy.mutating && lima.reap.mutating;
 assert !exedev.inventory.mutating;
 assert exedev.create.mutating && exedev.destroy.mutating;
 {
+  every_operation_in_every_module_forbids_unknown_fields = true;
+  inherit operationCount;
   every_lima_operation_forbids_unknown_fields = true;
   every_exedev_operation_forbids_unknown_fields = true;
   create_and_destroy_schemas_differ = true;

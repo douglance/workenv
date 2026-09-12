@@ -8,26 +8,18 @@
 let
   cfg = config.workenv.bootstrap;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
-  output = {
-    type = "object";
-    additionalProperties = true;
-  };
+  inherit (import ./schema.nix) closed none output;
   operations = {
     inspect = {
       description = "Inspect Nix and devenv prerequisite readiness.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
     bootstrap = {
       description = "Install or repair Nix and devenv prerequisites when explicitly invoked.";
       mutating = true;
-      input_schema = object { } [ ];
+      input_schema = none;
       output_schema = output;
     };
   };

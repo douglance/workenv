@@ -108,3 +108,65 @@ impl Executor for OneOutput {
         })
     }
 }
+
+#[test]
+fn peers_supplied_in_input_replace_what_the_existing_config_holds() -> Result<()> {
+    // `peers` is read from config and then from input, and it was honoured for a
+    // long time without ever being declared in modules/clipboard.nix. Declaring
+    // it there without pinning it here would leave the schema's word for it as
+    // the only evidence.
+    let temp = tempfile::tempdir()?;
+    let config_dir = temp.path().join(".state/clipboard/config");
+    fs::create_dir_all(&config_dir)?;
+    fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "version":1,"node_id":"old-node","node_name":"old",
+            "peers":[{"name":"peer-a","address":"peer.example"}],
+            "max_bytes":1,"poll_interval_ms":1,"headless_x11":false
+        }))?,
+    )?;
+    let mut request = request(temp.path());
+    request.input = json!({"peers":[{"name":"peer-b","address":"other.example"}]});
+    configure(&request)?;
+    let config: Value = serde_json::from_slice(&fs::read(config_dir.join("config.json"))?)?;
+    assert_eq!(config["peers"][0]["name"], "peer-b");
+    assert_eq!(config["peers"].as_array().map(Vec::len), Some(1));
+    Ok(())
+}
+
+#[test]
+fn replace_in_input_clears_the_peers_already_on_disk() -> Result<()> {
+    // The other newly declared pair. Without it, `replace` and `replace_existing`
+    // are two schema entries nothing proves the adapter reads.
+    let temp = tempfile::tempdir()?;
+    let config_dir = temp.path().join(".state/clipboard/config");
+    fs::create_dir_all(&config_dir)?;
+    fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "version":1,"node_id":"old-node","node_name":"old",
+            "peers":[{"name":"peer-a","address":"peer.example"}],
+            "max_bytes":1,"poll_interval_ms":1,"headless_x11":false
+        }))?,
+    )?;
+    let mut request = request(temp.path());
+    request.input = json!({"replace": true});
+    configure(&request)?;
+    let config: Value = serde_json::from_slice(&fs::read(config_dir.join("config.json"))?)?;
+    assert_eq!(config["peers"], json!([]));
+    Ok(())
+}
+
+#[test]
+fn node_name_in_input_names_the_node() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut request = request(temp.path());
+    request.input = json!({"node_name": "from-input"});
+    configure(&request)?;
+    let config: Value = serde_json::from_slice(&fs::read(
+        temp.path().join(".state/clipboard/config/config.json"),
+    )?)?;
+    assert_eq!(config["node_name"], "from-input");
+    Ok(())
+}
