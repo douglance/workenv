@@ -666,6 +666,22 @@ is reusable, and because each nearly became a wrong fix.
 
 Each of these cost real time to find; the scripts handle them so you don't rediscover them.
 
+- **A copied Mach-O is SIGKILLed, and that includes your own build output.** This
+  is already recorded below for the orchard release binary, but it is not
+  orchard-specific: copying `target/debug/workenv` anywhere else produces a
+  binary that dies instantly with exit 137 and no message. Three timing runs
+  reported `0s(137)` before the cause was recognised. `codesign --force --sign -`
+  on the copy fixes it.
+
+- **A build cache that garbage-collects can leave `target` dangling.** `target`
+  here is a symlink into an external build cache, and when that cache is
+  collected the link survives while its destination does not. cargo then fails
+  with `failed to create directory ... Not a directory (os error 20)`, and an
+  already-built binary simply vanishes mid-session. Four occurrences while
+  writing this. Nothing in this repository causes it and nothing here can fix it;
+  `cargo build` recreates the directory, and it is worth recognising on sight
+  rather than debugging as a code error.
+
 - **`trusted-users` must be set before installing devenv.** A fresh Nix install leaves it
   unset, so `--accept-flake-config` silently ignores devenv's cachix and Nix compiles
   `cachix-api` from source. Setting it plus the substituters took the devenv install from

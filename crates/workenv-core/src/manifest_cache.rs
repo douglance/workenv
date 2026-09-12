@@ -30,32 +30,31 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 use workenv_protocol::Manifest;
 
-/// Directories never worth hashing, and ruinous to walk.
-const SKIPPED: &[&str] = &[".git", "target", ".devenv", "result", ".direnv"];
-
 /// Environment variable that disables reuse.
 const DISABLE: &str = "WORKENV_MANIFEST_CACHE";
 
 /// Read a manifest that is still valid for this tree, if there is one.
 pub(crate) fn read(root: &Path) -> Option<Manifest> {
     let fingerprint = fingerprint(root)?;
-    let stored = std::fs::read_to_string(cache_path(root))
+    let stored = std::fs::read_to_string(cache_path(root)?)
         .ok()?
         .parse::<Entry>()
         .ok()?;
     if stored.fingerprint != fingerprint {
         return None;
     }
-    let manifest: Manifest = serde_json::from_str(&stored.manifest).ok()?;
-    // The fingerprint says the inputs are unchanged; this says the outputs are
-    // still there. A store path can be collected after the cache is written,
-    // and a manifest naming a path that no longer exists is worse than no
-    // manifest at all.
-    manifest
-        .extensions
-        .values()
-        .all(|extension| extension.executable.exists())
-        .then_some(manifest)
+    // The fingerprint is the whole validity test, and deliberately so.
+    //
+    // An earlier version also required every executable the manifest names to
+    // exist on disk, reasoning that a collected store path makes the manifest
+    // useless. That was wrong twice over. `devenv eval` returns a derivation's
+    // OUTPUT path without building it, so a correct, freshly written manifest
+    // routinely names paths that do not exist yet -- measured here with all nine
+    // of them absent, which made the cache miss every single time and left the
+    // feature doing nothing at all. And it duplicated a guarantee that already
+    // lives downstream: adapter_invocation falls back to a devenv shell when the
+    // adapter is not on disk, which is what builds it.
+    serde_json::from_str(&stored.manifest).ok()
 }
 
 /// Record this manifest as the answer for this tree.
@@ -66,7 +65,9 @@ pub(crate) fn write(root: &Path, manifest_json: &str) {
     let Some(fingerprint) = fingerprint(root) else {
         return;
     };
-    let path = cache_path(root);
+    let Some(path) = cache_path(root) else {
+        return;
+    };
     if path
         .parent()
         .is_some_and(|parent| std::fs::create_dir_all(parent).is_err())
@@ -96,28 +97,58 @@ impl std::str::FromStr for Entry {
     }
 }
 
-/// Where the cache for this root lives; `.devenv` is already git-ignored.
-fn cache_path(root: &Path) -> PathBuf {
-    root.join(".devenv/workenv-manifest.cache")
+/// Where the cache for this root lives.
+///
+/// Outside the repository, deliberately. Written inside it, the cache file is an
+/// untracked path that `git status` reports, so writing it changed the very
+/// fingerprint it was stored under and every read missed. It appeared to work
+/// only where `.devenv*` happened to be gitignored, which is exactly the kind of
+/// environment-dependent behaviour worth not having. Found by the tests.
+fn cache_path(root: &Path) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    let key = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+    Some(base.join("workenv").join(format!("manifest-{key}.cache")))
 }
 
 /// A hash of everything that can change this root's manifest.
 ///
-/// `None` means "do not cache": either reuse is switched off, or the root is
-/// not inside a git working tree and the import closure cannot be bounded.
+/// Asked of git, not computed by walking the tree. The first version of this
+/// content-hashed every file under the repository, which was measured at
+/// **13.6 GB across 65,741 files** here -- `.state/` holds build-artifact
+/// directories and git bundles -- and it ran twice per command. The cache made
+/// the tool *slower*: 77 s with caching disabled against a 900 s timeout with it
+/// enabled. git answers the same question in 0.04 s.
+///
+/// It is also more correct. Ignored paths cannot affect the manifest, and git is
+/// the thing that knows which those are. The assumption this rests on is that
+/// nothing gitignored feeds the evaluation; `devenv.yaml`, `devenv.lock` and
+/// every module are tracked, so that holds here.
+///
+/// `None` means "do not cache": either reuse is switched off, or this is not a
+/// git working tree and the inputs cannot be bounded.
 fn fingerprint(root: &Path) -> Option<String> {
     if std::env::var(DISABLE).as_deref() == Ok("0") {
         return None;
     }
     let repository = repository_of(root)?;
-    let mut entries = Vec::new();
-    collect(&repository, &repository, &mut entries)?;
-    entries.sort();
+    let head = git(&repository, &["rev-parse", "HEAD"])?;
+    // Dirty and untracked-but-not-ignored paths, which HEAD alone cannot see.
+    let status = git(&repository, &["status", "--porcelain=v1"])?;
     let mut digest = Sha256::new();
-    for (path, hash) in &entries {
+    digest.update(head.as_bytes());
+    digest.update([0]);
+    digest.update(status.as_bytes());
+    digest.update([0]);
+    // The status line alone is not enough: editing one file twice leaves the
+    // same " M path" line while changing what the manifest evaluates to.
+    for path in status.lines().filter_map(changed_path) {
         digest.update(path.as_bytes());
         digest.update([0]);
-        digest.update(hash);
+        if let Ok(bytes) = std::fs::read(repository.join(path)) {
+            digest.update(Sha256::digest(&bytes));
+        }
     }
     // The root itself is part of the key: two roots in one repository evaluate
     // to different manifests.
@@ -125,51 +156,31 @@ fn fingerprint(root: &Path) -> Option<String> {
     Some(format!("{:x}", digest.finalize()))
 }
 
+/// One path out of a `git status --porcelain=v1` line.
+///
+/// A rename reads `R  old -> new`; the new name is the one on disk to hash.
+fn changed_path(line: &str) -> Option<&str> {
+    let rest = line.get(3..)?.trim();
+    Some(rest.rsplit(" -> ").next().unwrap_or(rest))
+}
+
+/// Run one read-only git query, or nothing when it cannot be answered.
+fn git(repository: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// The nearest enclosing directory holding a `.git`.
 fn repository_of(root: &Path) -> Option<PathBuf> {
     root.ancestors()
         .find(|candidate| candidate.join(".git").exists())
         .map(Path::to_path_buf)
-}
-
-/// Hash every regular file under `dir`, relative to `base`.
-///
-/// Symlinks are recorded by their target text rather than followed: `target` is
-/// a symlink into a build cache here, and following it would hash gigabytes.
-fn collect(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Option<()> {
-    for entry in std::fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if SKIPPED.contains(&name.as_str()) {
-            continue;
-        }
-        let kind = entry.file_type().ok()?;
-        if kind.is_symlink() {
-            let target = std::fs::read_link(&path).ok()?;
-            out.push((
-                relative(base, &path),
-                hash_bytes(target.as_os_str().as_encoded_bytes()),
-            ));
-        } else if kind.is_dir() {
-            collect(base, &path, out)?;
-        } else if kind.is_file() {
-            let bytes = std::fs::read(&path).ok()?;
-            out.push((relative(base, &path), hash_bytes(&bytes)));
-        }
-    }
-    Some(())
-}
-
-/// A path relative to the repository, as a stable string.
-fn relative(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// One content hash.
-fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
-    Sha256::digest(bytes).to_vec()
 }

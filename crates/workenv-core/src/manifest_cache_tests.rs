@@ -13,9 +13,26 @@ impl Tree {
         let repository =
             std::env::temp_dir().join(format!("workenv-mc-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repository);
-        std::fs::create_dir_all(repository.join(".git")).expect("a fake repository");
         std::fs::create_dir_all(repository.join("root")).expect("a root directory");
         std::fs::write(repository.join("modules.nix"), "original").expect("a module file");
+        // A real repository, not a bare `.git` directory: the fingerprint asks
+        // git rather than walking the tree, so a fake one answers nothing and
+        // every test would pass for the wrong reason.
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(&args)
+                .output()
+                .expect("running git");
+            assert!(status.status.success(), "git {args:?} failed");
+        }
         Self { repository }
     }
 
@@ -88,15 +105,20 @@ fn editing_any_file_in_the_tree_invalidates_it() {
 }
 
 #[test]
-fn a_vanished_executable_invalidates_it_even_though_the_inputs_match() {
-    // The fingerprint says the inputs are unchanged; this says the outputs are
-    // gone. A store path can be garbage-collected after the cache is written,
-    // and a manifest naming a path that no longer exists is worse than none.
-    let tree = Tree::new("collected");
-    let adapter = existing_executable(&tree);
-    write(&tree.root(), &manifest_json(&adapter));
-    std::fs::remove_file(&adapter).expect("removing the adapter");
-    assert!(read(&tree.root()).is_none());
+fn an_unbuilt_executable_does_not_invalidate_it() {
+    // This test asserted the OPPOSITE until measurement showed the requirement
+    // was wrong. `devenv eval` returns a derivation's output path without
+    // building it, so a correct manifest routinely names store paths that do not
+    // exist yet -- all nine of them, here -- and requiring them made the cache
+    // miss every time. The missing-adapter case is handled downstream, where
+    // adapter_invocation falls back to a devenv shell that builds it.
+    //
+    // Worth remembering: the old version was green AND its mutation was caught.
+    // Both say the code matches the test; neither says the test is right.
+    let tree = Tree::new("unbuilt");
+    let absent = PathBuf::from("/nix/store/does-not-exist-workenv/bin/adapter");
+    write(&tree.root(), &manifest_json(&absent));
+    assert!(read(&tree.root()).is_some());
 }
 
 #[test]
