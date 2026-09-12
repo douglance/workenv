@@ -10,6 +10,20 @@ let
     extension = "workenv.orchard";
     config = { };
   };
+
+  # `source` is a path on the *target*: core runs `devenv shell --from <source>`
+  # there, never here. A remote environment whose source was `toString ../.`
+  # therefore named a macOS controller path that does not exist on a Linux
+  # guest, and had nothing to evaluate once it got there. The project
+  # integration is what puts a real checkout at that path, so for every remote
+  # environment below `source` and `directory` are the same path and this
+  # binding is what creates it.
+  projectBinding = repository: {
+    extension = "workenv.project";
+    config = { inherit repository; };
+  };
+
+  workenvProject = projectBinding "https://github.com/douglance/workenv.git";
 in
 
 {
@@ -47,6 +61,10 @@ in
     orchard.enable = true;
     ssh.enable = true;
     bootstrap.enable = true;
+    # The checkout adapter. It had recorded live acceptance but was enabled only
+    # in a `.state` working manifest, so `workenv.project` was unreachable from
+    # the shipped CLI and every environment here had to carry its own source.
+    project.enable = true;
 
     # One ephemeral Lima slot on `box-03`, an Apple Silicon (M2) Mac mini. The
     # address is static because the controller reads it from this manifest and
@@ -96,7 +114,7 @@ in
     environments."wkv-01" = {
       host = "wkv-01";
       directory = "/home/box-03.linux/workenv";
-      source = toString ../.;
+      source = "/home/box-03.linux/workenv";
       ephemeral = true;
       # herdr appears here as well as in `connection` because it declares a
       # `register` operation, and lifecycle up refuses a connection extension
@@ -105,6 +123,7 @@ in
       integrations = [
         { extension = "workenv.identity"; }
         { extension = "workenv.bootstrap"; }
+        workenvProject
         { extension = "workenv.herdr"; }
       ];
       connection = {
@@ -118,14 +137,33 @@ in
     environments."wkv-fast" = {
       host = "wkv-fast";
       directory = "/home/admin/workenv";
-      source = toString ../.;
+      source = "/home/admin/workenv";
       ephemeral = true;
       integrations = [
         { extension = "workenv.identity"; }
         { extension = "workenv.bootstrap"; }
+        workenvProject
       ];
       # Reaching in is the provider's own job here. Every other connection
       # extension needs target.address, which this host does not have.
+      connection = orchardBinding;
+    };
+
+    # A second project on the same scheduled-guest path. The environment name is
+    # also the guest name (the Orchard adapter falls back to
+    # `target.environment`), and `reap` sweeps by name prefix, so this is
+    # `wkv-devsql` rather than `devsql`: a guest outside the `wkv-` prefix is
+    # not covered by the sweep that expires the others, and would leak.
+    environments."wkv-devsql" = {
+      host = "wkv-fast";
+      directory = "/home/admin/devsql";
+      source = "/home/admin/devsql";
+      ephemeral = true;
+      integrations = [
+        { extension = "workenv.identity"; }
+        { extension = "workenv.bootstrap"; }
+        (projectBinding "https://github.com/douglance/devsql.git")
+      ];
       connection = orchardBinding;
     };
 
