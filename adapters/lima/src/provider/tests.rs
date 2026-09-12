@@ -239,3 +239,5 @@ fn config_still_wins_over_the_same_key_in_input() -> Result<()> {
     assert_eq!(resolved.slot, "wkv-01");
     Ok(())
 }
+
+mod guards;

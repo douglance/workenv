@@ -52,3 +52,53 @@ fn spec_without_stdin() -> ExecutionSpec {
         ..spec_with_stdin()
     }
 }
+
+#[test]
+fn a_reused_idempotency_key_with_different_stdin_is_refused() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let first = stage_stdin(root.path(), "stdin-collision", b"hello")?;
+    let refusal = stage_stdin(root.path(), "stdin-collision", b"goodbye")
+        .map_or_else(|error| error.to_string(), |_| String::new());
+    assert!(
+        refusal.contains("different standard input"),
+        "colliding stdin was accepted: {refusal:?}"
+    );
+    // The staged file still holds the first payload, which is why the second
+    // caller cannot be allowed through: it would run against the wrong input.
+    assert_eq!(fs::read(&first)?, b"hello");
+    Ok(())
+}
+
+#[test]
+fn restaging_identical_stdin_under_one_key_is_accepted() -> Result<()> {
+    // Retrying a mutation under its own idempotency key is the normal path.
+    let root = tempfile::tempdir()?;
+    let first = stage_stdin(root.path(), "stdin-retry", b"hello")?;
+    let second = stage_stdin(root.path(), "stdin-retry", b"hello")?;
+    assert_eq!(first, second);
+    Ok(())
+}
+
+#[test]
+fn staged_stdin_is_readable_only_by_its_owner() -> Result<()> {
+    // Staged stdin carries adapter input payloads, so it must not be world
+    // readable on a shared VM host.
+    let root = tempfile::tempdir()?;
+    let path = stage_stdin(root.path(), "stdin-mode", b"hello")?;
+    assert!(path.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    }
+    Ok(())
+}
+
+#[test]
+fn an_executable_carrying_a_separator_is_never_searched_in_path() -> Result<()> {
+    // A caller that names `bin/tool` means that exact relative path, not the
+    // first `bin/tool` found under a PATH entry.
+    assert_eq!(resolve_executable("bin/tool")?, "bin/tool");
+    assert_eq!(resolve_executable("/usr/bin/env")?, "/usr/bin/env");
+    Ok(())
+}

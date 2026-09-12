@@ -7,8 +7,10 @@ use workenv_protocol::AdapterRequest;
 
 /// Default seconds a claimed worker may live before it becomes reapable.
 ///
-/// Capped below the Tailscale boundary at which an ephemeral node converts to a
-/// standard tagged device, so a claimed guest never outlives its registration.
+/// A default, not a guarantee. The host reaps on whatever lease it was handed,
+/// so the only property this crate can assert is that the lease is non-zero; any
+/// relationship to the tailnet's own ephemeral-node lifetime would have to be
+/// measured against a live tailnet.
 const DEFAULT_LEASE_SECONDS: u64 = 14_400;
 
 /// One request's resolved worker settings.
