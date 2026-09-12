@@ -170,6 +170,19 @@ assert lib.all (name: exedev.${name}.input_schema.required == [ ]) (lib.attrName
 assert lima.create.input_schema.properties.lease_seconds.minimum == 60;
 assert exedev.create.input_schema.properties.cpus.minimum == 1;
 assert exedev.create.input_schema.properties.memory_gb.type == "integer";
+# Every provider's create must report ownership, because that is what
+# `Environment::destroy` gates on (workenv-core/src/environment.rs:114): a receipt
+# without `owned == true` and a string `resource_id` makes teardown bail "was
+# adopted or has no verified owned resource". The orchard adapter declared neither
+# and emitted neither, so its guests could not be torn down at all -- this is the
+# assertion that would have caught it. Stated on create only: destroy's own answer
+# has no owner to report, which is why one shared output schema could not say it.
+assert lib.elem "owned" lima.create.output_schema.required;
+assert lib.elem "resource_id" lima.create.output_schema.required;
+assert lib.elem "owned" exedev.create.output_schema.required;
+assert lib.elem "resource_id" exedev.create.output_schema.required;
+assert !(lib.elem "owned" (lima.destroy.output_schema.required or [ ]));
+assert !(lib.elem "owned" (exedev.destroy.output_schema.required or [ ]));
 # Observations stay observations, and the mutating set is unchanged by the split.
 assert !lima.inventory.mutating;
 assert lima.create.mutating && lima.destroy.mutating && lima.reap.mutating;
@@ -186,4 +199,5 @@ assert exedev.create.mutating && exedev.destroy.mutating;
   honoured_input_aliases_are_declared = true;
   the_controller_lifecycle_still_validates = true;
   properties_are_typed = true;
+  every_provider_create_reports_ownership = true;
 }

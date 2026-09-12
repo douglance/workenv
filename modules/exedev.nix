@@ -43,6 +43,25 @@ let
     };
     name.type = "string";
   } [ ];
+  # What `Environment::destroy` actually gates on: a create receipt without
+  # `owned == true` and a string `resource_id` makes it bail "was adopted or has no
+  # verified owned resource". The orchard adapter declared neither and emitted
+  # neither, so tearing down one of its guests was impossible until that was found.
+  # Stated on create only -- destroy's own answer has no owner to report -- and only
+  # Ready/Changed responses are validated, so the failure paths that answer with an
+  # empty payload are unaffected.
+  ownedCreateOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [
+      "owned"
+      "resource_id"
+    ];
+    properties = {
+      owned.type = "boolean";
+      resource_id.type = "string";
+    };
+  };
   operations = {
     inventory = {
       description = "Inspect exe.dev VM inventory.";
@@ -54,7 +73,7 @@ let
       description = "Create or adopt one exe.dev worker resource.";
       mutating = true;
       input_schema = createInput;
-      output_schema = output;
+      output_schema = ownedCreateOutput;
     };
     destroy = {
       description = "Destroy one previously owned exe.dev worker resource.";
