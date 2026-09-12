@@ -207,3 +207,35 @@ fn unsupported_operations_are_reported_as_unsupported() -> Result<()> {
     assert!(provider.runner.calls.is_empty());
     Ok(())
 }
+
+#[test]
+fn the_input_only_aliases_the_schema_declares_are_really_honoured() -> Result<()> {
+    // `instance_name` and `dave_address` are accepted as aliases for `slot` and
+    // `vm_host`, from input as well as from config. They are declared in
+    // modules/lima.nix, so this is the test that stops the two drifting apart:
+    // once the create schema forbids unknown fields, a schema missing an alias
+    // rejects input the adapter would have honoured, and an alias dropped from
+    // spec.rs leaves the schema promising something that no longer works.
+    let dir = TempDir::new()?;
+    let mut req = request(&dir, "create", json!({}));
+    req.config = json!({"state_dir": dir.path().to_string_lossy()});
+    req.input = json!({"instance_name": "wkv-07", "dave_address": "other.example"});
+    let resolved = spec(&req)?;
+    assert_eq!(resolved.slot, "wkv-07");
+    assert_eq!(resolved.vm_host, "other.example");
+    Ok(())
+}
+
+#[test]
+fn config_still_wins_over_the_same_key_in_input() -> Result<()> {
+    // Precedence is config first, then input, so a manifest-declared host cannot
+    // be redirected by an operation argument. Asserted because the create schema
+    // now permits `vm_host` in input, which makes this the reachable path.
+    let dir = TempDir::new()?;
+    let mut req = request(&dir, "create", json!({}));
+    req.input = json!({"vm_host": "attacker.example", "slot": "wkv-99"});
+    let resolved = spec(&req)?;
+    assert_eq!(resolved.vm_host, "box-03.example.ts.net");
+    assert_eq!(resolved.slot, "wkv-01");
+    Ok(())
+}

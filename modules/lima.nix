@@ -7,56 +7,103 @@
 let
   cfg = config.workenv.lima;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
   output = {
     type = "object";
     additionalProperties = true;
   };
-  # The controller sends `{}` on create and `{"create": <receipt>}` on destroy.
-  # Both must validate, so this schema stays permissive and `create` is
-  # annotation-only. Constraining it would make teardown structurally
-  # impossible and leak the guest.
-  providerInput = object {
-    create = {
-      description = "Previous create receipt supplied by the controller.";
-    };
+  # Per-operation schemas, not one shared `providerInput`.
+  #
+  # The shared schema had to accept both create's `{}` and destroy's
+  # `{"create": <receipt>}`, so it degraded to the union of the two with
+  # `additionalProperties = true`, and the enforcement in
+  # workenv-core/src/adapter.rs had nothing left to enforce. Declaring each
+  # operation separately is what lets create forbid a stray receipt and destroy
+  # forbid a claim knob that release does not read.
+  #
+  # The property sets below are the keys `provider/spec.rs` actually reads out of
+  # `request.input`, aliases included: `instance_name` for `slot`, and
+  # `dave_address` for `vm_host`. Neither alias appeared in the shared schema and
+  # both were honoured anyway, because nothing was being checked. Tightening the
+  # schema from the documentation rather than from the code would turn that into
+  # a rejection of input the adapter accepts.
+  noInput = {
+    type = "object";
+    additionalProperties = false;
+    properties = { };
+    required = [ ];
+  };
+  # Which slot, on which host, through which host CLI. Read on every operation,
+  # because `spec` runs before the operation is dispatched.
+  slotSelector = {
     slot.type = "string";
+    instance_name.type = "string";
     vm_host.type = "string";
+    dave_address.type = "string";
     command.type = "string";
-    lease_seconds = {
-      type = "integer";
-      minimum = 60;
+  };
+  # Host-only selectors: `reap` sweeps the whole host and never reads a slot, so
+  # naming one would promise a scoped sweep that the adapter does not perform.
+  hostSelector = {
+    vm_host.type = "string";
+    dave_address.type = "string";
+    command.type = "string";
+  };
+  createInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = slotSelector // {
+      lease_seconds = {
+        type = "integer";
+        minimum = 60;
+      };
+      allow_cold_start.type = "boolean";
+      adopt.type = "boolean";
     };
-    allow_cold_start.type = "boolean";
-    adopt.type = "boolean";
-  } [ ];
+  };
+  destroyInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = slotSelector // {
+      # Annotation only: the controller passes the create receipt here so the
+      # claim identity can be recovered. Named explicitly so create cannot
+      # receive it, and so destroy cannot receive the claim-time knobs
+      # (`lease_seconds`, `allow_cold_start`) that `release` never reads.
+      create = {
+        description = "Previous create receipt supplied by the controller.";
+      };
+    };
+  };
+  reapInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = hostSelector;
+  };
   operations = {
     inventory = {
       description = "Inspect Lima pool slots and host capacity.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = noInput;
       output_schema = output;
     };
     create = {
       description = "Claim one ready Lima pool slot for this environment.";
       mutating = true;
-      input_schema = providerInput;
+      input_schema = createInput;
       output_schema = output;
     };
     destroy = {
       description = "Release one previously claimed Lima pool slot.";
       mutating = true;
-      input_schema = providerInput;
+      input_schema = destroyInput;
       output_schema = output;
     };
     reap = {
       description = "Reclaim expired or orphaned Lima slots on the VM host.";
       mutating = true;
-      input_schema = providerInput;
+      input_schema = reapInput;
       output_schema = output;
     };
   };

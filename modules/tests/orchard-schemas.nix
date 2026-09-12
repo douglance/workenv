@@ -77,8 +77,9 @@ assert extension.location == "controller";
 assert extension.protocol_version == 1;
 assert !inventory.mutating;
 # The point of per-operation schemas: this one takes nothing, and says so.
-# A schema with additionalProperties = true would accept any input at all,
-# which is the state the Lima and pool provider schemas are in today.
+# A schema with additionalProperties = true would accept any input at all, which
+# is where the Lima and exe.dev providers started; modules/tests/provider-schemas.nix
+# now holds them to the same rule.
 assert inventory.input_schema.additionalProperties == false;
 assert inventory.input_schema.required == [ ];
 assert lib.elem "pending_count" inventory.output_schema.required;

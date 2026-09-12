@@ -31,6 +31,11 @@ pub use controller::{CallOptions, Controller};
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod adapter_failure_tests;
 #[cfg(test)]
+// Test-only, and only these: a test asserting a refusal must panic loudly when
+// the refusal it expected never happened.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod adapter_input_tests;
+#[cfg(test)]
 // Test-only, and only these: a test that cannot unwrap its own scratch file says
 // less than one that panics loudly when the fixture could not be created.
 #[allow(clippy::expect_used, clippy::unwrap_used)]

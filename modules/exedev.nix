@@ -10,49 +10,75 @@ let
     in
     provider != null && provider.extension == cfg.extensionId;
   workspaceManifest = builtins.fromTOML (builtins.readFile ../Cargo.toml);
-  object = properties: required: {
-    type = "object";
-    additionalProperties = true;
-    inherit properties required;
-  };
   output = {
     type = "object";
     additionalProperties = true;
   };
-  providerInput = object {
-    name.type = "string";
-    cpus = {
-      type = "integer";
-      minimum = 1;
+  # Per-operation schemas, for the reason set out in modules/orchard.nix: one
+  # shared schema spanning create and destroy has to accept the union of two
+  # incompatible inputs, so it constrains neither.
+  #
+  # The create properties are exactly the keys `provider/model.rs` reads out of
+  # `request.input`; destroy reads only `spec.name` and the receipt, so it
+  # declares only those.
+  noInput = {
+    type = "object";
+    additionalProperties = false;
+    properties = { };
+    required = [ ];
+  };
+  createInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = {
+      name.type = "string";
+      cpus = {
+        type = "integer";
+        minimum = 1;
+      };
+      memory_gb = {
+        type = "integer";
+        minimum = 1;
+      };
+      disk_gb = {
+        type = "integer";
+        minimum = 1;
+      };
+      region.type = "string";
+      adopt.type = "boolean";
     };
-    memory_gb = {
-      type = "integer";
-      minimum = 1;
+  };
+  destroyInput = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = {
+      # Annotation only: the controller passes the create receipt here so
+      # ownership can be verified before anything is removed.
+      create = {
+        description = "Previous create receipt supplied by the controller.";
+      };
+      name.type = "string";
     };
-    disk_gb = {
-      type = "integer";
-      minimum = 1;
-    };
-    region.type = "string";
-    adopt.type = "boolean";
-  } [ ];
+  };
   operations = {
     inventory = {
       description = "Inspect exe.dev VM inventory.";
       mutating = false;
-      input_schema = object { } [ ];
+      input_schema = noInput;
       output_schema = output;
     };
     create = {
       description = "Create or adopt one exe.dev worker resource.";
       mutating = true;
-      input_schema = providerInput;
+      input_schema = createInput;
       output_schema = output;
     };
     destroy = {
       description = "Destroy one previously owned exe.dev worker resource.";
       mutating = true;
-      input_schema = providerInput;
+      input_schema = destroyInput;
       output_schema = output;
     };
   };
