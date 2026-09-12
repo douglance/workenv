@@ -203,6 +203,18 @@ while [ "$#" -gt 0 ]; do if [ "$1" = --profile ]; then profile=$2; mkdir -p "$pr
         .output()?;
 
     fs::set_permissions(&prefix_parent, Permissions::from_mode(0o755))?;
+    assert_stub_nix_ran(&run, &nix_log, &path_arg(&fake_bin.join("nix"))?);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+/// What the install script actually did, when it did not do the expected thing.
+///
+/// Extracted to keep the test inside this repository's 60-line block limit, and
+/// because the failure it reports is the point: reading the stub's log used to fail
+/// with a bare "No such file or directory (os error 2)", which says nothing about why
+/// the stub never ran and cost two wrong diagnoses on a runner.
+fn assert_stub_nix_ran(run: &std::process::Output, nix_log: &std::path::Path, stub: &str) {
     let context = format!(
         "exit={:?}\nstdout:\n{}\nstderr:\n{}",
         run.status.code(),
@@ -210,15 +222,13 @@ while [ "$#" -gt 0 ]; do if [ "$1" = --profile ]; then profile=$2; mkdir -p "$pr
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(run.status.success(), "install script failed\n{context}");
-    let logged = fs::read_to_string(&nix_log).unwrap_or_else(|error| {
+    let logged = fs::read_to_string(nix_log).unwrap_or_else(|error| {
         panic!("the stub nix was never invoked ({error})\n{context}");
     });
     assert!(
-        logged.starts_with(&path_arg(&fake_bin.join("nix"))?),
+        logged.starts_with(stub),
         "the nix that ran was not the stub: {logged}\n{context}"
     );
-    fs::remove_dir_all(root)?;
-    Ok(())
 }
 
 fn request(operation: &str) -> Result<AdapterRequest> {
