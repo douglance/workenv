@@ -24,13 +24,28 @@
 //! and every banner line as program output.
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
-use workenv_platform::{ExecutionSpec, Executor};
+use workenv_platform::Executor;
 use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 
+use super::carrier::Carrier;
 use super::response;
 
 /// Milliseconds allowed for one guest command before the transport gives up.
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+
+/// Retries allowed when the carrier failed before running anything.
+const RETRIES: u32 = 2;
+
+/// Carrier stderr markers that mean the command never started.
+///
+/// Measured: `orchard ssh` answers "failed to setup port-forwarding to the VM
+/// ... expected handshake response status code 101 but got 500" intermittently,
+/// and six consecutive attempts succeeded immediately afterwards.
+const SETUP_FAILURES: &[&str] = &[
+    "failed to setup port-forwarding",
+    "failed to WebSocket dial",
+    "expected handshake response status code",
+];
 
 /// Exit statuses the wrapper reserves for its own failures.
 ///
@@ -148,38 +163,89 @@ pub(super) fn run(
         Ok(plan) => plan,
         Err(error) => return response(request, ResponseStatus::Failed, json!({}), Some(&error)),
     };
-    let carrier = carrier_argv(guest, &script(&argv, &cwd, &stdin));
-    let spec = ExecutionSpec {
-        executable: carrier[0].clone(),
-        arg: carrier[1..].to_vec(),
-        cwd: None,
-        stdin: None,
-        timeout_ms: timeout,
-        // Keyed on the controller's request so a retry returns the original
-        // receipt instead of running the command inside the guest twice.
-        idempotency_key: format!("workenv-orchard-execute:{}", request.request_id),
-        purpose: format!("Run {} in Orchard guest {guest}.", argv.join(" ")),
-    };
-    let output = match executor.execute(spec) {
-        Ok(output) => output,
-        Err(error) => {
-            return response(
-                request,
-                ResponseStatus::Failed,
-                json!({}),
-                Some(&error.to_string()),
-            );
+    let in_guest = carrier_argv(guest, &script(&argv, &cwd, &stdin));
+    let carrier = Carrier::new(request, guest, argv, in_guest, timeout);
+    for attempt in 0..=RETRIES {
+        let output = match executor.execute(carrier.spec(attempt)) {
+            Ok(output) => output,
+            Err(error) => {
+                return response(
+                    request,
+                    ResponseStatus::Failed,
+                    json!({}),
+                    Some(&error.to_string()),
+                );
+            }
+        };
+        let interpreted = interpret(&output.stdout);
+        // `orchard ssh` sets up a port-forward before running anything, and that
+        // setup intermittently fails with a WebSocket 500. The command provably
+        // never ran, so retrying cannot double-execute it -- and without this the
+        // caller saw only "guest did not return a transport result", which cost
+        // real debugging time twice before it was handled here.
+        let retryable = interpreted.is_err()
+            && attempt < RETRIES
+            && never_started(&output.stdout, &output.stderr);
+        if retryable {
+            continue;
         }
-    };
-    match interpret(&output.stdout) {
+        return answer(request, guest, &output, interpreted, attempt);
+    }
+    response(
+        request,
+        ResponseStatus::Failed,
+        json!({}),
+        Some("the carrier never started the command"),
+    )
+}
+
+/// Turn one finished attempt into the response, successful or not.
+fn answer(
+    request: &AdapterRequest,
+    guest: &str,
+    output: &workenv_platform::ExecutionOutput,
+    interpreted: Result<Value, String>,
+    attempt: u32,
+) -> AdapterResponse {
+    let mut answer = match interpreted {
         Ok(mut data) => {
             data["guest"] = json!(guest);
-            let mut answer = response(request, ResponseStatus::Ready, data, None);
-            answer.execution_id = Some(output.execution_id);
-            answer
+            response(request, ResponseStatus::Ready, data, None)
         }
-        Err(error) => response(request, ResponseStatus::Failed, json!({}), Some(&error)),
+        Err(error) => response(
+            request,
+            ResponseStatus::Failed,
+            json!({}),
+            Some(&detail(&error, &output.stderr, attempt)),
+        ),
+    };
+    // The execution identity is carried even on failure: without it there is no
+    // record to go and read, which is what made this opaque.
+    answer.execution_id = Some(output.execution_id.clone());
+    answer
+}
+
+/// Whether the carrier failed before the command could run.
+///
+/// Only then is a retry safe. Any output at all on stdout means the wrapper
+/// started, so the command may have run and must not be repeated.
+pub(super) fn never_started(stdout: &str, stderr: &str) -> bool {
+    if !stdout.trim().is_empty() {
+        return false;
     }
+
+    SETUP_FAILURES.iter().any(|marker| stderr.contains(marker))
+}
+
+/// What to say when the guest returned nothing usable.
+pub(super) fn detail(error: &str, stderr: &str, attempts: u32) -> String {
+    let trimmed = stderr.trim();
+    let carrier = if trimmed.is_empty() {
+        "the carrier wrote nothing to stderr either".to_owned()
+    } else {
+        format!("carrier stderr: {}", excerpt(trimmed))
+    };
+    format!("{error}; {carrier}; attempts: {}", attempts + 1)
 }
 
 /// Decode one base64 stream, treating undecodable bytes as empty.

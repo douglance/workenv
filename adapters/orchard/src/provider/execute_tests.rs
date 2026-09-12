@@ -7,7 +7,8 @@ use serde_json::json;
 use workenv_platform::{ExecutionOutput, ExecutionSpec, Executor};
 use workenv_protocol::ResponseStatus;
 
-use super::execute::{carrier_argv, interpret, plan, run, script};
+use super::carrier::Carrier;
+use super::execute::{carrier_argv, detail, interpret, never_started, plan, run, script};
 use super::test_support::request_with;
 
 /// An executor that returns canned output and records what it was asked to run.
@@ -197,4 +198,64 @@ fn the_plan_defaults_the_timeout_rather_than_running_unbounded() {
     let req = request_with("execute", json!({"argv": ["true"]}), None);
     let (_, _, _, timeout) = plan(&req).expect("a plan");
     assert!(timeout > 0, "a transport with no timeout can hang forever");
+}
+
+#[test]
+fn a_setup_failure_with_no_output_is_retryable() {
+    // Measured: `orchard ssh` sets up a port-forward before running anything and
+    // intermittently fails it with a WebSocket 500, after which six consecutive
+    // attempts succeeded. The command provably never ran, so a retry cannot
+    // double-execute it.
+    assert!(never_started(
+        "",
+        "ssh command failed: failed to setup port-forwarding to the VM \"g\": \
+         failed to WebSocket dial: expected handshake response status code 101 but got 500"
+    ));
+}
+
+#[test]
+fn any_output_at_all_makes_it_unsafe_to_retry() {
+    // Output means the wrapper started, so the command may have run. Retrying a
+    // mutating command here would run it twice.
+    assert!(!never_started(
+        "partial output",
+        "failed to setup port-forwarding"
+    ));
+}
+
+#[test]
+fn an_unrecognised_failure_is_not_retried() {
+    // Only failures known to happen before the command starts are retried.
+    // Treating every empty result as retryable would repeat a command that was
+    // killed midway.
+    assert!(!never_started("", "permission denied"));
+}
+
+#[test]
+fn the_failure_message_carries_the_carriers_own_stderr() {
+    // "guest did not return a transport result" alone cost real debugging time
+    // twice, because it named neither the cause nor anywhere to look.
+    let text = detail("no result", "failed to WebSocket dial", 1);
+    assert!(text.contains("failed to WebSocket dial"), "{text}");
+    assert!(text.contains("attempts: 2"), "{text}");
+}
+
+#[test]
+fn a_silent_carrier_says_so_rather_than_trailing_off() {
+    let text = detail("no result", "   ", 0);
+    assert!(text.contains("wrote nothing to stderr"), "{text}");
+}
+
+#[test]
+fn each_attempt_gets_its_own_execution_identity() {
+    // APoC returns the ORIGINAL receipt for a repeated idempotency key, so a
+    // retry sharing the first attempt's key would replay that first failure
+    // forever rather than actually trying again. The key must move per attempt
+    // while still being derived from the controller's request.
+    let req = request_with("execute", json!({"argv": ["true"]}), None);
+    let carrier = Carrier::for_tests(&req, "g", vec!["true".to_owned()]);
+    let first = carrier.spec(0).idempotency_key;
+    let second = carrier.spec(1).idempotency_key;
+    assert_ne!(first, second, "a retry would replay the first receipt");
+    assert!(first.contains(&req.request_id), "{first}");
 }

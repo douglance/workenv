@@ -3,6 +3,7 @@ mod access;
 #[cfg(test)]
 #[path = "provider/access_tests.rs"]
 mod access_tests;
+mod carrier;
 mod client;
 mod create;
 mod credentials;
