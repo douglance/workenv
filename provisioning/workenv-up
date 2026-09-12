@@ -37,7 +37,13 @@ else
     "${VM[@]}" "grep -q READY /tmp/$SLOT.log 2>/dev/null" && break
     sleep 5
   done
-  "${VM[@]}" "grep -q READY /tmp/$SLOT.log" || { echo "  guest did not become READY" >&2; exit 1; }
+  # Destroyed, not abandoned. `limactl start` keeps building after we stop
+  # waiting, and nothing else here ever deletes a guest -- so the half-built VM
+  # finishes on its own and the next run silently adopts it through the
+  # "already exists; reusing" branch above, skipping creation entirely.
+  "${VM[@]}" "grep -q READY /tmp/$SLOT.log" || {
+    "${VM[@]}" "limactl delete --force --tty=false $SLOT" >/dev/null 2>&1 || true
+    echo "  guest did not become READY" >&2; exit 1; }
   echo "  $SLOT is READY"
 fi
 

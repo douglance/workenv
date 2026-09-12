@@ -119,8 +119,13 @@ CRED_FILE="$HOME/.orchard/workenv-credentials"
 # The LAST match, not the first: a re-run appends a fresh bootstrap line and a
 # previous line may have been redacted after rotation. `head -1` would read the
 # stale one and write credentials that cannot authenticate.
+# No match is an answer, not an error. `grep -v` exits 1 when it filters
+# everything, and under pipefail that becomes the pipeline's status -- which
+# defeats the exemption set -e grants a command substitution in an assignment, so
+# a log with no bootstrap line aborted the script here, right after "5/5", and
+# both credential branches below were unreachable.
 read_logged() { sed -n "s/.*$1: //p" "$LOG_DIR/orchard-controller.log" 2>/dev/null \
-  | sed $'s/\033\[[0-9;]*m//g' | tr -d '\r' | grep -v '^<redacted' | tail -1; }
+  | sed $'s/\033\[[0-9;]*m//g' | tr -d '\r' | grep -v '^<redacted' | tail -1 || true; }
 ADMIN_ACCOUNT="$(read_logged 'Service account name')"
 ADMIN_TOKEN="$(read_logged 'Service account token')"
 

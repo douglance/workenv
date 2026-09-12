@@ -79,6 +79,16 @@ cat > "$TUNNEL_PLIST" <<PLIST_EOF
 PLIST_EOF
 launchctl bootout "gui/$UID/$TUNNEL_LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$TUNNEL_PLIST"
+# KeepAlive outlives this script, and every step after this one fails by an
+# explicit `exit 1`: the reachability probe, the token mint, the verify. Without
+# a teardown a failed enrol left a permanent `ssh -R` agent re-dialling $TARGET
+# with nothing on either end using the forward. Hung off EXIT rather than ERR
+# because, measured, bash runs no ERR trap for an explicit exit -- an ERR trap
+# here would have caught none of the three paths that actually fail.
+drop_tunnel_unless_ok() {
+  [ "$1" -eq 0 ] || launchctl bootout "gui/$UID/$TUNNEL_LABEL" 2>/dev/null || true
+}
+trap 'drop_tunnel_unless_ok "$?"' EXIT
 sleep 4
 # 401 means reachable and authenticating, which is the goal. `curl -f` would
 # read a correctly-secured controller as an unreachable one.
@@ -152,6 +162,10 @@ for _ in $(seq 1 20); do
   orchard list workers 2>/dev/null | grep -q "^$NAME" && break
   sleep 2
 done
-orchard list workers 2>/dev/null | grep -E "^Name|^$NAME" || {
+# Gated on the worker's own row, never on the table. `grep -E "^Name|^$NAME"`
+# matched the header `orchard list workers` always prints, so this step passed
+# whatever happened and reported an enrolled worker that had never registered.
+orchard list workers 2>/dev/null | grep -q "^$NAME" || {
   echo "worker $NAME did not register" >&2; exit 1; }
+orchard list workers 2>/dev/null || true
 echo "worker $NAME enrolled"

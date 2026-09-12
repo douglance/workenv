@@ -45,14 +45,22 @@ cmd_start() {
   local supervisor=$!
   disown 2>/dev/null || true
 
+  # Recorded before the probe, not after. The supervisor is already running, so a
+  # probe that never answers used to exit leaving it re-dialling ssh every 5s with
+  # no handle on disk for `stop` to find it by -- only a reboot cleared it.
+  printf '{"slot":"%s","bind":"%s","port":%s,"guest_port":%s,"supervisor":%s}\n' \
+    "$slot" "$bind" "$port" "$guest_port" "$supervisor" > "$STATE/$slot.json"
+
   for _ in $(seq 1 20); do
     probe "$bind" "$port" && break
     sleep 1
   done
   probe "$bind" "$port" || { echo "forward for $slot never answered on $port" >&2
-                             tail -5 "$STATE/$slot.log" >&2; exit 1; }
-  printf '{"slot":"%s","bind":"%s","port":%s,"guest_port":%s,"supervisor":%s}\n' \
-    "$slot" "$bind" "$port" "$guest_port" "$supervisor" > "$STATE/$slot.json"
+                             tail -5 "$STATE/$slot.log" >&2
+                             # Tears down the supervisor and any ssh it is
+                             # holding, in that order, and clears the json.
+                             cmd_stop "$slot" >/dev/null 2>&1 || true
+                             exit 1; }
   echo "$slot published on $bind:$port"
 }
 

@@ -332,19 +332,32 @@ def slot_quote(value):
 def cmd_reap(_a):
     def run_reap():
         now = int(time.time())
-        reaped, kept = [], []
+        reaped, kept, failed = [], [], []
         for slot, (inst, record) in slots_with_records().items():
             claim = (record or {}).get("claim")
             if claim and now > claim["lease_until"]:
-                run(["limactl", "delete", "--force", "--tty=false", slot],
-                    timeout=180)
+                out = run(["limactl", "delete", "--force", "--tty=false", slot],
+                          timeout=180)
+                # The claim stays when the guest survived the delete, exactly as
+                # release does. Nulling it drops the slot out of this loop's own
+                # selection forever -- it only ever looks at slots that still hold
+                # a claim -- while cmd_claim, which skips nothing but "claimed",
+                # re-lets the still-running guest to the next tenant with the
+                # previous tenant's credentials on its disk.
+                if out.returncode != 0 and slot in [i["name"] for i in lima_list()]:
+                    failed.append({"slot": slot,
+                                   "error": out.stderr.strip()[:300]})
+                    continue
                 record.update(state="released",
                               generation=record["generation"] + 1, claim=None)
                 write_slot(slot, record)
                 reaped.append(slot)
             elif claim:
                 kept.append(slot)
-        return {"reaped": reaped, "kept": kept, "tailnet_removed": []}
+        # reaped names only guests that are actually gone; a caller may treat it
+        # as the set whose capacity has come back.
+        return {"reaped": reaped, "kept": kept, "failed": failed,
+                "tailnet_removed": []}
     return locked(run_reap)
 
 

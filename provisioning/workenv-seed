@@ -69,17 +69,23 @@ put_secret "$HOME/.codex/auth.json" ".codex/auth.json"
 put_secret "$HOME/.grok/auth.json"  ".grok/auth.json"
 
 # Claude Code keeps credentials in the macOS Keychain; Linux reads a file.
-if security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
-  if security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
-     | "${SSH[@]}" "$TARGET" 'cat > ~/.claude/.credentials.json && chmod 600 ~/.claude/.credentials.json'; then
-    n=$("${SSH[@]}" "$TARGET" 'wc -c < ~/.claude/.credentials.json' 2>/dev/null | tr -d ' ')
-    printf '  %-28s installed 0600 (%s bytes, from Keychain)\n' ".claude/.credentials.json" "$n"
-  else
-    printf '  %-28s Keychain read denied\n' ".claude/.credentials.json"
-  fi
+# Captured here first, rather than piped straight into the remote `cat >`. The
+# remote redirection truncates the guest's credential file the moment the pipe
+# opens, which is before `security -w` is known to have succeeded -- so a denied
+# Keychain read replaced a working credential with a 0-byte one, and the guest's
+# next claude invocation failed to authenticate with nothing to point at.
+CLAUDE_CREDS="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+if [ -n "$CLAUDE_CREDS" ]; then
+  printf '%s' "$CLAUDE_CREDS" \
+    | "${SSH[@]}" "$TARGET" 'cat > ~/.claude/.credentials.json && chmod 600 ~/.claude/.credentials.json'
+  n=$("${SSH[@]}" "$TARGET" 'wc -c < ~/.claude/.credentials.json' 2>/dev/null | tr -d ' ')
+  printf '  %-28s installed 0600 (%s bytes, from Keychain)\n' ".claude/.credentials.json" "$n"
+elif security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+  printf '  %-28s Keychain read denied\n' ".claude/.credentials.json"
 else
   printf '  %-28s no Keychain entry\n' ".claude/.credentials.json"
 fi
+unset CLAUDE_CREDS
 
 log "seed summary"
 "${SSH[@]}" "$TARGET" 'for p in .claude/skills .claude/commands .codex/skills .agents/skills; do

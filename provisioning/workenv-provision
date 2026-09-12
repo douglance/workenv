@@ -90,11 +90,17 @@ if [ -d "$WORKENV_SRC/modules" ]; then
   };
 }
 NIXEOF
+  # One missing tool must not end the body. As the last statement in it, a failed
+  # `[ -n "$b" ]` became the body's exit status, so a single unresolved tool took
+  # the whole run down here at step 4/8 -- silently, because the only output was
+  # the abort -- and steps 5/8 through 7/8 never ran.
   ( cd "$HOME/.workenv-toolshell" && devenv shell -- bash -c '
       for t in devsql codex claude grok pi herdr; do
         b=$(type -a "$t" 2>/dev/null | grep -o "/nix/store[^ ]*" | head -1)
-        [ -n "$b" ] && ln -sfn "$b" "$HOME/.local/bin/$t"
-      done' )
+        if [ -z "$b" ]; then echo "  WARN $t not in the devenv shell" >&2; continue; fi
+        ln -sfn "$b" "$HOME/.local/bin/$t"
+      done
+      exit 0' )
   echo "  linked from the nix store: $(ls "$HOME/.local/bin" | tr "\n" " ")"
 else
   echo "WARN workenv source absent at $WORKENV_SRC; tools not installed"
@@ -118,8 +124,12 @@ MEM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
 # remember to raise is not a guard; swap costs disk and nothing else.
 if ! swapon --show 2>/dev/null | grep -q swapfile; then
   echo "adding 8G swap for the build (${MEM_MB}MB RAM)"
+  # Visible and non-fatal. Inside a bare `&&` list a failed fallocate printed
+  # nothing, left no swap behind the message that said it had added some, and the
+  # run continued to the build where rustc was then SIGKILLed instead.
   sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
-    && sudo mkswap -q /swapfile && sudo swapon /swapfile
+    && sudo mkswap -q /swapfile && sudo swapon /swapfile \
+    || echo "WARN swap setup failed; a large build may be OOM-killed"
 fi
 # Budget roughly 4 GB of RAM per concurrent rustc rather than picking a number.
 # codegen-units=1 at opt-level=3 makes the final crate the peak, and that peak
@@ -150,7 +160,10 @@ fi
 if [ -x "$BIN/nib" ]; then
   echo "nib present: $($BIN/nib --version 2>&1 | head -1)"
 elif command -v cargo >/dev/null 2>&1 || [ -f "$HOME/.cargo/env" ]; then
-  . "$HOME/.cargo/env"
+  # The condition admits a cargo that came from nix rather than rustup, and that
+  # cargo has no env file. Sourcing it unconditionally aborted the run here with
+  # "No such file or directory", taking steps 6b/8 and 7/8 with it.
+  if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
   [ -d "$HOME/src/nib" ] || git clone --depth 1 https://github.com/douglance/nib.git "$HOME/src/nib"
   # nib ships no Cargo.lock, so --locked cannot be used here.
   ( cd "$HOME/src/nib" && CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release -j"$BUILD_JOBS" ) \
