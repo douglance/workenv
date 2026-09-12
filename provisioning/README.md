@@ -144,8 +144,9 @@ that. They measure different things — and that *is* the point: the re-platform
 provisioning out of the per-spawn path and into a one-time image bake. Spawn becomes an
 APFS clone of an already-provisioned disk.
 
-The remaining work to make the comparison exact is baking the workenv toolchain into the
-image; the spawn cost does not change when you do, only the image tag does.
+That caveat has since been closed: the `workenv-base` bake above carries the toolchain, and
+the spawn cost did not move when it was added -- only the image tag did. This section is kept
+as the bare-image control, because it is what isolates clone-and-boot from provisioning.
 
 ### The scheduler actually enforces resources
 
