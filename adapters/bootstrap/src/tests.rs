@@ -174,7 +174,21 @@ while [ "$#" -gt 0 ]; do if [ "$1" = --profile ]; then profile=$2; mkdir -p "$pr
             &format!("PATH={}:$link_dir:$PATH", shell_arg(&path_arg(&fake_bin)?)),
         );
 
-    let status = Command::new("bash").arg("-c").arg(script).status()?;
+    // PATH is set, unlike before, so nothing ambient decides this test.
+    //
+    // Two things leaked in. `sudo_for_path` runs before the script rewrites PATH, so
+    // it consulted the real sudo -- passwordless on a runner, not here. And the
+    // version gate `devenv version | grep -F "$devenv_version"` saw whatever devenv
+    // was on PATH: the gate runs inside the pinned devenv shell on CI, so the
+    // version matched, the whole install block was skipped, the stub nix never ran,
+    // and reading its log failed with ENOENT. It passed here only because this
+    // machine's devenv (2.2.2) is older than the pin (2.3). `fake_bin` holds only
+    // `sudo` and `nix`, so `devenv` does not resolve and the gate always opens.
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .status()?;
 
     fs::set_permissions(&prefix_parent, Permissions::from_mode(0o755))?;
     assert!(status.success());
