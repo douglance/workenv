@@ -292,7 +292,23 @@ fn int_field(value: &Value, key: &str) -> Option<u64> {
 pub(super) fn setup_args(spec: &Spec) -> Vec<String> {
     match spec.setup_script.as_deref() {
         Some(script) if !script.trim().is_empty() => {
-            vec!["--setup-script".into(), script.to_owned()]
+            // The script travels on stdin, and only the sentinel path is passed
+            // as an argument. Two measured reasons, both of which produce a
+            // *successful* create with an unprovisioned guest:
+            //
+            // A multi-line value is silently discarded -- the VM came up
+            // `running` with `has_creation_log: false`, no nix, no devenv and an
+            // empty shell directory, while create reported success.
+            //
+            // And exe.dev's argument parser splits on spaces rather than
+            // honouring quoting, so folding the script onto one line does not
+            // help either: a base64 one-liner failed with "flag provided but not
+            // defined: -d", having read `base64 -d` as flags to `new`.
+            //
+            // `/dev/stdin` is exe.dev's own documented answer, and it works here
+            // because this is a single hop to the relay -- unlike the nested
+            // `ssh exe.dev ssh <vm>` used by the transport, which drops stdin.
+            vec!["--setup-script".into(), "/dev/stdin".into()]
         }
         _ => Vec::new(),
     }

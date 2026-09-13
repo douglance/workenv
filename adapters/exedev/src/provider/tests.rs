@@ -271,9 +271,14 @@ fn a_configured_setup_script_reaches_the_create_command() {
         adopt: false,
         setup_script: Some("echo provisioning".into()),
     };
+    // The script itself must NOT be in argv. exe.dev discards a multi-line value
+    // silently -- a VM came up `running` with `has_creation_log: false`, no nix
+    // and no devenv while create reported success -- and its parser splits a
+    // single-line value on spaces, so a base64 one-liner failed with "flag
+    // provided but not defined: -d". `/dev/stdin` is its documented channel.
     assert_eq!(
         setup_args(&spec),
-        vec!["--setup-script".to_owned(), "echo provisioning".to_owned()]
+        vec!["--setup-script".to_owned(), "/dev/stdin".to_owned()]
     );
 }
 

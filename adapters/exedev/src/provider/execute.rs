@@ -144,7 +144,7 @@ pub(super) fn dispatch<R: Runner>(
             json!({
                 "status": "connection",
                 "guest": vm,
-                "attach_argv": attach_argv(&vm),
+                "attach_argv": attach_argv(request, &vm),
                 "reaches_by": "exe.dev-relay",
             }),
             None,
@@ -197,15 +197,41 @@ fn run<R: Runner>(request: &AdapterRequest, runner: &mut R, vm: &str) -> Adapter
 ///
 /// No cluster read at all, deliberately: this answers even when the relay is
 /// briefly unreachable, and the caller finds out at attach time either way.
-fn attach_argv(vm: &str) -> Vec<String> {
-    vec![
-        "ssh".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "exe.dev".into(),
-        "ssh".into(),
-        vm.into(),
-    ]
+///
+/// `request` may carry the argv core wants run, because an environment binding
+/// no `connection` still reaches here through the host's transport, and core
+/// then supplies the devenv shell argv and the directory to run it in. Those are
+/// folded into a single trailing argument: the relay takes two positionals, so
+/// spreading a command across several silently loses all but the first.
+fn attach_argv(request: &AdapterRequest, vm: &str) -> Vec<String> {
+    let mut argv = vec![
+        "ssh".to_owned(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "exe.dev".to_owned(),
+        "ssh".to_owned(),
+        vm.to_owned(),
+    ];
+    let inner: Vec<String> = request
+        .input
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(shell_quote)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !inner.is_empty() {
+        let cwd = request.input.get("cwd").and_then(Value::as_str);
+        let command = inner.join(" ");
+        argv.push(cwd.map_or(command.clone(), |dir| {
+            format!("cd {} && {command}", shell_quote(dir))
+        }));
+    }
+    argv
 }
 
 fn observe<R: Runner>(runner: &mut R, args: &[String]) -> ProviderResult<Value> {

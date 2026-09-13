@@ -265,7 +265,7 @@ impl<R: Runner> Provider<R> {
     }
 
     fn create_vm(&mut self, request: &AdapterRequest, spec: &Spec) -> ProviderResult<Value> {
-        self.runner.mutate(
+        self.runner.mutate_stdin(
             request.request_id.as_str(),
             &[
                 "new".into(),
@@ -285,6 +285,7 @@ impl<R: Runner> Provider<R> {
             .into_iter()
             .chain(setup_args(spec))
             .collect::<Vec<_>>(),
+            spec.setup_script.as_deref(),
         )
     }
 }

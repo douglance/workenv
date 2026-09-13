@@ -107,7 +107,16 @@ in
       # directory -> realize. `project` is absent because its repository comes
       # from static binding config and a generic slot has no single repository.
       integrations = [ ];
-      connection = exedevBinding;
+      # No connection binding, and that is a size decision as much as a design
+      # one. Core refuses an environment whose repeated bindings of one extension
+      # differ, so a connection binding here would have to repeat the provider's
+      # config -- setup script included -- once per slot. Measured, that put 19
+      # copies of the script into the manifest, inflated it to 80 KB and pushed
+      # evaluation past its 300s budget, so `up` died with "manifest evaluation
+      # failed with exit code 128". With this absent, core falls back to the
+      # host's transport for `connect`, which is the same adapter reached with an
+      # empty config, and the script appears exactly once.
+      connection = null;
     });
   };
 }

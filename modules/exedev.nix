@@ -96,7 +96,22 @@ let
       stderr.type = "string";
     };
   };
-  connectInput = closed { name.type = "string"; } [ ];
+  # `argv` and `cwd` are declared because an environment that binds no
+  # `connection` still reaches `connect` -- core falls back to the host's
+  # transport and passes the devenv shell argv it wants run (connection.rs).
+  # Without them that call is rejected by this very schema, so the slots would
+  # each have to carry a duplicate connection binding, and with it a second copy
+  # of the setup script: measured, that duplication put 19 copies into the
+  # manifest, inflated it to 80 KB, and pushed evaluation past the 300s budget
+  # until create failed with "manifest evaluation failed with exit code 128".
+  connectInput = closed {
+    name.type = "string";
+    cwd.type = "string";
+    argv = {
+      type = "array";
+      items.type = "string";
+    };
+  } [ ];
   connectOutput = {
     type = "object";
     additionalProperties = true;

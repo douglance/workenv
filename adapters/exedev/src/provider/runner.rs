@@ -8,6 +8,23 @@ pub(super) trait Runner {
 
     fn mutate(&mut self, request_id: &str, args: &[String]) -> ProviderResult<Value>;
 
+    /// A mutation that also sends a payload on stdin.
+    ///
+    /// Exists for `create`'s setup script, which cannot travel in argv: exe.dev
+    /// discards a multi-line value and its parser splits a single-line one on
+    /// spaces. `/dev/stdin` is its documented channel, and stdin survives this
+    /// single hop even though it does not survive the nested relay the transport
+    /// uses. Defaults to the plain mutation so a payload-free caller is
+    /// unchanged.
+    fn mutate_stdin(
+        &mut self,
+        request_id: &str,
+        args: &[String],
+        _stdin: Option<&str>,
+    ) -> ProviderResult<Value> {
+        self.mutate(request_id, args)
+    }
+
     /// The relay's stdout, unparsed.
     ///
     /// `observe` exists for the exe.dev CLI's own `--json` output and fails when
@@ -54,6 +71,15 @@ impl<E: Executor> Runner for SshRunner<E> {
         self.run(args, mutation_key(request_id, args))
     }
 
+    fn mutate_stdin(
+        &mut self,
+        request_id: &str,
+        args: &[String],
+        stdin: Option<&str>,
+    ) -> ProviderResult<Value> {
+        self.run_stdin(args, mutation_key(request_id, args), stdin)
+    }
+
     fn observe_raw(&mut self, args: &[String], timeout_ms: u64) -> ProviderResult<String> {
         self.run_raw(
             args,
@@ -91,13 +117,22 @@ impl<E: Executor> SshRunner<E> {
     }
 
     fn run(&self, args: &[String], idempotency_key: String) -> ProviderResult<Value> {
+        self.run_stdin(args, idempotency_key, None)
+    }
+
+    fn run_stdin(
+        &self,
+        args: &[String],
+        idempotency_key: String,
+        stdin: Option<&str>,
+    ) -> ProviderResult<Value> {
         let output = self
             .executor
             .execute(ExecutionSpec {
                 executable: "ssh".into(),
                 arg: ssh_args(args),
                 cwd: Some(self.cwd.clone()),
-                stdin: None,
+                stdin: stdin.map(|text| text.as_bytes().to_vec()),
                 timeout_ms: 180_000,
                 idempotency_key,
                 purpose: "Run exe.dev provider command through APoC.".into(),
