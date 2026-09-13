@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Bake the guest image Orchard schedules, and refuse to publish a dirty one.
+#
+# Why this exists: `workenv-base` was baked by hand on one Mac. Nothing reproduced
+# it, so `tart list` showed it `local` on the controller only and Orchard -- which
+# assigns guests to a worker -- failed every time with
+#
+#   failed to clone the VM: tart command failed: "the specified VM
+#   \"workenv-base\" does not exist"
+#
+# Measured: a bare `ghcr.io/cirruslabs/ubuntu:latest` guest reaches `running` in 19s,
+# and the baked image fails at ~290s. So fast boot and a ready toolchain were
+# mutually exclusive: the fast image had no toolchain, and the image with the
+# toolchain could not be scheduled at all.
+#
+# A registry-hosted image fixes that -- any worker can pull it -- but publishing a
+# 15 GB filesystem from a machine that also seeds credentials is not something to do
+# on trust. `--push` therefore runs an explicit credential audit first and refuses on
+# any hit.
+set -euo pipefail
+
+BASE="ghcr.io/cirruslabs/ubuntu:latest"
+NAME="workenv-base"
+GUEST_USER="admin"
+DISK_GB=48
+CPU=4
+MEMORY_MB=8192
+PUSH_REF=""
+REBUILD=0
+
+usage() {
+  cat >&2 <<USAGE
+usage: workenv-bake [options]
+
+  --base REF        image to clone from (default: $BASE)
+  --name NAME       local image name to produce (default: $NAME)
+  --user USER       guest login for provisioning (default: $GUEST_USER)
+  --disk GB         disk size (default: $DISK_GB)
+  --cpu N           vcpus (default: $CPU)
+  --memory MB       memory (default: $MEMORY_MB)
+  --rebuild         delete and rebake an existing local image
+  --push REF        after baking and auditing, push to REF
+                    (run 'tart login <registry>' yourself first; this script
+                     never handles a token)
+
+Without --push nothing leaves this machine.
+USAGE
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) BASE="$2"; shift 2 ;;
+    --name) NAME="$2"; shift 2 ;;
+    --user) GUEST_USER="$2"; shift 2 ;;
+    --disk) DISK_GB="$2"; shift 2 ;;
+    --cpu) CPU="$2"; shift 2 ;;
+    --memory) MEMORY_MB="$2"; shift 2 ;;
+    --rebuild) REBUILD=1; shift ;;
+    --push) PUSH_REF="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "unknown option: $1" >&2; usage ;;
+  esac
+done
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+provision="$here/workenv-provision"
+[ -x "$provision" ] || { echo "missing $provision" >&2; exit 1; }
+command -v tart >/dev/null || { echo "tart is not installed" >&2; exit 1; }
+
+step() { printf '\n==> %s\n' "$*"; }
+
+vm_exists() { tart list --format json 2>/dev/null | grep -q "\"$NAME\"" ; }
+
+# The VM is stopped on every exit path, so a failed bake does not leave a running
+# guest holding a tart slot the worker needs.
+running=0
+cleanup() {
+  if [ "$running" = 1 ]; then
+    tart stop "$NAME" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+step "clone $BASE -> $NAME"
+if vm_exists; then
+  if [ "$REBUILD" = 1 ]; then
+    tart delete "$NAME"
+    tart clone "$BASE" "$NAME"
+  else
+    echo "    $NAME exists; pass --rebuild to start from $BASE again"
+  fi
+else
+  tart clone "$BASE" "$NAME"
+fi
+
+step "size it"
+tart set "$NAME" --disk-size "$DISK_GB" --cpu "$CPU" --memory "$MEMORY_MB"
+
+step "boot headless"
+tart run --no-graphics "$NAME" >/dev/null 2>&1 &
+running=1
+
+step "wait for an address"
+ip=""
+for _ in $(seq 1 90); do
+  ip="$(tart ip "$NAME" 2>/dev/null || true)"
+  [ -n "$ip" ] && break
+  sleep 2
+done
+[ -n "$ip" ] || { echo "the guest never reported an address" >&2; exit 1; }
+echo "    $ip"
+
+ssh_guest() {
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=10 -o LogLevel=ERROR "$GUEST_USER@$ip" "$@"
+}
+
+step "wait for sshd"
+for _ in $(seq 1 90); do
+  ssh_guest true >/dev/null 2>&1 && break
+  sleep 2
+done
+ssh_guest true >/dev/null 2>&1 || { echo "sshd never answered at $ip" >&2; exit 1; }
+
+step "provision (workenv-provision, idempotent)"
+ssh_guest 'cat > /tmp/workenv-provision && chmod +x /tmp/workenv-provision' < "$provision"
+ssh_guest 'sudo -n true 2>/dev/null || true; /tmp/workenv-provision'
+
+# An image that boots fast and cannot build anything is the problem this is meant to
+# solve, so the toolchain is verified in the guest rather than assumed.
+step "verify the toolchain is actually in the image"
+missing=0
+for probe in 'nix --version' 'devenv version' 'apoc --version' 'git --version'; do
+  printf '    %-18s ' "${probe%% *}"
+  if out="$(ssh_guest "bash -lc '$probe'" 2>/dev/null)"; then
+    printf '%s\n' "$out" | head -1
+  else
+    echo "MISSING"
+    missing=1
+  fi
+done
+[ "$missing" = 0 ] || { echo "the image is not ready; not continuing" >&2; exit 1; }
+
+# The audit. A base image must carry tools and no identities: workenv-seed streams
+# credentials into guests at `up` time, and anything of that shape baked in would be
+# published to every worker that pulls this.
+step "audit for credentials and machine identity"
+dirty="$(ssh_guest 'bash -lc "
+  for p in \
+    \$HOME/.claude/.credentials.json \
+    \$HOME/.codex/auth.json \
+    \$HOME/.grok/auth.json \
+    \$HOME/.config/gh/hosts.yml \
+    \$HOME/.orchard \
+    \$HOME/.ssh/id_rsa \$HOME/.ssh/id_ed25519 \
+    /var/lib/tailscale/tailscaled.state \
+    /etc/ssh/ssh_host_ed25519_key ; do
+    [ -e \"\$p\" ] && echo \"\$p\"
+  done
+  true
+"' 2>/dev/null || true)"
+
+if [ -n "$dirty" ]; then
+  echo "    found:"
+  printf '%s\n' "$dirty" | while IFS= read -r path; do
+    [ -n "$path" ] && echo "      $path"
+  done
+else
+  echo "    clean"
+fi
+
+step "stop"
+tart stop "$NAME" >/dev/null 2>&1 || true
+running=0
+
+if [ -z "$PUSH_REF" ]; then
+  step "done (local only)"
+  cat <<DONE
+    $NAME is built on this machine and nowhere else, which is exactly the state
+    that made Orchard fail. To make it schedulable on any worker:
+
+      tart login <registry>          # you hold the token, not this script
+      workenv-bake --push <ref>
+
+    Then point the fleet at it, in presets/personal.nix:
+
+      orchardBinding = {
+        extension = "workenv.orchard";
+        config.image = "<ref>";
+      };
+DONE
+  exit 0
+fi
+
+if [ -n "$dirty" ]; then
+  cat >&2 <<REFUSE
+
+refusing to push: the image carries files that look like credentials or a machine
+identity, listed above. Pushing would copy them to every worker that pulls this
+image, and to anyone who can read the registry. Remove them in the guest and
+re-run, or push a ref you have decided is private and acceptable by hand.
+REFUSE
+  exit 1
+fi
+
+step "push $NAME -> $PUSH_REF"
+echo "    15 GB or so; this takes a while"
+tart push "$NAME" "$PUSH_REF"
+
+step "done"
+cat <<PUSHED
+    Pushed $PUSH_REF.
+
+    Point the fleet at it in presets/personal.nix:
+
+      orchardBinding = {
+        extension = "workenv.orchard";
+        config.image = "$PUSH_REF";
+      };
+
+    A private package also needs the worker to authenticate, so run
+    'tart login <registry>' on the worker as well, or publish the image.
+PUSHED
