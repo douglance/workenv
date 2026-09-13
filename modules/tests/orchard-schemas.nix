@@ -43,25 +43,23 @@ let
       ];
     };
   normal = (evaluate { }).config;
-  # Enabling orchard must not disturb the provider already serving real hosts.
-  # pool shipped enabled-by-nothing; this asserts orchard is actually reachable
-  # and that lima keeps its extension and its assertions when both are on.
-  withLima =
+  # Enabling orchard must not disturb another provider configured beside it. This
+  # was written against Lima, which Orchard has since replaced; it is retargeted at
+  # exedev rather than dropped, because the guarantee is about coexistence and not
+  # about which provider happens to be the other one. `pool` once shipped
+  # enabled-by-nothing, so this also asserts orchard is genuinely reachable.
+  withExedev =
     (evaluate {
-      imports = [ ../lima.nix ];
-      workenv.lima.enable = true;
-      workenv.lima.package = pkgs.hello;
-      workenv.hosts.guest = {
-        address = "user@guest.example";
-        transport = "workenv.ssh";
-        provider = {
-          extension = "workenv.lima";
-          config.vm_host = "vmhost.example";
-        };
+      imports = [ ../exedev.nix ];
+      workenv.exedev.enable = true;
+      workenv.exedev.package = pkgs.hello;
+      workenv.hosts.cloud.provider = {
+        extension = "workenv.exedev";
+        config.name = "disposable";
       };
-      workenv.environments.guest = {
-        host = "guest";
-        directory = "/tmp/guest";
+      workenv.environments.cloud = {
+        host = "cloud";
+        directory = "/tmp/cloud";
         source = "path:/tmp/config";
         ephemeral = true;
       };
@@ -143,9 +141,9 @@ assert lib.all (entry: entry.assertion) normal.assertions;
 # An empty controller URL must be refused, not defaulted around.
 assert lib.any (entry: !entry.assertion) emptyUrl.assertions;
 assert renamed.workenv.extensions ? "personal.orchard";
-assert withLima.workenv.extensions ? "workenv.orchard";
-assert withLima.workenv.extensions ? "workenv.lima";
-assert lib.all (entry: entry.assertion) withLima.assertions;
+assert withExedev.workenv.extensions ? "workenv.orchard";
+assert withExedev.workenv.extensions ? "workenv.exedev";
+assert lib.all (entry: entry.assertion) withExedev.assertions;
 {
   controller_located = true;
   inventory_is_observation = true;
@@ -158,5 +156,5 @@ assert lib.all (entry: entry.assertion) withLima.assertions;
   guests_are_reachable_without_an_address = true;
   broken_port_forward_is_not_declared = true;
   guests_are_reachable_as_a_transport = true;
-  coexists_with_lima = true;
+  coexists_with_another_provider = true;
 }

@@ -72,19 +72,16 @@ in
     # never renames it. The user is `box-03` because that is the Lima guest user;
     # `fleet.json` says `exedev`, and the two want reconciling when the guest
     # gains its own account.
+    # Migrated off the Lima pool onto Orchard. The slot registry, the fixed
+    # `box-03@wkv-01...` address and the `workenv-lima` shell command are all gone:
+    # the scheduler chooses the worker after this manifest is written, so there is
+    # no address to declare, and `workenv.orchard` is provider, transport and
+    # connection at once -- the same shape `wkv-fast` already used.
     hosts."wkv-01" = {
-      address = "box-03@wkv-01.example.ts.net";
-      transport = "workenv.ssh";
+      address = null;
+      transport = "workenv.orchard";
       system = "aarch64-linux";
-      provider = {
-        extension = "workenv.lima";
-        config = {
-          vm_host = "box-03.example.ts.net";
-          command = "workenv-lima";
-          slot = "wkv-01";
-          lease_seconds = 14400;
-        };
-      };
+      provider = orchardBinding;
     };
 
     # An address-free host. This is the whole point of the Orchard path: the
@@ -116,19 +113,15 @@ in
       directory = "/home/box-03.linux/workenv";
       source = "/home/box-03.linux/workenv";
       ephemeral = true;
-      # herdr appears here as well as in `connection` because it declares a
-      # `register` operation, and lifecycle up refuses a connection extension
-      # that supports register unless the identical binding is also an
-      # integration. Without this, `environment up` bails before doing any work.
       integrations = [
         { extension = "workenv.identity"; }
         { extension = "workenv.bootstrap"; }
         workenvProject
-        { extension = "workenv.herdr"; }
       ];
-      connection = {
-        extension = "workenv.herdr";
-      };
+      # Reaching in is the provider's own job here, as for wkv-fast. herdr was
+      # only ever an integration because it was also the connection, and a
+      # connection extension declaring `register` must be bound both ways.
+      connection = orchardBinding;
     };
 
     # Measured at 7s from create to ssh-ready against a 4354s baseline, because
@@ -180,11 +173,11 @@ in
         # with "workenv.clipboard does not support aarch64-darwin" -- every
         # command, not just the ones that would have used it.
         { extension = "workenv.bootstrap"; }
-        { extension = "workenv.herdr"; }
       ];
-      connection = {
-        extension = "workenv.herdr";
-      };
+      # No connection extension: `connection` is `nullOr` and defaults to null,
+      # and core then falls back to a devenv shell (connection.rs:15). This host
+      # *is* the controller, so there is nothing to reach into -- herdr was
+      # answering a question this environment does not ask.
     };
   };
 }

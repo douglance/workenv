@@ -3,7 +3,8 @@
 # Two lists were maintained by hand and both had silently gone stale. The
 # release workflow's `packages=(...)` array shipped neither
 # workenv-adapter-lima nor workenv-adapter-orchard, so the only provider in a
-# release tarball was exedev. The quality workflow's expected-extension list
+# release tarball was exedev. (Lima has since been replaced by Orchard and
+# removed; the hole it exposed is what this suite exists for.) The quality workflow's expected-extension list
 # named nine extensions and never mentioned orchard or project, so a manifest
 # with both missing entirely passed that check green -- verified by running the
 # workflow's own jq against such a manifest.
@@ -120,7 +121,7 @@ in
 assert declared == expected;
 # Neither side vacuous: `==` over two empty lists is true, and a readDir that
 # returned nothing would satisfy the assertion above while proving nothing.
-assert lib.length adapterNames >= 10;
+assert lib.length adapterNames >= 8;
 # Each extension's version against the version Cargo recorded for the crate
 # behind it, and each extension's executable against a crate that exists. A
 # manifest naming a binary Cargo never builds is undispatchable at runtime.

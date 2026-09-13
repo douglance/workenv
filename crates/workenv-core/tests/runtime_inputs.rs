@@ -102,7 +102,9 @@ fn every_adapter_module_declares_the_executor_it_runs_through() -> Result<()> {
     }
     // Neither side vacuous: an empty sweep would satisfy the check above, and a
     // parser that silently returned no names would too.
-    if checked.len() < 9 {
+    // Eight adapters since Orchard replaced Lima and the herdr wrapper went with it.
+    // This guard fired when they were removed, which is what it is for.
+    if checked.len() < 8 {
         bail!(
             "only {} modules were checked, so the sweep is not covering the adapter set: {checked:?}",
             checked.len()

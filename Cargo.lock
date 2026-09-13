@@ -3538,32 +3538,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "workenv-adapter-herdr"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "tempfile",
- "toml",
- "uuid",
- "workenv-platform",
- "workenv-protocol",
-]
-
-[[package]]
 name = "workenv-adapter-identity"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "sha2",
- "tempfile",
- "workenv-platform",
- "workenv-protocol",
-]
-
-[[package]]
-name = "workenv-adapter-lima"
 version = "0.2.0"
 dependencies = [
  "anyhow",
