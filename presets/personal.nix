@@ -6,9 +6,38 @@ let
   # refuses an environment whose repeated bindings of one extension carry
   # different configuration ("ambiguous bindings with different configuration").
   # Writing it once is what keeps them identical.
+  # The defaults this replaces were not a smaller version of these values, they
+  # were the wrong machine entirely: `create.rs` falls back to
+  # `ghcr.io/cirruslabs/ubuntu:latest` at 2 cpu / 2048 MB, so every guest came up
+  # as bare Ubuntu with no toolchain -- measured, 8s to a guest with no nix, no
+  # devenv and no `/home/admin` checkout. `workenv-base` is the baked image with
+  # the toolchain in it.
+  #
+  # 4 cpu / 8192 MB because a guest here has to be able to build: provisioning
+  # adds an 8 GB swapfile precisely because rustc was SIGKILLed on a 7914 MB
+  # guest. 2048 MB cannot compile anything.
+  #
+  # `lease_seconds` deliberately absent. It is accepted by create's schema and
+  # discarded by create's code, which never reads it -- declaring one here would
+  # read as an expiry policy that does not exist. Expiry lives entirely in
+  # `reap`, which takes the lease from its own caller.
   orchardBinding = {
     extension = "workenv.orchard";
-    config = { };
+    # `labels` pins placement to the worker that actually holds the image.
+    # `workenv-base` is a `local` tart image on the controller Mac, so a guest
+    # scheduled anywhere else fails with `the specified VM "workenv-base" does
+    # not exist` -- the exact failure that made every guest fall back to bare
+    # Ubuntu. A worker carries no labels by default and any label disqualifies a
+    # worker lacking it, so this is the mechanism that makes placement follow
+    # the image rather than depend on which worker the scheduler happens to pick.
+    config = {
+      image = "workenv-base";
+      cpu = 4;
+      memory = 8192;
+      labels = {
+        image = "workenv-base";
+      };
+    };
   };
 
   # `source` is a path on the *target*: core runs `devenv shell --from <source>`

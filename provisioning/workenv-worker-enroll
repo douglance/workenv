@@ -2,25 +2,61 @@
 # Enrol a Mac as an Orchard worker so environments can be placed on it.
 #
 #   workenv-worker-enroll <ssh-target> [worker-name] [tart-vm-slots]
+#   workenv-worker-enroll --local      [worker-name] [tart-vm-slots]
 #
 # Runs on the controller. Installs tart and orchard on the target, opens a
 # reverse tunnel for the controller API, mints a bootstrap token, and starts
 # the worker. Idempotent: re-running replaces the worker process.
+#
+# `--local` enrols the controller Mac itself. The controller is the largest
+# machine in the fleet and sat outside it entirely, so every guest was scheduled
+# onto the smallest worker -- and `workenv-base` is a `local` tart image on this
+# machine, which no other worker can pull. Two of the five steps are
+# specifically about reaching somewhere else and are skipped: the tools are
+# already here, and a reverse tunnel to 127.0.0.1 would forward the controller
+# API to itself. `bash -c` stands in for `ssh <target>` so steps 3-5 stay one
+# implementation rather than two that drift.
 set -euo pipefail
 
-TARGET="${1:?usage: workenv-worker-enroll <ssh-target> [name] [slots]}"
-NAME="${2:-$(printf '%s' "$TARGET" | sed 's/.*@//; s/\..*//')}"
+TARGET="${1:?usage: workenv-worker-enroll <ssh-target|--local> [name] [slots]}"
+LOCAL=0
+if [ "$TARGET" = "--local" ]; then
+  LOCAL=1
+  NAME="${2:-$(hostname -s)}"
+else
+  NAME="${2:-$(printf '%s' "$TARGET" | sed 's/.*@//; s/\..*//')}"
+fi
 SLOTS="${3:-1}"
 PORT="${WORKENV_ORCHARD_PORT:-6120}"
 ORCHARD_VERSION="${WORKENV_ORCHARD_VERSION:-0.56.1}"
 TART_VERSION="${WORKENV_TART_VERSION:-2.37.0}"
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$TARGET")
+if [ "$LOCAL" = 1 ]; then
+  SSH=(bash -c)
+else
+  SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$TARGET")
+fi
 step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
 
 step "1/5 install tart and orchard on $TARGET"
 # Downloaded on the target, not copied from here: copying a signed Mach-O
 # invalidates its signature and the binary is then SIGKILLed on exec with no
 # message other than "Killed: 9".
+#
+# Locally the tools are already installed -- but where is not assumed: tart is a
+# Homebrew install here, not the `~/.local/bin/tart` the remote path creates, so
+# a check hardcoding that path reports a machine with tart as having none. The
+# worker plist resolves orchard through `$HOME/.local/bin`, so that one is
+# checked at the path the plist will actually use.
+if [ "$LOCAL" = 1 ]; then
+  command -v tart >/dev/null || { echo "tart is not installed on this Mac" >&2; exit 1; }
+  [ -x "$HOME/.local/bin/orchard" ] || {
+    echo "orchard is not at $HOME/.local/bin/orchard, which the worker plist requires" >&2
+    exit 1
+  }
+  printf '  tart %s / orchard %s\n' \
+    "$(tart --version 2>&1 | head -1)" \
+    "$("$HOME/.local/bin/orchard" --version 2>&1 | head -1)"
+else
 "${SSH[@]}" "
   set -e
   mkdir -p ~/.local/bin /tmp/wkv-install && cd /tmp/wkv-install
@@ -42,8 +78,12 @@ step "1/5 install tart and orchard on $TARGET"
     \"\$(~/.local/bin/tart --version 2>&1 | head -1)\" \
     \"\$(~/.local/bin/orchard --version 2>&1 | head -1)\"
 "
+fi
 
 step "2/5 reverse tunnel for the controller API"
+if [ "$LOCAL" = 1 ]; then
+  echo "  skipped: the controller API is already on 127.0.0.1:$PORT here"
+else
 # A tagged worker cannot dial a user-owned controller under the default tailnet
 # grant (src is autogroup:member only), and the connection times out with no
 # diagnostic. The controller can always dial the worker, so the tunnel runs the
@@ -98,6 +138,7 @@ case "$REMOTE_CODE" in
   *) echo "controller API is not reachable from $TARGET (got '$REMOTE_CODE')" >&2; exit 1 ;;
 esac
 echo "  controller API reachable from $TARGET"
+fi
 
 step "3/5 bootstrap token"
 orchard create service-account workers --roles compute:write --roles compute:read >/dev/null 2>&1 || true
@@ -123,9 +164,36 @@ printf '%s' "$TOKEN" | "${SSH[@]}" '
 # the worker present -- because what the controller had seen was the one-shot
 # enrolment process, which then exited. `orchard worker run` has no
 # persisted-credential flag.
-"${SSH[@]}" "bash -s -- '$PORT' '$NAME' '$SLOTS'" <<'REMOTE'
+# The worker shells out to tart to build guests, so tart must be on the PATH the
+# plist declares -- and launchd gives a job none of the login shell's. Remotely
+# step 1 installs tart into ~/.local/bin, which that PATH already carries; on
+# this Mac it is a Homebrew install at /opt/homebrew/bin, which it does not. The
+# directory is measured from the tart that is actually there rather than
+# assumed, because the failure is silent in the worst way: the worker registers,
+# advertises its slots, is scheduled onto, and only then fails every create.
+if [ "$LOCAL" = 1 ]; then
+  TART_DIR="$(dirname "$(command -v tart)")"
+else
+  TART_DIR="\$HOME/.local/bin"
+fi
+# Labels are scheduling constraints, not metadata: a worker carries none by
+# default, and *any* label on a guest disqualifies every worker that lacks it.
+# That is exactly the property needed here -- `workenv-base` is a `local` tart
+# image on one machine, so a guest asking for it must land on that machine or
+# fail with "the specified VM \"workenv-base\" does not exist", which is the
+# original symptom this whole path exists to fix. The label is what makes
+# placement follow the image instead of being a coin toss between workers.
+LABELS="${WORKENV_WORKER_LABELS-${WORKENV_WORKER_LABELS_DEFAULT:-}}"
+if [ "$LOCAL" = 1 ] && [ -z "${WORKENV_WORKER_LABELS+set}" ]; then
+  LABELS="image=workenv-base"
+fi
+[ -n "$LABELS" ] && echo "  labels: $LABELS"
+"${SSH[@]}" "bash -s -- '$PORT' '$NAME' '$SLOTS' '$TART_DIR' '$LABELS'" <<'REMOTE'
 set -eu
-PORT="$1"; NAME="$2"; SLOTS="$3"
+PORT="$1"; NAME="$2"; SLOTS="$3"; TART_DIR="$4"; LABELS="${5:-}"
+# Omitted entirely when empty: `--labels ""` is not the same as no labels.
+LABEL_ARG=""
+[ -n "$LABELS" ] && LABEL_ARG="--labels $LABELS"
 AGENT="$HOME/Library/LaunchAgents/dev.workenv.orchard-worker.plist"
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/workenv"
 chmod 700 "$HOME/Library/Logs/workenv" 2>/dev/null || true
@@ -138,14 +206,14 @@ cat > "$AGENT" <<PLIST
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string><string>-c</string>
-    <string>exec $HOME/.local/bin/orchard worker run http://127.0.0.1:$PORT --name $NAME --bootstrap-token-stdin --resources org.cirruslabs.tart-vms=$SLOTS &lt; $HOME/.orchard/worker-token</string>
+    <string>exec $HOME/.local/bin/orchard worker run http://127.0.0.1:$PORT --name $NAME --bootstrap-token-stdin --resources org.cirruslabs.tart-vms=$SLOTS $LABEL_ARG &lt; $HOME/.orchard/worker-token</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <dict><key>PATH</key><string>$TART_DIR:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>StandardOutPath</key><string>$HOME/Library/Logs/workenv/orchard-worker.log</string>
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/workenv/orchard-worker.log</string>
 </dict>

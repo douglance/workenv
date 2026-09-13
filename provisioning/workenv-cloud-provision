@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Make a cloud Linux VM able to run a workenv environment. Runs in the guest.
+#
+#   ssh <vm> 'bash -s' < workenv-cloud-provision
+#
+# This is deliberately not `workenv-provision`. That script builds the whole
+# agent harness -- the tools.json toolchain, apoc and nib from source, a swapfile
+# sized for rustc -- and takes 73 minutes, measured. Most of that cost buys
+# things a *worker* needs, and this is not a worker: it is a disposable guest
+# that runs one project's gate and is then destroyed.
+#
+# What a guest actually needs is nix and devenv, and nothing else. Everything a
+# project compiles with arrives through `devenv shell --from <source>`, which is
+# how a repo with no devenv.nix of its own gets rust and node from the shared
+# default shell. So rust, node, pnpm and the rest are deliberately absent here --
+# installing them would duplicate, at a different version, what the shell already
+# pins.
+#
+# The measured cost of getting this wrong is specific: without trusted-users and
+# devenv's cachix, `--accept-flake-config` is silently ignored and Nix compiles
+# cachix-api from source, which takes hours instead of seconds. That single
+# config block is most of the difference between a usable guest and an unusable
+# one, which is why it is written before devenv is installed rather than after.
+set -euo pipefail
+
+NIX_URL="https://releases.nixos.org/nix/nix-2.35.2/install"
+NIX_SHA="9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c"
+DEVENV_FLAKE="github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2"
+SHELL_DIR="/opt/workenv/shells/default"
+log() { printf '\n=== %s (%ss) ===\n' "$*" "$(( $(date +%s) - T0 ))"; }
+T0=$(date +%s)
+
+sudo -n true 2>/dev/null || { echo "passwordless sudo is required" >&2; exit 1; }
+
+log "1/4 nix"
+if ! [ -e /nix/var/nix/profiles/default/bin/nix ]; then
+  curl -fsSL -o /tmp/install-nix "$NIX_URL"
+  # Checked, not trusted: this script runs as root through sudo moments later.
+  echo "$NIX_SHA  /tmp/install-nix" | sha256sum -c -
+  sudo sh /tmp/install-nix --daemon --yes --no-channel-add
+fi
+printf '%s\n' \
+  "build-users-group = nixbld" \
+  "experimental-features = nix-command flakes" \
+  "trusted-users = root $(id -un)" \
+  "substituters = https://cache.nixos.org https://devenv.cachix.org https://cachix.cachix.org" \
+  "trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw= cachix.cachix.org-1:eWNHQldwUO7G2VkjpnjDbWwy4KQ/HNxht7H4SSoMckM=" \
+  | sudo tee /etc/nix/nix.conf >/dev/null
+sudo systemctl restart nix-daemon
+sleep 3
+. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+log "2/4 devenv"
+if ! [ -x /opt/workenv/nix-profile/bin/devenv ]; then
+  sudo install -d -m 0755 /opt/workenv
+  sudo chown "$(id -u):$(id -g)" /opt/workenv
+  nix profile install --accept-flake-config --profile /opt/workenv/nix-profile "$DEVENV_FLAKE"
+fi
+sudo ln -sfn /opt/workenv/nix-profile/bin/devenv /usr/local/bin/devenv
+
+log "3/4 default shell"
+# The shell a project gets when it brings no devenv.nix of its own. All three
+# files are required: devenv resolves its inputs from devenv.yaml and pins them
+# in devenv.lock, so a source shipped without the lock re-resolves over the
+# network on first use and puts minutes back into a loop measured in seconds.
+sudo install -d -m 0755 "$SHELL_DIR"
+sudo chown "$(id -u):$(id -g)" "$SHELL_DIR"
+for f in devenv.nix devenv.yaml devenv.lock; do
+  [ -s "$SHELL_DIR/$f" ] || { echo "missing $SHELL_DIR/$f; stage it before running this" >&2; exit 1; }
+done
+
+log "4/4 verify"
+# The probe is the exact call `realize` makes, run from a directory that has no
+# devenv.nix -- because that is the case this whole file exists to serve, and a
+# check run from the shell's own directory would pass while the real one failed.
+probe_dir="$(mktemp -d)"
+( cd "$probe_dir" && devenv shell --from "path:$SHELL_DIR" -- bash -lc 'cargo --version && node --version && git --version' )
+rm -rf "$probe_dir"
+printf '\nready in %ss\n' "$(( $(date +%s) - T0 ))"

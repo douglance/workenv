@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Move the Orchard controller to another Mac, keeping it at 127.0.0.1:6120 here.
+#
+#   workenv-controller-relocate <ssh-target>
+#
+# Why: the controller was running on the machine its operator also works on.
+# Measured on that Mac during ordinary use -- 1606 processes, 13399 threads,
+# 63 GB of 64 GB resident, load average 824 -- the controller still answered but
+# took 20-22s per request, which is longer than every Orchard client waits. So
+# `orchard list vms`, `orchard delete vm` and the adapter's own create all failed
+# with "context deadline exceeded", workers timed out polling and churned through
+# disconnect/re-register cycles, and a guest that had been scheduled and cloned
+# correctly never started. None of that was a fault in the fleet; it was the host.
+#
+# The controller is the one process the whole fleet coordinates through, so it
+# belongs on a machine nobody is using. It needs almost nothing: a 5 MB data dir
+# and negligible CPU.
+#
+# What this deliberately does NOT change: the controller stays reachable at
+# 127.0.0.1:6120 *here*, through a forward tunnel. Every consumer -- the
+# `workenv.orchard` module's `controllerUrl` default, `~/.orchard/orchard.yml`,
+# the adapter's credentials, this Mac's worker plist -- keeps pointing at
+# loopback and needs no edit. The data directory is copied rather than recreated
+# so the existing service accounts, and therefore the existing credentials, stay
+# valid. Relocation should be a change of address, not a reconfiguration.
+set -euo pipefail
+
+TARGET="${1:?usage: workenv-controller-relocate <ssh-target>}"
+PORT="${WORKENV_ORCHARD_PORT:-6120}"
+# The address is resolved once and pinned for every later hop. Measured here:
+# `ssh box-03` succeeded while the rsync a few seconds later died on "Could not
+# resolve hostname box-03.example.ts.net" -- MagicDNS is unreliable on a host
+# under heavy load, and this script stops the running controller before it
+# copies anything, so a name lookup failing midway leaves the fleet with no
+# controller at all. Pinning an address that already answered removes DNS from
+# every step after the first.
+#
+# The probe is an actual ssh connection, not a ping. ping proved worse than
+# useless here: it is not what any later step uses, ICMP can be filtered while
+# ssh works fine, and on macOS its timeout is delivered as SIGALRM -- which
+# printed "Alarm clock" and killed this script before its first line of output.
+# Testing the transport that the work actually runs over removes a whole failure
+# mode and answers the real question.
+reaches() { ssh -o BatchMode=yes -o ConnectTimeout=8 -o "HostName=$1" "$TARGET" true 2>/dev/null; }
+ADDR="$(ssh -G "$TARGET" 2>/dev/null | awk '/^hostname /{print $2; exit}')"
+if [ -z "$ADDR" ] || ! reaches "$ADDR"; then
+  TS_IP="$(tailscale status 2>/dev/null | awk -v n="${TARGET##*@}" '$2 == n {print $1; exit}' || true)"
+  if [ -n "$TS_IP" ] && reaches "$TS_IP"; then
+    ADDR="$TS_IP"
+  else
+    echo "cannot reach $TARGET over ssh by name or tailnet address" >&2
+    exit 1
+  fi
+fi
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o "HostName=$ADDR" "$TARGET")
+RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=20 -o HostName=$ADDR"
+echo "target $TARGET pinned to $ADDR"
+CTRL_LABEL="dev.workenv.orchard-controller"
+TUNNEL_LABEL="dev.workenv.orchard-tunnel.$TARGET"
+FWD_LABEL="dev.workenv.orchard-forward.$TARGET"
+AGENTS="$HOME/Library/LaunchAgents"
+LOG_DIR="$HOME/Library/Logs/workenv"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
+
+"${SSH[@]}" 'test -x ~/.local/bin/orchard' \
+  || { echo "orchard is not installed at ~/.local/bin/orchard on $TARGET" >&2; exit 1; }
+mkdir -p "$LOG_DIR"
+
+step "1/6 stop the local controller and the reverse tunnel"
+# Both are booted out AND renamed. A bootout alone leaves RunAtLoad to start the
+# old controller again at next login, and two controllers with two divergent
+# databases answering for one fleet is worse than none.
+for label in "$CTRL_LABEL" "$TUNNEL_LABEL"; do
+  launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+  # `|| true` because this script must be safe to re-run: on a second pass both
+  # plists are already renamed, the test is false, and as the last command in
+  # the loop body that would become the loop's exit status and abort under
+  # `set -e` -- at step 1, having just stopped the controller.
+  { [ -f "$AGENTS/$label.plist" ] && mv "$AGENTS/$label.plist" "$AGENTS/$label.plist.relocated"; } || true
+done
+# The reverse tunnel has to go before the remote controller starts: it forwards
+# the target's own :$PORT back to this Mac, so leaving it would stop the new
+# controller from binding the port it needs.
+for _ in $(seq 1 20); do
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1 || break
+  sleep 0.5
+done
+echo "  local :$PORT released"
+
+step "2/6 copy the cluster database and adapter credentials"
+# -a to keep the 0600/0700 modes: the data dir holds service account tokens, and
+# the credentials file is a secret at rest. Sent over ssh, never through argv.
+"${SSH[@]}" "umask 077; mkdir -p ~/.orchard && chmod 700 ~/.orchard"
+rsync -a -e "$RSYNC_SSH" "$HOME/.orchard/controller/" "$TARGET:.orchard/controller/"
+if [ -f "$HOME/.orchard/workenv-credentials" ]; then
+  rsync -a -e "$RSYNC_SSH" \
+    "$HOME/.orchard/workenv-credentials" "$TARGET:.orchard/workenv-credentials"
+fi
+echo "  database and credentials in place on $TARGET"
+
+step "3/6 install the controller there"
+# The installer is run on the target rather than reimplemented for remote use.
+# It already stops whatever holds the port, writes a loopback-only agent, proves
+# the listener is not on all interfaces, and creates adapter credentials only
+# when the copied ones do not authenticate -- which, having just copied them,
+# they will.
+"${SSH[@]}" 'mkdir -p ~/.local/bin && cat > ~/.local/bin/workenv-controller-install && chmod +x ~/.local/bin/workenv-controller-install' \
+  < "$here/workenv-controller-install"
+"${SSH[@]}" "WORKENV_ORCHARD_PORT=$PORT ~/.local/bin/workenv-controller-install"
+
+step "4/6 forward :$PORT here to the controller there"
+# Supervised by APoC, not launchd, and that is a measured choice rather than a
+# preference. The launchd agent this replaced ran -- `launchctl print` reported
+# it alive, never exited, with a correct argv -- and never bound the port: no
+# listener in netstat, connection refused on every probe, and an empty stderr
+# log. The identical command run by hand bound it immediately, with and without
+# an ssh-agent, so it was neither authentication nor the arguments. Rather than
+# keep guessing at a supervisor that fails silently, this uses the one that
+# reports what happened.
+#
+# The forward is bound to 127.0.0.1 explicitly. A bare `-L $PORT:` binds the
+# wildcard address, which would re-expose on this Mac exactly the control plane
+# the controller's loopback-only listener exists to keep closed.
+apoc execution start ssh \
+  --purpose "forward the orchard controller on $TARGET to loopback $PORT here" \
+  --idempotency-key "orchard-forward-$TARGET-$(date +%Y%m%d%H%M%S)" \
+  -- -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+     -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+     -o "HostName=$ADDR" \
+     -L "127.0.0.1:$PORT:127.0.0.1:$PORT" "$TARGET" >/dev/null
+# The tunnel needs to be up before the worker below is pointed at it, and before
+# the verify at the end; a few seconds of connect is normal.
+for _ in $(seq 1 20); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/v1/workers" 2>/dev/null)" = "000" ] || break
+  sleep 1
+done
+
+step "5/6 restart this Mac's worker onto the new controller"
+# The worker holds a session against the old controller and will not notice the
+# address it dials now resolves somewhere else.
+if [ -f "$AGENTS/dev.workenv.orchard-worker.plist" ]; then
+  launchctl kickstart -k "gui/$UID/dev.workenv.orchard-worker" 2>/dev/null || true
+  echo "  worker restarted"
+else
+  echo "  no worker on this Mac; nothing to restart"
+fi
+
+step "6/6 verify"
+# 401 is the pass: it proves the port speaks to a controller that authenticates.
+# A `curl -f` here would read a correctly-secured controller as a missing one.
+probe() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/v1/workers" 2>/dev/null; }
+for _ in $(seq 1 30); do
+  case "$(probe)" in 200|401|403) break ;; esac
+  sleep 1
+done
+case "$(probe)" in
+  200|401|403) echo "  controller reachable at 127.0.0.1:$PORT through $TARGET" ;;
+  *) echo "controller is not reachable through the forward; see $LOG_DIR/orchard-forward-$TARGET.log" >&2; exit 1 ;;
+esac
+# Authenticated, not merely reachable: the copied database has to carry the
+# service accounts, or every adapter call 401s while the probe above still passes.
+orchard list workers >/dev/null 2>&1 \
+  || { echo "the controller answers but does not accept the existing credentials" >&2; exit 1; }
+orchard list workers 2>/dev/null || true
+echo "controller now runs on $TARGET, reachable here at 127.0.0.1:$PORT"
