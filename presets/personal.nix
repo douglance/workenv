@@ -44,7 +44,6 @@ in
       ];
     };
     apoc.enable = true;
-    herdr.enable = true;
     tailscale.enable = true;
     identity.enable = true;
     # workenv.clipboard is not enabled. It is an xclip/xsel integration whose
@@ -54,9 +53,8 @@ in
     # and every command fails with "Refusing to evaluate package
     # 'ssh-clipboard-unsupported-on-aarch64-darwin'". This fleet is Macs only.
     exedev.enable = true;
-    lima.enable = true;
-    # Read-only cluster inventory. Declares no hosts, so it cannot affect the
-    # Lima-backed environments above; it only makes `workenv extension call
+    # The provider, transport and connection for every remote environment here
+    # since Lima was removed. Also what makes `workenv extension call
     # workenv.orchard inventory` reachable from the CLI and MCP.
     orchard.enable = true;
     ssh.enable = true;

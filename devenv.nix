@@ -36,6 +36,7 @@
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/herdr-platforms.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/orchard-schemas.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/adapter-coverage.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
+    nix-instantiate --eval --strict --json --expr 'import ./modules/tests/personal-preset.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nixfmt --check \
       devenv.nix \
       modules/*.nix \
