@@ -17,6 +17,15 @@ pub(super) struct Spec {
     pub(super) disk_gb: u64,
     pub(super) region: String,
     pub(super) adopt: bool,
+    /// First-boot script, run inside the VM by exe.dev.
+    ///
+    /// This is how an exe.dev guest gets nix and devenv. The `bootstrap`
+    /// integration cannot do it: it is controller-located and reaches a target
+    /// over ssh at `target.address`, and an exe.dev VM has none -- the API
+    /// advertises `ssh <name>.exe.xyz` and every attempt answers "no ssh.config
+    /// on the VM host". A guest that provisions itself at create needs no
+    /// address to become usable.
+    pub(super) setup_script: Option<String>,
 }
 
 pub(super) fn spec(request: &AdapterRequest) -> Result<Spec> {
@@ -46,6 +55,9 @@ pub(super) fn spec(request: &AdapterRequest) -> Result<Spec> {
             .as_bool()
             .or_else(|| request.input["adopt"].as_bool())
             .unwrap_or(false),
+        setup_script: str_field(&request.config, "setup_script")
+            .or_else(|| str_field(&request.input, "setup_script"))
+            .map(str::to_owned),
     })
 }
 
@@ -269,4 +281,19 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn int_field(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64).filter(|n| *n > 0)
+}
+
+/// `--setup-script` arguments, or none at all when no script is configured.
+///
+/// Omitted entirely rather than passed empty: `--setup-script ''` is a request
+/// to run an empty script, not a request to run none, and exe.dev caps the value
+/// at 10 KiB -- so the script installs nix and devenv from URLs and the larger
+/// shell definition is staged afterwards rather than embedded here.
+pub(super) fn setup_args(spec: &Spec) -> Vec<String> {
+    match spec.setup_script.as_deref() {
+        Some(script) if !script.trim().is_empty() => {
+            vec!["--setup-script".into(), script.to_owned()]
+        }
+        _ => Vec::new(),
+    }
 }

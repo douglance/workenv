@@ -1,4 +1,5 @@
 //! exe.dev provider logic.
+mod execute;
 mod model;
 mod runner;
 
@@ -12,8 +13,8 @@ use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 use model::{
     Spec, adopt_response, capacity_report, destroyed, fingerprint, observe_inventory,
     observed_response, pending, pending_data, previous_identity, previous_owned, read_receipt,
-    receipt_path, receipt_value, receipt_waits, response, spec, state_dir, status_for_create,
-    write_receipt,
+    receipt_path, receipt_value, receipt_waits, response, setup_args, spec, state_dir,
+    status_for_create, write_receipt,
 };
 use runner::{ProviderResult, Runner, SshRunner};
 
@@ -24,12 +25,13 @@ pub(crate) fn handle(request: &AdapterRequest) -> Result<AdapterResponse> {
         "inventory" => Ok(provider.inventory_response(request)),
         "create" => provider.create_response(request),
         "destroy" => provider.destroy_response(request),
-        _ => Ok(response(
-            request,
-            ResponseStatus::Unsupported,
-            json!({}),
-            Some("unsupported exe.dev operation"),
-        )),
+        // The transport half, kept beside the relay quirks it works around.
+        _ => Ok(
+            execute::dispatch(request, &mut provider.runner).unwrap_or_else(|| {
+                let why = "unsupported exe.dev operation";
+                response(request, ResponseStatus::Unsupported, json!({}), Some(why))
+            }),
+        ),
     }
 }
 
@@ -279,7 +281,10 @@ impl<R: Runner> Provider<R> {
                 "workenv".into(),
                 "--no-email".into(),
                 "--json".into(),
-            ],
+            ]
+            .into_iter()
+            .chain(setup_args(spec))
+            .collect::<Vec<_>>(),
         )
     }
 }

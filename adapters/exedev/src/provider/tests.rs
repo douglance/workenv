@@ -5,6 +5,8 @@ use workenv_protocol::{PROTOCOL_VERSION, Target};
 struct FakeRunner {
     values: Vec<ProviderResult<Value>>,
     calls: Vec<Vec<String>>,
+    /// Raw relay stdout handed back to `observe_raw`, in order.
+    raw: Vec<ProviderResult<String>>,
 }
 
 impl Runner for FakeRunner {
@@ -14,6 +16,11 @@ impl Runner for FakeRunner {
 
     fn mutate(&mut self, _request_id: &str, args: &[String]) -> ProviderResult<Value> {
         self.next(args)
+    }
+
+    fn observe_raw(&mut self, args: &[String], _timeout_ms: u64) -> ProviderResult<String> {
+        self.calls.push(args.to_vec());
+        self.raw.remove(0)
     }
 }
 
@@ -122,6 +129,7 @@ fn adopt_never_creates_or_marks_owned() -> Result<()> {
     let mut provider = Provider::new(FakeRunner {
         values: vec![Ok(json!({"vms":[vm()]}))],
         calls: vec![],
+        raw: vec![],
     });
     let result = provider.create_response(&req)?;
     assert_eq!(result.status, ResponseStatus::Ready);
@@ -143,6 +151,7 @@ fn create_returns_pending_owned_when_new_vm_is_not_running() -> Result<()> {
             Ok(json!({"vms":[stopped_vm()]})),
         ],
         calls: vec![],
+        raw: vec![],
     });
     let result = provider.create_response(&req)?;
     assert_eq!(result.status, ResponseStatus::Pending);
@@ -161,6 +170,7 @@ fn capacity_preflight_rejects_fully_allocated_plan() -> Result<()> {
     let mut provider = Provider::new(FakeRunner {
         values: vec![Ok(json!({"vms":[]})), Ok(plan()), Ok(json!({"vms":[full]}))],
         calls: vec![],
+        raw: vec![],
     });
     let result = provider.create_response(&req)?;
     assert_eq!(result.status, ResponseStatus::Failed);
@@ -188,6 +198,7 @@ fn destroy_accepts_core_create_input_as_previous_resource() -> Result<()> {
             Ok(json!({"vms":[]})),
         ],
         calls: vec![],
+        raw: vec![],
     });
     let result = provider.destroy_response(&req)?;
     assert_eq!(result.status, ResponseStatus::Changed);
@@ -204,6 +215,7 @@ fn destroy_rejects_recreated_same_name_without_matching_identity() -> Result<()>
     let mut provider = Provider::new(FakeRunner {
         values: vec![Ok(json!({"vms":[vm()]}))],
         calls: vec![],
+        raw: vec![],
     });
     let result = provider.destroy_response(&req)?;
     assert_eq!(result.status, ResponseStatus::Failed);
@@ -224,11 +236,13 @@ fn uncertain_create_is_not_repeated() -> Result<()> {
             Ok(json!({"vms":[]})),
         ],
         calls: vec![],
+        raw: vec![],
     });
     assert_eq!(first.create_response(&req)?.status, ResponseStatus::Pending);
     let mut second = Provider::new(FakeRunner {
         values: vec![Ok(json!({"vms":[]}))],
         calls: vec![],
+        raw: vec![],
     });
     assert_eq!(
         second.create_response(&req)?.status,
@@ -242,4 +256,45 @@ fn uncertain_create_is_not_repeated() -> Result<()> {
             .any(|call| { call.first().is_some_and(|arg| arg == "new") })
     );
     Ok(())
+}
+
+#[test]
+fn a_configured_setup_script_reaches_the_create_command() {
+    // Without this the VM boots with no nix and no devenv, and `realize` fails
+    // on a machine that looks healthy.
+    let spec = Spec {
+        name: "wkv-1".into(),
+        cpus: 2,
+        memory_gb: 8,
+        disk_gb: 50,
+        region: "dal".into(),
+        adopt: false,
+        setup_script: Some("echo provisioning".into()),
+    };
+    assert_eq!(
+        setup_args(&spec),
+        vec!["--setup-script".to_owned(), "echo provisioning".to_owned()]
+    );
+}
+
+#[test]
+fn no_script_and_an_empty_script_are_not_the_same_request() {
+    // `--setup-script ''` asks exe.dev to run an empty script; omitting the flag
+    // asks it to run none. Passing the former for the latter is how a provider
+    // ends up reporting a first-boot step that never happened.
+    let base = Spec {
+        name: "wkv-1".into(),
+        cpus: 2,
+        memory_gb: 8,
+        disk_gb: 50,
+        region: "dal".into(),
+        adopt: false,
+        setup_script: None,
+    };
+    assert!(setup_args(&base).is_empty());
+    let blank = Spec {
+        setup_script: Some("   ".into()),
+        ..base
+    };
+    assert!(setup_args(&blank).is_empty());
 }

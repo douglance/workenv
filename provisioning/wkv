@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Take a repository into a disposable guest and put an agent in it.
+#
+#   wkv            [repo-dir]     claim a slot, clone, seed, attach
+#   wkv --down     <slot>         destroy the guest behind a slot
+#   wkv --list                    show which slots are taken
+#
+# Lives here rather than as a `workenv` subcommand: AGENTS.md forbids adding
+# command workflows to the CLI, and this is exactly that -- an opinionated
+# sequence over operations the CLI already exposes. workenv owns the resource
+# lifecycle and its receipts; this owns the ordering and the guest's contents.
+#
+# Slots, not per-project environments. The environment name *is* the VM name,
+# globally, so several workenvs on one project cannot come from one environment
+# per project. Any free slot takes any repository, which is why adding a project
+# needs no registry entry and no manifest change.
+set -euo pipefail
+
+ROOT="${WORKENV_FLEET_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fleet" && pwd)}"
+WORKENV="${WORKENV_BIN:-workenv}"
+AGENT_CMD="${WKV_AGENT:-claude --dangerously-skip-permissions}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
+
+wk() { "$WORKENV" --root "$ROOT" "$@"; }
+
+# Every slot the manifest declares, in order.
+slots() {
+  wk environment list --format json 2>/dev/null \
+    | sed -n 's/.*"\(wkv-c[0-9][0-9]\)".*/\1/p' \
+    | tr ' ' '\n' | grep -o 'wkv-c[0-9][0-9]' | sort -u
+}
+
+# Slots that already have a VM. Asked of the provider, never of a local file:
+# a slot's state is the cluster's answer, and anything cached here would be
+# wrong exactly when a second terminal claimed a slot a moment ago.
+taken() {
+  ssh -o BatchMode=yes exe.dev ls --json 2>/dev/null \
+    | tr ',' '\n' | sed -n 's/.*"vm_name":"\(wkv-c[0-9][0-9]\)".*/\1/p' | sort -u
+}
+
+case "${1:-}" in
+  --list)
+    printf 'taken:\n'; taken | sed 's/^/  /'
+    printf 'free:\n'; comm -23 <(slots) <(taken) | sed 's/^/  /'
+    exit 0
+    ;;
+  --down)
+    slot="${2:?usage: wkv --down <slot>}"
+    # A fresh key every time. A mutation replays its previous answer for a
+    # reused key, so a recycled one would report a teardown that never ran.
+    wk environment destroy "$slot" --idempotency-key "wkv-down-$slot-$(date +%s)"
+    exit 0
+    ;;
+esac
+
+REPO_DIR="$(cd "${1:-$PWD}" && pwd)"
+git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+  || { echo "$REPO_DIR is not a git repository" >&2; exit 1; }
+REMOTE="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
+[ -n "$REMOTE" ] || { echo "$REPO_DIR has no 'origin' remote to clone from" >&2; exit 1; }
+NAME="$(basename "$REPO_DIR")"
+BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+
+step "claim a slot"
+SLOT="$(comm -23 <(slots) <(taken) | head -1)"
+[ -n "$SLOT" ] || { echo "every slot is in use; free one with 'wkv --down <slot>'" >&2; exit 1; }
+echo "  $SLOT  <- $NAME ($BRANCH)"
+
+step "up"
+# `up` is create + apply: the provider's setup_script installs nix and devenv on
+# first boot, then apply makes the directory and realises the devenv shell. The
+# slot carries no integrations, so nothing here depends on the guest having an
+# ssh address -- which it does not.
+wk environment up "$SLOT" --idempotency-key "wkv-up-$SLOT-$(date +%s)"
+
+# One hop into the guest. stdin does not survive the relay -- a `cat > file`
+# through it wrote zero bytes and reported success -- so anything that must
+# arrive goes through argv, base64'd.
+guest() { ssh -o BatchMode=yes exe.dev ssh "$SLOT" "$@"; }
+put() {
+  local b64; b64="$(base64 < "$1" | tr -d '\n')"
+  guest "printf %s '$b64' | base64 -d > '$2'"
+}
+
+# Seeding comes before the clone, not after. Most of these repositories are
+# private, and a clone attempted before the guest holds any credential fails on
+# authentication -- which reads as a broken remote rather than an unseeded guest.
+step "seed"
+"$here/workenv-seed" --exedev "$SLOT"
+
+step "clone $NAME"
+guest "rm -rf /home/exedev/work && git clone --depth 50 --branch '$BRANCH' '$REMOTE' /home/exedev/work 2>&1 | tail -2" || {
+  echo "clone failed. If the remote is private, the guest has no git credential:" >&2
+  echo "  the identity profile's gh credential helper is what supplies one, and" >&2
+  echo "  it is not bound to these slots yet. A public remote clones fine." >&2
+  exit 1
+}
+
+step "attach"
+cat <<NOTE
+  slot      $SLOT
+  project   $NAME ($BRANCH)
+  checkout  /home/exedev/work
+  shell     devenv shell --from path:/opt/workenv/shells/default
+
+  when finished:  wkv --down $SLOT
+NOTE
+exec ssh -t -o BatchMode=yes exe.dev ssh "$SLOT" \
+  "cd /home/exedev/work && devenv shell --from path:/opt/workenv/shells/default -- $AGENT_CMD"

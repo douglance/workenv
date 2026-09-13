@@ -7,6 +7,16 @@ pub(super) trait Runner {
     fn observe(&mut self, args: &[String]) -> ProviderResult<Value>;
 
     fn mutate(&mut self, request_id: &str, args: &[String]) -> ProviderResult<Value>;
+
+    /// The relay's stdout, unparsed.
+    ///
+    /// `observe` exists for the exe.dev CLI's own `--json` output and fails when
+    /// the stream is not a single JSON document. The transport's stdout is not:
+    /// it carries the relay's "Tip:" banner around a sentinel line, so the
+    /// transport has to select its result out of the stream rather than parse
+    /// the whole of it. A longer timeout too, because this one carries the
+    /// caller's command rather than a control-plane call.
+    fn observe_raw(&mut self, args: &[String], timeout_ms: u64) -> ProviderResult<String>;
 }
 
 pub(super) type ProviderResult<T> = std::result::Result<T, String>;
@@ -43,9 +53,43 @@ impl<E: Executor> Runner for SshRunner<E> {
     fn mutate(&mut self, request_id: &str, args: &[String]) -> ProviderResult<Value> {
         self.run(args, mutation_key(request_id, args))
     }
+
+    fn observe_raw(&mut self, args: &[String], timeout_ms: u64) -> ProviderResult<String> {
+        self.run_raw(
+            args,
+            format!("workenv-exedev:v2:exec:{}", Uuid::new_v4()),
+            timeout_ms,
+        )
+    }
 }
 
 impl<E: Executor> SshRunner<E> {
+    /// Run through the relay and hand back stdout exactly as it arrived.
+    ///
+    /// The relay's own exit code is not consulted. Measured, it does not carry
+    /// the child's -- so a transport that read it would report every command
+    /// failure as the same status. Whether the command ran at all is decided by
+    /// the presence of the sentinel line, which is the caller's job.
+    fn run_raw(
+        &self,
+        args: &[String],
+        idempotency_key: String,
+        timeout_ms: u64,
+    ) -> ProviderResult<String> {
+        self.executor
+            .execute(ExecutionSpec {
+                executable: "ssh".into(),
+                arg: ssh_args(args),
+                cwd: Some(self.cwd.clone()),
+                stdin: None,
+                timeout_ms,
+                idempotency_key,
+                purpose: "Run one command inside an exe.dev VM through the relay.".into(),
+            })
+            .map(|output| output.stdout)
+            .map_err(|error| error.to_string())
+    }
+
     fn run(&self, args: &[String], idempotency_key: String) -> ProviderResult<Value> {
         let output = self
             .executor

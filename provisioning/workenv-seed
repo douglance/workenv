@@ -2,10 +2,86 @@
 # Seed a provisioned guest with skills, agent configs, and credentials.
 # Runs on the CONTROLLER. Secrets stream over ssh and are never printed.
 set -euo pipefail
-TARGET="${1:?usage: workenv-seed <ssh-target>}"
+log() { printf '\n=== %s ===\n' "$*"; }
+
+# --- exe.dev guests -------------------------------------------------------
+# A scheduled exe.dev VM has no address to ssh to, and no stdin through its
+# relay: `ssh exe.dev ssh <vm> 'cat > file'` writes zero bytes and reports
+# success, which is the worst failure available because it looks seeded. So this
+# mode carries everything through argv, base64'd, and rsync is not usable at all.
+#
+# Linux caps a single argument at 128 KiB, so anything larger is chunked. The
+# credentials and instruction files total ~16 KB and arrive in one hop each; the
+# skills trees are 3.1 MB compressed and cost about a minute, which is why the
+# cost is announced rather than hidden.
+if [ "${1:-}" = "--exedev" ]; then
+  SLOT="${2:?usage: workenv-seed --exedev <vm-name>}"
+  guest() { ssh -o BatchMode=yes exe.dev ssh "$SLOT" "$@"; }
+  CHUNK=61440 # 60 KiB raw -> 80 KiB base64, inside the per-argument limit.
+  put_bytes() { # stdin -> remote path, chunked, mode 600
+    local dest="$1" part tmp n=0
+    tmp="$(mktemp -d)"
+    split -b "$CHUNK" - "$tmp/p"
+    guest "install -d -m 700 \"\$(dirname ~/$dest)\" && : > ~/$dest.b64"
+    for part in "$tmp"/p*; do
+      guest "printf %s '$(base64 < "$part" | tr -d '\n')' >> ~/$dest.b64"
+      n=$((n + 1))
+    done
+    guest "base64 -d < ~/$dest.b64 > ~/$dest && rm -f ~/$dest.b64 && chmod 600 ~/$dest"
+    printf '  %-30s %s chunk(s)\n' "$dest" "$n"
+    rm -rf "$tmp"
+  }
+
+  log "credentials and instruction files -> $SLOT"
+  for spec in \
+    "$HOME/.codex/auth.json:.codex/auth.json" \
+    "$HOME/.grok/auth.json:.grok/auth.json" \
+    "$HOME/.claude/CLAUDE.md:.claude/CLAUDE.md" \
+    "$HOME/.claude/settings.json:.claude/settings.json" \
+    "$HOME/.codex/AGENTS.md:.codex/AGENTS.md" \
+    "$HOME/.agents/AGENTS.md:.agents/AGENTS.md"; do
+    src="${spec%%:*}"
+    dst="${spec##*:}"
+    [ -f "$src" ] && put_bytes "$dst" <"$src"
+  done
+
+  # Captured before sending, not piped straight through: a remote redirection
+  # truncates the guest's credential file the moment the pipe opens, which is
+  # before `security -w` is known to have succeeded -- so a denied Keychain read
+  # replaced a working credential with a 0-byte one.
+  CLAUDE_CREDS="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+  if [ -n "$CLAUDE_CREDS" ]; then
+    printf '%s' "$CLAUDE_CREDS" | put_bytes ".claude/.credentials.json"
+  else
+    printf '  %-30s unavailable (Keychain denied or absent)\n' ".claude/.credentials.json"
+  fi
+  unset CLAUDE_CREDS
+
+  if [ "${WKV_SEED_SKILLS:-1}" = "1" ]; then
+    # `.agents/skills` is included because `~/.claude/skills/*` are symlinks into
+    # it -- drop it and every skill in the guest is a dangling link, which the
+    # usual `find` count reports as present.
+    log "skills (~3 MB; set WKV_SEED_SKILLS=0 to skip)"
+    tar czf - -C "$HOME" .claude/skills .claude/commands .agents/skills .codex/skills 2>/dev/null |
+      put_bytes "skills.tgz"
+    guest 'tar xzf ~/skills.tgz -C ~ && rm -f ~/skills.tgz'
+  fi
+
+  log "what arrived"
+  guest 'for f in .codex/auth.json .grok/auth.json .claude/.credentials.json .claude/CLAUDE.md; do
+      [ -f ~/$f ] && printf "  %-30s %s bytes mode %s\n" "$f" "$(wc -c < ~/$f)" "$(stat -c %a ~/$f)"
+    done
+    for d in .claude/skills .agents/skills; do
+      [ -d ~/$d ] && printf "  %-30s %s entries\n" "$d" "$(find ~/$d -mindepth 1 -maxdepth 1 | wc -l)"
+    done'
+  echo SEED_DONE
+  exit 0
+fi
+# --- ssh-reachable guests -------------------------------------------------
+
+TARGET="${1:?usage: workenv-seed <ssh-target> | --exedev <vm-name>}"
 SSH=(ssh -o BatchMode=yes)
 RS=(rsync -az --delete -e "ssh -o BatchMode=yes")
-log() { printf '\n=== %s ===\n' "$*"; }
 
 "${SSH[@]}" "$TARGET" 'mkdir -p ~/.claude ~/.codex ~/.agents ~/.grok'
 

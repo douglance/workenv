@@ -1,0 +1,54 @@
+# First-boot provisioning for a cloud Linux VM, run by the provider.
+#
+# Not a standalone script: the preset composes this with the default shell's
+# devenv files and passes the result as the provider's `setup_script`. It is a
+# fragment so that the shell definition has one source -- `provisioning/shells/
+# default/devenv.nix` -- rather than a copy that drifts.
+#
+# This exists because `bootstrap` cannot serve this provider. Bootstrap is
+# controller-located and reaches a target over ssh at `target.address`; an
+# exe.dev VM has none, and the address its API advertises answers "no ssh.config
+# on the VM host" on every placement mode tried. A guest that provisions itself
+# at create needs no address to become usable.
+#
+# Budget: exe.dev caps a setup script at 10 KiB, so nothing large is embedded.
+# nix and devenv come from URLs, and `devenv.lock` is resolved here on first boot
+# rather than shipped -- the lock is 8.8 KiB on its own and would not fit beside
+# the rest.
+set -eu
+
+SUDO=""
+[ "$(id -u)" = "0" ] || SUDO="sudo -n"
+NIX_URL="https://releases.nixos.org/nix/nix-2.35.2/install"
+NIX_SHA="9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c"
+DEVENV_FLAKE="github:cachix/devenv/e0781f7bee573eefcab4a7d2788fd9b455560ca2"
+SHELL_DIR="/opt/workenv/shells/default"
+
+if ! [ -e /nix/var/nix/profiles/default/bin/nix ]; then
+  curl -fsSL -o /tmp/install-nix "$NIX_URL"
+  # Checked, not trusted: this runs as root moments later.
+  echo "$NIX_SHA  /tmp/install-nix" | sha256sum -c -
+  $SUDO sh /tmp/install-nix --daemon --yes --no-channel-add
+fi
+
+# Without trusted-users and devenv's cachix, `--accept-flake-config` is silently
+# ignored and Nix compiles cachix-api from source: hours instead of seconds.
+# This block is most of the difference between a usable guest and an unusable one.
+printf '%s\n' \
+  "build-users-group = nixbld" \
+  "experimental-features = nix-command flakes" \
+  "trusted-users = root $(id -un)" \
+  "substituters = https://cache.nixos.org https://devenv.cachix.org https://cachix.cachix.org" \
+  "trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw= cachix.cachix.org-1:eWNHQldwUO7G2VkjpnjDbWwy4KQ/HNxht7H4SSoMckM=" \
+  | $SUDO tee /etc/nix/nix.conf >/dev/null
+$SUDO systemctl restart nix-daemon || true
+sleep 3
+. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+$SUDO install -d -m 0755 /opt/workenv "$SHELL_DIR"
+$SUDO chown -R "$(id -u):$(id -g)" /opt/workenv
+if ! [ -x /opt/workenv/nix-profile/bin/devenv ]; then
+  nix profile install --accept-flake-config \
+    --profile /opt/workenv/nix-profile "$DEVENV_FLAKE"
+fi
+$SUDO ln -sfn /opt/workenv/nix-profile/bin/devenv /usr/local/bin/devenv

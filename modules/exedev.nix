@@ -34,6 +34,12 @@ let
     };
     region.type = "string";
     adopt.type = "boolean";
+    # exe.dev runs this inside the VM on first boot, and it is what replaces the
+    # `bootstrap` integration for this provider: bootstrap is controller-located
+    # and reaches a target over ssh at `target.address`, which an exe.dev VM does
+    # not have. Capped by exe.dev at 10 KiB, so it installs nix and devenv from
+    # URLs rather than carrying a shell definition inline.
+    setup_script.type = "string";
   } [ ];
   destroyInput = closed {
     # Annotation only: the controller passes the create receipt here so
@@ -62,6 +68,52 @@ let
       resource_id.type = "string";
     };
   };
+  executeInput = closed {
+    argv = {
+      type = "array";
+      items.type = "string";
+      minItems = 1;
+    };
+    cwd.type = "string";
+    stdin.type = "string";
+    purpose.type = "string";
+    name.type = "string";
+    timeout_ms = {
+      type = "integer";
+      minimum = 1;
+    };
+  } [ "argv" ];
+  # `exit_code` is required because `target.rs` maps its absence to Pending, so a
+  # transport answering without one silently turns a finished command into an
+  # unfinished one and the caller runs it again.
+  executeOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [ "exit_code" ];
+    properties = {
+      exit_code.type = "integer";
+      stdout.type = "string";
+      stderr.type = "string";
+    };
+  };
+  connectInput = closed { name.type = "string"; } [ ];
+  connectOutput = {
+    type = "object";
+    additionalProperties = true;
+    required = [
+      "attach_argv"
+      "guest"
+    ];
+    properties = {
+      attach_argv = {
+        type = "array";
+        items.type = "string";
+      };
+      guest.type = "string";
+      status.type = "string";
+      reaches_by.type = "string";
+    };
+  };
   operations = {
     inventory = {
       description = "Inspect exe.dev VM inventory.";
@@ -80,6 +132,27 @@ let
       mutating = true;
       input_schema = destroyInput;
       output_schema = output;
+    };
+    # An exe.dev VM has no address a transport can dial: the API advertises
+    # `ssh <name>.exe.xyz` and every attempt answers "no ssh.config on the VM
+    # host", measured across pooled and --no-pool placement and after a restart.
+    # Without a transport, core can only run controller-located extensions on
+    # such a host, so `identity` and `project` -- the whole point of an
+    # environment -- were unreachable.
+    execute = {
+      description = "Run one exact argv inside this environment's exe.dev VM.";
+      mutating = true;
+      # Internal for the same reason orchard's is: this is the transport core
+      # uses to place a target extension, not an operation an operator calls.
+      internal = true;
+      input_schema = executeInput;
+      output_schema = executeOutput;
+    };
+    connect = {
+      description = "Argv that opens a shell on this environment's exe.dev VM.";
+      mutating = false;
+      input_schema = connectInput;
+      output_schema = connectOutput;
     };
   };
 in

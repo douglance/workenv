@@ -132,9 +132,29 @@ assert exedev.destroy.input_schema.properties ? create;
 # one: a declared field is a promise of a scoped sweep the adapter never makes.
 # The aliases provider/spec.rs honours out of input, which the shared schema
 # never declared and which a schema written from the docs would now reject.
-# Nothing is required anywhere: the controller sends `{}` on create, so a
-# required field would make the normal lifecycle structurally impossible.
-assert lib.all (name: exedev.${name}.input_schema.required == [ ]) (lib.attrNames exedev);
+# Nothing is required on the *lifecycle* operations: the controller sends `{}`
+# on create (environment.rs `setup_binding` always does), so a required field
+# there would make the normal lifecycle structurally impossible.
+#
+# `execute` is deliberately excluded, and is the one operation that must require
+# something. It is the transport core calls to place a target extension, and it
+# is always called with an argv -- an execute carrying none has nothing to run,
+# so accepting it would turn a caller's mistake into a silent no-op reported as
+# success. Listing the lifecycle operations by name rather than subtracting
+# `execute` from the set keeps this honest: a new operation is covered by
+# default and has to be argued for, instead of quietly inheriting an exemption.
+assert lib.all (name: exedev.${name}.input_schema.required == [ ]) [
+  "create"
+  "destroy"
+  "inventory"
+  "connect"
+];
+assert exedev.execute.input_schema.required == [ "argv" ];
+# And it stays internal. `execute` runs an arbitrary argv inside the VM, so if
+# it were reachable from `extension call` it would be a remote shell wearing the
+# protocol's clothes; `adapter.rs` refuses internal operations for exactly that.
+assert exedev.execute.internal;
+assert !exedev.connect.internal;
 # Typed properties, so validation has something to check beyond field names.
 assert exedev.create.input_schema.properties.cpus.minimum == 1;
 assert exedev.create.input_schema.properties.memory_gb.type == "integer";
