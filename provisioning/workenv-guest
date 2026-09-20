@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Run one command inside a runner, whichever backend created it.
+#
+#   workenv-guest exedev  <vm> <command...>
+#   workenv-guest orchard <vm> <command...>
+#
+# The pool is one pool; this is the one place that knows the two ways into it.
+# Seeding, wiping and the isolation check all go through here so that adding a
+# backend is one case in one file rather than three copies that drift.
+#
+# Neither backend gives a guest an address. exe.dev advertises one that answers
+# "no ssh.config on the VM host" on every placement mode tried, and an Orchard
+# guest is placed by the scheduler after the manifest is written. So both are
+# reached by name through something that already knows where the guest is.
+#
+# Exit codes are not trustworthy on the Orchard path: `orchard ssh` returns its
+# own status and not the command's (adapters/orchard/src/provider/execute.rs
+# :14-24). Callers must therefore decide from what the command *prints*, not
+# from what this returns -- which is why the wipe and the check both end in a
+# sentinel line. Do not add an `exit $?` here and believe it.
+set -euo pipefail
+
+BACKEND="${1:?usage: workenv-guest <exedev|orchard> <vm> <command...>}"
+VM="${2:?usage: workenv-guest <exedev|orchard> <vm> <command...>}"
+shift 2
+
+ORCHARD="${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}"
+
+# Newlines in argv do not survive `ssh exe.dev ssh` (they become spaces) or
+# `orchard ssh -- sh -c "$*"` (same). Seed already base64s file bodies; a
+# multi-line script has to travel the same way or wipe/check run as one line
+# and fail with a `do` syntax error while reporting success-shaped noise.
+cmd=$(printf '%s' "$*")
+if [[ "$cmd" == *$'\n'* ]]; then
+  b64=$(printf '%s' "$cmd" | openssl base64 -A)
+  cmd="printf %s $b64 | openssl base64 -d -A | bash"
+fi
+
+case "$BACKEND" in
+  exedev)
+    # stdin does not survive this relay: a `cat > file` through it wrote zero
+    # bytes and reported success. Callers pass payloads through argv, base64'd.
+    exec ssh -o BatchMode=yes "${WORKENV_EXEDEV_HOST:-exe.dev}" ssh "$VM" "$cmd"
+    ;;
+  orchard)
+    # Wrapped in `sh -c`, deliberately. Callers pass one command *string* with
+    # `&&`, pipes and redirections in it, which the exe.dev path gets for free
+    # because its outer ssh hands the string to a shell. `orchard ssh vm ... --`
+    # passes argv, so the same string would arrive as a program name containing
+    # spaces. Wrapping makes both backends accept the same input, which is the
+    # whole reason callers can be backend-agnostic.
+    exec "$ORCHARD" ssh vm "$VM" -- sh -c "$cmd"
+    ;;
+  *)
+    echo "workenv-guest: unknown backend '$BACKEND' (expected exedev or orchard)" >&2
+    exit 2
+    ;;
+esac

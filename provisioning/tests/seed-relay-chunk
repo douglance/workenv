@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# put_bytes must keep each exe.dev hop under the 64 KiB request-body cap.
+#
+# The live claim died here: CHUNK=61440 raw became ~80 KiB after base64, and
+# exe.dev rejected the hop with "request body exceeds 64KB limit" before
+# SEED_DONE. This reads CHUNK and the printf wrapper from the shipped script
+# and encodes a full chunk with the same pipeline put_bytes uses.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEED="$here/../workenv-seed"
+# Independent of the script: exe.dev's documented relay body cap.
+MAX_BODY=65536
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+CHUNK=$(awk '/^  CHUNK=[0-9]+/{sub(/^  CHUNK=/,""); print; exit}' "$SEED")
+[ -n "$CHUNK" ] || { echo 'seed-relay-chunk: no CHUNK= in workenv-seed' >&2; exit 1; }
+
+wrapper=$(grep -F 'printf %s' "$SEED" | head -1)
+case "$wrapper" in
+  *'printf %s'*) ;;
+  *) echo "seed-relay-chunk: put_bytes printf wrapper missing: $wrapper" >&2; exit 1 ;;
+esac
+
+part="$(mktemp)"
+trap 'rm -f "$part"' EXIT
+# Full-size chunk, same as split -b "$CHUNK" produces for skills.tgz.
+dd if=/dev/zero of="$part" bs="$CHUNK" count=1 2>/dev/null
+encoded=$(base64 < "$part" | tr -d '\n')
+# Exact command put_bytes sends through workenv-guest for a skills hop.
+cmd="printf %s '$encoded' >> ~/skills.tgz.b64"
+len=${#cmd}
+
+printf 'seed relay chunk\n'
+printf '  CHUNK=%s  command=%s bytes  cap=%s\n' "$CHUNK" "$len" "$MAX_BODY"
+under=0
+[ "$len" -lt "$MAX_BODY" ] && under=1
+check "a full skills hop fits under exe.dev's 64 KiB body cap" 1 "$under"
+check "CHUNK is a positive byte count" 1 "$( [ "$CHUNK" -gt 0 ] && echo 1 || echo 0 )"
+
+# The encoder must be the one put_bytes uses: inflate is 4/3, not 1:1.
+# A CHUNK that only looks small as raw bytes would still blow the cap.
+raw_over=0
+[ "$CHUNK" -ge "$MAX_BODY" ] && raw_over=1
+check "raw CHUNK alone is not used as the hop size" 0 "$raw_over"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

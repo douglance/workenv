@@ -1,58 +1,19 @@
 { pkgs, ... }:
 
 let
-  # One binding config, reused. `workenv.orchard` is bound three ways for the
-  # fast host -- as its provider, its transport and its connection -- and core
-  # refuses an environment whose repeated bindings of one extension carry
-  # different configuration ("ambiguous bindings with different configuration").
-  # Writing it once is what keeps them identical.
-  # The defaults this replaces were not a smaller version of these values, they
-  # were the wrong machine entirely: `create.rs` falls back to
-  # `ghcr.io/cirruslabs/ubuntu:latest` at 2 cpu / 2048 MB, so every guest came up
-  # as bare Ubuntu with no toolchain -- measured, 8s to a guest with no nix, no
-  # devenv and no `/home/admin` checkout. `workenv-base` is the baked image with
-  # the toolchain in it.
+  # The identity this fleet runs as. Bound, not merely enabled: a configless
+  # `{ extension = "workenv.identity"; }` fails inside the adapter on
+  # "profile.name is required", so every environment below declared an identity
+  # integration and ran on whatever credentials the machine happened to hold.
+  # `modules/identity.nix` now refuses to evaluate that shape.
   #
-  # 4 cpu / 8192 MB because a guest here has to be able to build: provisioning
-  # adds an 8 GB swapfile precisely because rustc was SIGKILLed on a 7914 MB
-  # guest. 2048 MB cannot compile anything.
-  #
-  # `lease_seconds` deliberately absent. It is accepted by create's schema and
-  # discarded by create's code, which never reads it -- declaring one here would
-  # read as an expiry policy that does not exist. Expiry lives entirely in
-  # `reap`, which takes the lease from its own caller.
-  orchardBinding = {
-    extension = "workenv.orchard";
-    # `labels` pins placement to the worker that actually holds the image.
-    # `workenv-base` is a `local` tart image on the controller Mac, so a guest
-    # scheduled anywhere else fails with `the specified VM "workenv-base" does
-    # not exist` -- the exact failure that made every guest fall back to bare
-    # Ubuntu. A worker carries no labels by default and any label disqualifies a
-    # worker lacking it, so this is the mechanism that makes placement follow
-    # the image rather than depend on which worker the scheduler happens to pick.
-    config = {
-      image = "workenv-base";
-      cpu = 4;
-      memory = 8192;
-      labels = {
-        image = "workenv-base";
-      };
-    };
+  # One binding value, reused, for the same reason as `orchardBinding`: core
+  # rejects an environment whose repeated bindings of one extension differ, and
+  # writing it once is what keeps them identical.
+  identityBinding = {
+    extension = "workenv.identity";
+    config.profile = (import ./profiles.nix).personal;
   };
-
-  # `source` is a path on the *target*: core runs `devenv shell --from <source>`
-  # there, never here. A remote environment whose source was `toString ../.`
-  # therefore named a macOS controller path that does not exist on a Linux
-  # guest, and had nothing to evaluate once it got there. The project
-  # integration is what puts a real checkout at that path, so for every remote
-  # environment below `source` and `directory` are the same path and this
-  # binding is what creates it.
-  projectBinding = repository: {
-    extension = "workenv.project";
-    config = { inherit repository; };
-  };
-
-  workenvProject = projectBinding "https://github.com/douglance/workenv.git";
 in
 
 {
@@ -93,98 +54,18 @@ in
     # the shipped CLI and every environment here had to carry its own source.
     project.enable = true;
 
-    # One ephemeral Lima slot on `box-03`, an Apple Silicon (M2) Mac mini. The
-    # address is static because the controller reads it from this manifest and
-    # never from a provider response, so a claim binds an identity to a slot and
-    # never renames it. The user is `box-03` because that is the Lima guest user;
-    # `fleet.json` says `exedev`, and the two want reconciling when the guest
-    # gains its own account.
-    # Migrated off the Lima pool onto Orchard. The slot registry, the fixed
-    # `box-03@wkv-01...` address and the `workenv-lima` shell command are all gone:
-    # the scheduler chooses the worker after this manifest is written, so there is
-    # no address to declare, and `workenv.orchard` is provider, transport and
-    # connection at once -- the same shape `wkv-fast` already used.
-    hosts."wkv-01" = {
-      address = null;
-      transport = "workenv.orchard";
-      system = "aarch64-linux";
-      provider = orchardBinding;
-    };
-
-    # An address-free host. This is the whole point of the Orchard path: the
-    # scheduler chooses the machine after this manifest is written, so there is
-    # no address to declare, and `workenv.orchard` is both the provider that
-    # creates the guest and the transport that reaches it by name through the
-    # controller. Nothing here names a machine, so the same environment lands on
-    # whichever worker has capacity.
-    hosts."wkv-fast" = {
-      address = null;
-      transport = "workenv.orchard";
-      system = "aarch64-linux";
-      # The controller URL is not repeated here. The adapter defaults to the
-      # loopback controller, which is the only place it can be once the
-      # controller is bound to 127.0.0.1, and an unset value cannot disagree
-      # with the transport and connection bindings.
-      provider = orchardBinding;
-    };
-
+    # No per-project hosts or environments. `wkv-01`, `wkv-fast` and
+    # `wkv-devsql` lived here, one environment per project, each naming its own
+    # repository and its own guest name. The pool in `runners.nix` replaces all
+    # three: the environment name is the guest name globally, so one environment
+    # per project can never give two workenvs on one project, and a pool of
+    # identical runners gives arbitrary concurrency from static declarations --
+    # with no registry, no adopt step, and no manifest change per project.
     hosts.local = {
       address = null;
       transport = null;
       provider = null;
       system = pkgs.stdenv.hostPlatform.system;
-    };
-
-    environments."wkv-01" = {
-      host = "wkv-01";
-      directory = "/home/box-03.linux/workenv";
-      source = "/home/box-03.linux/workenv";
-      ephemeral = true;
-      integrations = [
-        { extension = "workenv.identity"; }
-        { extension = "workenv.bootstrap"; }
-        workenvProject
-      ];
-      # Reaching in is the provider's own job here, as for wkv-fast. herdr was
-      # only ever an integration because it was also the connection, and a
-      # connection extension declaring `register` must be bound both ways.
-      connection = orchardBinding;
-    };
-
-    # Measured at 7s from create to ssh-ready against a 4354s baseline, because
-    # the image carries the toolchain. Credentials are deliberately not baked:
-    # a Tart image is cloned and can be pushed to a registry.
-    environments."wkv-fast" = {
-      host = "wkv-fast";
-      directory = "/home/admin/workenv";
-      source = "/home/admin/workenv";
-      ephemeral = true;
-      integrations = [
-        { extension = "workenv.identity"; }
-        { extension = "workenv.bootstrap"; }
-        workenvProject
-      ];
-      # Reaching in is the provider's own job here. Every other connection
-      # extension needs target.address, which this host does not have.
-      connection = orchardBinding;
-    };
-
-    # A second project on the same scheduled-guest path. The environment name is
-    # also the guest name (the Orchard adapter falls back to
-    # `target.environment`), and `reap` sweeps by name prefix, so this is
-    # `wkv-devsql` rather than `devsql`: a guest outside the `wkv-` prefix is
-    # not covered by the sweep that expires the others, and would leak.
-    environments."wkv-devsql" = {
-      host = "wkv-fast";
-      directory = "/home/admin/devsql";
-      source = "/home/admin/devsql";
-      ephemeral = true;
-      integrations = [
-        { extension = "workenv.identity"; }
-        { extension = "workenv.bootstrap"; }
-        (projectBinding "https://github.com/douglance/devsql.git")
-      ];
-      connection = orchardBinding;
     };
 
     environments.workenv = {
@@ -193,7 +74,7 @@ in
       source = toString ../.;
       integrations = [
         { extension = "workenv.tailscale"; }
-        { extension = "workenv.identity"; }
+        identityBinding
         # workenv.clipboard is deliberately absent. It is an xclip/xsel
         # integration declared `systems = [ "x86_64-linux" ]`, and this host is
         # the controller Mac, so listing it made the whole manifest fail to load

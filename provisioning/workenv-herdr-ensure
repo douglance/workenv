@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Idempotently install and start Herdr on a live guest. First-boot does the
+# same work from the setup script; this covers guests that came up before that
+# fragment existed.
+#
+#   workenv-herdr-ensure --via exedev|orchard <slot>
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VIA=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --via) VIA="${2:?}"; shift 2 ;;
+    --) shift; break ;;
+    -*) printf 'workenv-herdr-ensure: unknown flag %s\n' "$1" >&2; exit 1 ;;
+    *) break ;;
+  esac
+done
+SLOT="${1:?usage: workenv-herdr-ensure --via <exedev|orchard> <slot>}"
+[ -n "$VIA" ] || { printf 'workenv-herdr-ensure: --via is required\n' >&2; exit 1; }
+script="$(cat "$here/workenv-herdr-install")"
+out="$("$here/workenv-guest" "$VIA" "$SLOT" "$script" || true)"
+printf '%s\n' "$out"
+case "$out" in
+  *HERDR_SERVER_ON*) ;;
+  *)
+    printf 'workenv-herdr-ensure: guest did not print HERDR_SERVER_ON\n' >&2
+    exit 1
+    ;;
+esac
+# Controller-side: exe.dev guests have a public SSH name. Orchard guests do not.
+if [ "$VIA" = exedev ]; then
+  "$here/workenv-herdr-register" "$SLOT" || \
+    printf 'workenv-herdr-ensure: herdr machine register failed for %s\n' "$SLOT" >&2
+fi
+exit 0

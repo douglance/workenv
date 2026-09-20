@@ -183,6 +183,32 @@ fn changing_the_adapter_contract_still_invalidates_the_receipt() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn destroy_uses_an_earlier_owned_create_when_the_latest_create_is_unowned() -> Result<()> {
+    // A later `up` retry records a create with owned:false. Destroy used to take
+    // that newest receipt and refuse, leaving the VM from the first create live.
+    let root = tempfile::tempdir()?;
+    let executor = std::sync::Arc::new(MockExecutor::default());
+    executor.responses.lock().map_err(lock_error)?.extend([
+        owned_create("create-1:dev:create:0:setup"),
+        adopted_create("create-2:dev:create:0:setup"),
+        response("destroy-1:dev:destroy:0:setup"),
+    ]);
+    let controller = Controller::with_executor(
+        root.path().to_path_buf(),
+        provider_manifest(true),
+        executor.clone(),
+    )?;
+    controller.environment("create", "dev", Some("create-1"))?;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    controller.environment("create", "dev", Some("create-2"))?;
+    let value = controller.environment("destroy", "dev", Some("destroy-1"))?;
+    assert_eq!(value["ok"], true);
+    let calls = executor.calls.lock().map_err(lock_error)?;
+    assert_eq!(calls.len(), 3, "destroy never asked the adapter: {calls:?}");
+    Ok(())
+}
+
 fn owned_create(request_id: &str) -> workenv_protocol::AdapterResponse {
     workenv_protocol::AdapterResponse {
         data: json!({"owned": true, "resource_id": "vm-1"}),

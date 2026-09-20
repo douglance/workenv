@@ -1,0 +1,65 @@
+# Install and start a Herdr server on this guest. Every workenv is a Herdr
+# machine: agents inside it show in a Herdr client that has added this host.
+#
+# URLs and sha256 sums are the linux rows from tools.json (herdr 0.9.0). A
+# mismatch against that file is a test failure, not a comment to update later.
+set -eu
+SUDO="${SUDO:-}"
+[ "$(id -u)" = 0 ] && SUDO=""
+[ -n "$SUDO" ] || [ "$(id -u)" = 0 ] || SUDO="sudo -n"
+
+arch=$(uname -m)
+case "$arch" in
+  x86_64)
+    HERDR_URL="https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-linux-x86_64"
+    HERDR_SHA="4fa1a01158dd8043da92d31b270780b0dcc10603038d9b61cac4d81ab63fb71f"
+    ;;
+  aarch64)
+    HERDR_URL="https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-linux-aarch64"
+    HERDR_SHA="9c8db20fb7e7427b138d5367113f1621ffd319f2f65d6f009e2594029115f0d2"
+    ;;
+  *)
+    printf 'workenv-herdr-install: no linux herdr binary for arch %s\n' "$arch" >&2
+    exit 1
+    ;;
+esac
+
+if ! [ -x /usr/local/bin/herdr ]; then
+  curl -fsSL -o /tmp/herdr "$HERDR_URL"
+  echo "$HERDR_SHA  /tmp/herdr" | sha256sum -c -
+  $SUDO install -m 0755 /tmp/herdr /usr/local/bin/herdr
+fi
+
+runuser=$(id -un)
+[ "$runuser" = root ] && { id exedev >/dev/null 2>&1 && runuser=exedev || runuser=admin; }
+home=$(getent passwd "$runuser" | cut -d: -f6)
+[ -n "$home" ] || home=/home/$runuser
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  $SUDO tee /etc/systemd/system/herdr.service >/dev/null <<UNIT
+[Unit]
+Description=Herdr server
+After=network-online.target
+
+[Service]
+Type=simple
+User=$runuser
+WorkingDirectory=$home
+ExecStart=/usr/local/bin/herdr server
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now herdr.service
+else
+  mkdir -p /opt/workenv
+  if ! [ -f /opt/workenv/herdr-server.pid ] || ! kill -0 "$(cat /opt/workenv/herdr-server.pid)" 2>/dev/null; then
+    nohup /usr/local/bin/herdr server >/opt/workenv/herdr-server.log 2>&1 &
+    echo $! > /opt/workenv/herdr-server.pid
+  fi
+fi
+/usr/local/bin/herdr --version
+printf 'HERDR_SERVER_ON\n'

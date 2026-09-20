@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Point the controller Herdr client at a live exe.dev guest so it appears in
+# the Machines sidebar without a manual `herdr machine add`.
+#
+#   workenv-herdr-register <slot>           add if missing
+#   workenv-herdr-register --remove <slot>  drop on --down
+set -euo pipefail
+HERDR="${HERDR_BIN:-herdr}"
+die() { printf 'workenv-herdr-register: %s\n' "$*" >&2; exit 1; }
+
+remove=0
+if [ "${1:-}" = --remove ]; then remove=1; shift; fi
+SLOT="${1:?usage: workenv-herdr-register [--remove] <slot>}"
+TARGET="$SLOT.exe.xyz"
+
+listed="$("$HERDR" machine list --json 2>/dev/null || printf '[]\n')"
+id="$(printf '%s' "$listed" | python3 -c '
+import json,sys
+slot, target = sys.argv[1], sys.argv[2]
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(rows, list):
+    sys.exit(0)
+for row in rows:
+    if row.get("label") == slot or row.get("target") == target:
+        print(row.get("id", ""))
+        break
+' "$SLOT" "$TARGET")"
+
+if [ "$remove" = 1 ]; then
+  [ -n "$id" ] || { printf 'HERDR_MACHINE_ABSENT\n'; exit 0; }
+  "$HERDR" machine remove "$id"
+  printf 'HERDR_MACHINE_REMOVED\n'
+  exit 0
+fi
+
+if [ -n "$id" ]; then
+  printf 'HERDR_MACHINE_ON\n'
+  exit 0
+fi
+"$HERDR" machine add "$TARGET" --label "$SLOT"
+printf 'HERDR_MACHINE_ON\n'

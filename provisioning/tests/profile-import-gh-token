@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# macOS gh keeps the oauth token in the Keychain; hosts.yml names the user only.
+# Import must copy the live token into the profile file or a Linux guest cannot
+# clone private GitHub.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMPORT="$here/../workenv-profile-import"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+TOKEN='gho_test_token_not_a_secret_aaa'
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+mkdir -p "$tmp/bin" "$tmp/gh" "$tmp/profiles/work" "$tmp/home"
+cat > "$tmp/bin/gh" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *'api user'*) printf '%s\n' 'testuser' ;;
+  *'auth token'*) printf '%s\n' '$TOKEN' ;;
+  *) exit 1 ;;
+esac
+STUB
+cat > "$tmp/bin/security" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$tmp/bin/gh" "$tmp/bin/security"
+
+cat > "$tmp/gh/hosts.yml" <<'YAML'
+github.com:
+    git_protocol: https
+    user: testuser
+YAML
+python3 -c '
+import json,sys
+json.dump({"schema_version":1,"digest":"d","spec":{"name":"work","github_login":"testuser"}},
+          open(sys.argv[1],"w"))
+' "$tmp/profiles/work/profile.json"
+
+out="$(
+  HOME="$tmp/home" WORKENV_PROFILES_DIR="$tmp/profiles" PATH="$tmp/bin:/usr/bin:/bin" \
+    "$IMPORT" work --from-gh-config "$tmp/gh" 2>&1
+)" || { printf '  FAIL  import exited nonzero\n%s\n' "$out"; exit 1; }
+
+hosts="$tmp/profiles/work/.gh/hosts.yml"
+keys="$(python3 -c '
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+keys=[]
+for line in text.splitlines():
+    s=line.strip()
+    if s and not s.startswith("#") and ":" in s:
+        keys.append(s.split(":",1)[0].strip())
+print(" ".join(keys))
+' "$hosts")"
+
+printf '\nprofile-import gh token\n'
+check "a keychain-style hosts.yml gains oauth_token" 1 \
+  "$(python3 -c 'from pathlib import Path; import sys; print(1 if "oauth_token:" in Path(sys.argv[1]).read_text() else 0)' "$hosts")"
+check "the copied hosts.yml still names github.com" 1 \
+  "$(python3 -c 'from pathlib import Path; import sys; print(1 if "github.com" in Path(sys.argv[1]).read_text() else 0)' "$hosts")"
+case "$out" in
+  *"$TOKEN"*) leaked=1 ;;
+  *) leaked=0 ;;
+esac
+check "import stdout does not print the token" 0 "$leaked"
+check "hosts.yml keys include oauth_token" 1 \
+  "$(python3 -c 'import sys; print(1 if "oauth_token" in sys.argv[1].split() else 0)' "$keys")"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

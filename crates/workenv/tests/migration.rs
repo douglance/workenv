@@ -223,3 +223,37 @@ async fn remote_macos_hosts_require_system_review() -> Result<()> {
     assert_eq!(report["warnings"][0]["host"], "mac-ssh");
     Ok(())
 }
+
+/// The migrated identity binding must name the directory key the adapter reads.
+///
+/// It did not: migration emitted `profiles_root` and the adapter has always read
+/// `profiles_dir`, so a migrated fleet silently resolved profiles under
+/// `$HOME/.config/workenv/profiles` instead of the directory migration had just
+/// populated -- and unknown binding-config keys raise no error, so the only
+/// symptom was a profile that was not found. The key is spelled out here rather
+/// than taken from the shared constant, so that renaming the constant fails this
+/// test instead of quietly moving both sides together.
+#[tokio::test]
+async fn migrated_identity_binding_points_at_the_migrated_profile_directory() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("fleet");
+    std::fs::create_dir_all(&root)?;
+    write_fixture_fleet(&root)?;
+    write_profile(&root)?;
+
+    let (code, report, _) = invoke(&root, &[]).await?;
+    let proposed = report["proposed_nix"].as_str().context("missing Nix")?;
+
+    assert_eq!(code, Some(0));
+    assert!(
+        !proposed.contains("profiles_root"),
+        "migration still emits the key the identity adapter does not read"
+    );
+    let expected = root.join("profiles");
+    let expected = expected.to_string_lossy();
+    assert!(
+        proposed.contains("profiles_dir") && proposed.contains(expected.as_ref()),
+        "migrated identity config does not point at {expected}"
+    );
+    Ok(())
+}

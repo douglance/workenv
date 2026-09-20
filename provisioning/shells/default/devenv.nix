@@ -45,6 +45,7 @@
     pkgs.clippy
     pkgs.rustfmt
     pkgs.git
+    pkgs.gh
     pkgs.ripgrep
     pkgs.fd
     pkgs.jq

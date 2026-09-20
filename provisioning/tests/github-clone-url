@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# The guest clones through the seeded gh helper, not the controller's SSH Host.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL="$here/../workenv-github-url"
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+printf '\ngithub clone url\n'
+check "github.com ssh becomes https" \
+  "https://github.com/org/repo.git" \
+  "$("$URL" "git@github.com:org/repo.git")"
+check "github-* ssh alias becomes https github.com" \
+  "https://github.com/org/private.git" \
+  "$("$URL" "git@github-work:org/private.git")"
+check "ssh:// github alias becomes https" \
+  "https://github.com/org/repo.git" \
+  "$("$URL" "ssh://git@github-work/org/repo.git")"
+check "https github is unchanged" \
+  "https://github.com/org/repo.git" \
+  "$("$URL" "https://github.com/org/repo.git")"
+check "a non-github ssh remote is unchanged" \
+  "git@git.example.edu:group/repo.git" \
+  "$("$URL" "git@git.example.edu:group/repo.git")"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

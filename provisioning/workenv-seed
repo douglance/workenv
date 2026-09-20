@@ -1,8 +1,108 @@
 #!/usr/bin/env bash
-# Seed a provisioned guest with skills, agent configs, and credentials.
+# Seed a provisioned guest with one identity, plus the operator's tooling.
 # Runs on the CONTROLLER. Secrets stream over ssh and are never printed.
+#
+#   workenv-seed --via <exedev|orchard> <vm> --identity <profile>
+#   workenv-seed <ssh-target>               --identity <profile>
+#
+# Two kinds of material, and the difference is the whole point of the script:
+#
+#   identity   .claude/.credentials.json, .codex/auth.json, .grok/auth.json,
+#              .gh/hosts.yml, .gitconfig -- taken ONLY from the named profile's
+#              tree, never from the controller's own $HOME. A guest therefore
+#              holds exactly one identity and has nothing of any other.
+#   tooling    skills, commands, agents, CLAUDE.md, AGENTS.md -- the operator's
+#              working material, identical whoever is logged in, taken from $HOME.
+#
+# Some credentials are legitimately shared. Anthropic auth is one store holding
+# several accounts, selected by ANTHROPIC_PROFILE, so two profiles can carry a
+# byte-identical .claude/.credentials.json and still be different identities.
+# That selection is a mechanism, not a label, so it is installed here as
+# ~/.workenv-identity and sourced by the guest's login shell -- and
+# workenv-identity-check reads it back rather than assuming it took.
+#
+# There is deliberately no fallback from a profile to $HOME. Falling back is the
+# bug this exists to prevent: it turns "the work profile has no login yet" into
+# "the work guest silently ran as the personal account", which is invisible
+# precisely because everything works.
 set -euo pipefail
 log() { printf '\n=== %s ===\n' "$*"; }
+die() { printf 'workenv-seed: %s\n' "$*" >&2; exit 1; }
+
+PROFILES_DIR="${WORKENV_PROFILES_DIR:-$HOME/.config/workenv/profiles}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND=""
+SLOT=""
+TARGET=""
+IDENTITY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --via)      BACKEND="${2:?--via needs exedev or orchard}"; SLOT="${3:?--via needs a vm name}"; shift 3 ;;
+    --exedev)   BACKEND=exedev; SLOT="${2:?--exedev needs a vm name}"; shift 2 ;;
+    --identity) IDENTITY="${2:?--identity needs a profile name}"; shift 2 ;;
+    -*)         die "unknown option $1" ;;
+    *)          TARGET="$1"; shift ;;
+  esac
+done
+
+[ -n "$IDENTITY" ] || die "--identity <profile> is required.
+  A guest with no named identity is a guest running on whatever credentials this
+  machine happens to hold, which is the failure the profiles exist to prevent.
+  Profiles live under $PROFILES_DIR; create one with workenv-profile-import."
+
+PROFILE="$PROFILES_DIR/$IDENTITY"
+[ -d "$PROFILE" ] || die "no profile '$IDENTITY' at $PROFILE.
+  Prepare it with:  workenv --root fleet extension call workenv.identity apply --environment workenv
+  then log it in:   workenv-profile-import $IDENTITY   (or the adapter's interactive login)"
+
+# Identity material, profile-relative source -> guest-relative destination.
+# `.gh/hosts.yml` becomes the guest's gh config because the profile's .gitconfig
+# delegates the GitHub credential to `gh auth git-credential`; without it the
+# guest can clone a public repo and push nothing.
+spec_field() { # $1 = field -> value, or empty
+  [ -f "$PROFILE/profile.json" ] || return 0
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spec"].get(sys.argv[2],""))' \
+    "$PROFILE/profile.json" "$1" 2>/dev/null || true
+}
+
+# The guest's copy of who it is. A file rather than an exported variable because
+# the agent runs through several shells and a relay, and because the check that
+# follows needs to read the selection back rather than trust that it was made.
+identity_marker() {
+  printf 'WORKENV_PROFILE=%s\n' "$IDENTITY"
+  anthropic="$(spec_field anthropic_profile)"
+  [ -n "$anthropic" ] && printf 'ANTHROPIC_PROFILE=%s\n' "$anthropic"
+  return 0
+}
+
+# Sourced from both, because a relay exec gets .bashrc and a login shell gets
+# .profile, and an identity that applies in only one of them is an identity that
+# applies when nobody is looking.
+MARKER_BLOCK='# >>> workenv identity >>>
+set -a; . "$HOME/.workenv-identity"; set +a
+# <<< workenv identity <<<'
+
+identity_files() {
+  printf '%s\n' \
+    ".claude/.credentials.json:.claude/.credentials.json" \
+    ".codex/auth.json:.codex/auth.json" \
+    ".grok/auth.json:.grok/auth.json" \
+    ".gh/hosts.yml:.config/gh/hosts.yml" \
+    ".gitconfig:.gitconfig"
+}
+
+# Operator tooling. Not identity: the same files whoever is logged in.
+tooling_files() {
+  printf '%s\n' \
+    "$HOME/.claude/CLAUDE.md:.claude/CLAUDE.md" \
+    "$HOME/.claude/settings.json:.claude/settings.json" \
+    "$HOME/.codex/AGENTS.md:.codex/AGENTS.md" \
+    "$HOME/.agents/AGENTS.md:.agents/AGENTS.md"
+}
+
+present=0
+missing=0
 
 # --- exe.dev guests -------------------------------------------------------
 # A scheduled exe.dev VM has no address to ssh to, and no stdin through its
@@ -10,14 +110,15 @@ log() { printf '\n=== %s ===\n' "$*"; }
 # success, which is the worst failure available because it looks seeded. So this
 # mode carries everything through argv, base64'd, and rsync is not usable at all.
 #
-# Linux caps a single argument at 128 KiB, so anything larger is chunked. The
-# credentials and instruction files total ~16 KB and arrive in one hop each; the
-# skills trees are 3.1 MB compressed and cost about a minute, which is why the
-# cost is announced rather than hidden.
-if [ "${1:-}" = "--exedev" ]; then
-  SLOT="${2:?usage: workenv-seed --exedev <vm-name>}"
-  guest() { ssh -o BatchMode=yes exe.dev ssh "$SLOT" "$@"; }
-  CHUNK=61440 # 60 KiB raw -> 80 KiB base64, inside the per-argument limit.
+# exe.dev caps a relayed command at 64 KiB. Base64 inflates 4/3, and put_bytes
+# wraps each chunk as `printf %s '...' >> dest`, so raw chunks stay at 32 KiB
+# (about 44 KiB encoded). Linux's 128 KiB argv cap is not the binding limit:
+# 60 KiB raw became 80 KiB on the wire and live seeding died with
+# "request body exceeds 64KB limit". Credentials still fit in one hop; skills
+# take more hops and about a minute, which is why the cost is announced.
+if [ -n "$BACKEND" ]; then
+  guest() { "$here/workenv-guest" "$BACKEND" "$SLOT" "$@"; }
+  CHUNK=32768
   put_bytes() { # stdin -> remote path, chunked, mode 600
     local dest="$1" part tmp n=0
     tmp="$(mktemp -d)"
@@ -32,30 +133,41 @@ if [ "${1:-}" = "--exedev" ]; then
     rm -rf "$tmp"
   }
 
-  log "credentials and instruction files -> $SLOT"
-  for spec in \
-    "$HOME/.codex/auth.json:.codex/auth.json" \
-    "$HOME/.grok/auth.json:.grok/auth.json" \
-    "$HOME/.claude/CLAUDE.md:.claude/CLAUDE.md" \
-    "$HOME/.claude/settings.json:.claude/settings.json" \
-    "$HOME/.codex/AGENTS.md:.codex/AGENTS.md" \
-    "$HOME/.agents/AGENTS.md:.agents/AGENTS.md"; do
+  log "identity '$IDENTITY' -> $SLOT"
+  # Wiped first, and unconditionally. A slot is a reused name: seeding on top of
+  # a previous tenant's files leaves that tenant's credentials in place wherever
+  # this profile has no file of its own, which is exactly the bug the deleted
+  # Lima pool shipped.
+  "$here/workenv-identity-wipe" --via "$BACKEND" "$SLOT" --quiet
+
+  while IFS= read -r spec; do
+    src="$PROFILE/${spec%%:*}"
+    dst="${spec##*:}"
+    if [ -f "$src" ]; then
+      put_bytes "$dst" <"$src"
+      present=$((present + 1))
+    else
+      printf '  %-30s absent from profile\n' "$dst"
+      missing=$((missing + 1))
+    fi
+  done < <(identity_files)
+
+  identity_marker | put_bytes ".workenv-identity"
+  # Idempotent: the block is removed before it is added, so reseeding a slot
+  # cannot leave two of them, the second naming the previous tenant.
+  guest 'for rc in .bashrc .profile; do
+      [ -f "$HOME/$rc" ] || : > "$HOME/$rc"
+      awk "/# >>> workenv identity >>>/{s=1} !s{print} /# <<< workenv identity <<</{s=0}" \
+        "$HOME/$rc" > "$HOME/$rc.wkv" && mv "$HOME/$rc.wkv" "$HOME/$rc"
+    done'
+  guest "printf %s '$(printf '%s' "$MARKER_BLOCK" | base64 | tr -d '\n')' | base64 -d | tee -a ~/.bashrc >> ~/.profile"
+
+  log "tooling"
+  while IFS= read -r spec; do
     src="${spec%%:*}"
     dst="${spec##*:}"
     [ -f "$src" ] && put_bytes "$dst" <"$src"
-  done
-
-  # Captured before sending, not piped straight through: a remote redirection
-  # truncates the guest's credential file the moment the pipe opens, which is
-  # before `security -w` is known to have succeeded -- so a denied Keychain read
-  # replaced a working credential with a 0-byte one.
-  CLAUDE_CREDS="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
-  if [ -n "$CLAUDE_CREDS" ]; then
-    printf '%s' "$CLAUDE_CREDS" | put_bytes ".claude/.credentials.json"
-  else
-    printf '  %-30s unavailable (Keychain denied or absent)\n' ".claude/.credentials.json"
-  fi
-  unset CLAUDE_CREDS
+  done < <(tooling_files)
 
   if [ "${WKV_SEED_SKILLS:-1}" = "1" ]; then
     # `.agents/skills` is included because `~/.claude/skills/*` are symlinks into
@@ -68,22 +180,27 @@ if [ "${1:-}" = "--exedev" ]; then
   fi
 
   log "what arrived"
-  guest 'for f in .codex/auth.json .grok/auth.json .claude/.credentials.json .claude/CLAUDE.md; do
+  guest 'for f in .codex/auth.json .grok/auth.json .claude/.credentials.json .gitconfig .config/gh/hosts.yml .claude/CLAUDE.md; do
       [ -f ~/$f ] && printf "  %-30s %s bytes mode %s\n" "$f" "$(wc -c < ~/$f)" "$(stat -c %a ~/$f)"
     done
     for d in .claude/skills .agents/skills; do
       [ -d ~/$d ] && printf "  %-30s %s entries\n" "$d" "$(find ~/$d -mindepth 1 -maxdepth 1 | wc -l)"
     done'
+  printf '\nseeded as %s: %s identity file(s) present, %s absent from the profile\n' \
+    "$IDENTITY" "$present" "$missing"
+  [ "$present" -gt 0 ] || die "profile '$IDENTITY' holds no credentials, so this guest can authenticate to nothing.
+  The profile tree exists but was never logged in. Capture a session with:
+    workenv-profile-import $IDENTITY [--from-gh-config <dir>]"
   echo SEED_DONE
   exit 0
 fi
 # --- ssh-reachable guests -------------------------------------------------
 
-TARGET="${1:?usage: workenv-seed <ssh-target> | --exedev <vm-name>}"
+[ -n "$TARGET" ] || die "usage: workenv-seed <ssh-target> --identity <profile> | --via <backend> <vm> --identity <profile>"
 SSH=(ssh -o BatchMode=yes)
 RS=(rsync -az --delete -e "ssh -o BatchMode=yes")
 
-"${SSH[@]}" "$TARGET" 'mkdir -p ~/.claude ~/.codex ~/.agents ~/.grok'
+"${SSH[@]}" "$TARGET" 'mkdir -p ~/.claude ~/.codex ~/.agents ~/.grok ~/.config/gh'
 
 log "source trees the provisioner builds from"
 # The provisioner builds apoc and reads the tool definitions from the workenv
@@ -124,51 +241,50 @@ for spec in \
   fi
 done
 
-log "instruction files and configs"
-for spec in \
-  "$HOME/.claude/CLAUDE.md:.claude/CLAUDE.md" \
-  "$HOME/.claude/settings.json:.claude/settings.json" \
-  "$HOME/.codex/AGENTS.md:.codex/AGENTS.md" \
-  "$HOME/.codex/config.toml:.codex/config.toml" \
-  "$HOME/.agents/AGENTS.md:.agents/AGENTS.md" ; do
+log "tooling"
+while IFS= read -r spec; do
   src="${spec%%:*}"; dst="${spec##*:}"
   [ -f "$src" ] && { "${RS[@]}" "$src" "$TARGET:$dst"; printf '  %s\n' "$dst"; }
-done
+done < <(tooling_files)
 
-log "credentials (streamed, never displayed)"
+log "identity '$IDENTITY' (streamed, never displayed)"
+"$here/workenv-identity-wipe" "$TARGET" --quiet
 put_secret() { # $1 = local file, $2 = remote path
-  [ -f "$1" ] || { printf '  %-28s (absent locally)\n' "$2"; return 0; }
   "${SSH[@]}" "$TARGET" "install -d -m 700 \$(dirname ~/$2) && cat > ~/$2 && chmod 600 ~/$2" < "$1"
   printf '  %-28s installed 0600 (%s bytes)\n' "$2" "$(wc -c < "$1" | tr -d ' ')"
 }
-put_secret "$HOME/.codex/auth.json" ".codex/auth.json"
-put_secret "$HOME/.grok/auth.json"  ".grok/auth.json"
+while IFS= read -r spec; do
+  src="$PROFILE/${spec%%:*}"
+  dst="${spec##*:}"
+  if [ -f "$src" ]; then
+    put_secret "$src" "$dst"
+    present=$((present + 1))
+  else
+    printf '  %-28s absent from profile\n' "$dst"
+    missing=$((missing + 1))
+  fi
+done < <(identity_files)
 
-# Claude Code keeps credentials in the macOS Keychain; Linux reads a file.
-# Captured here first, rather than piped straight into the remote `cat >`. The
-# remote redirection truncates the guest's credential file the moment the pipe
-# opens, which is before `security -w` is known to have succeeded -- so a denied
-# Keychain read replaced a working credential with a 0-byte one, and the guest's
-# next claude invocation failed to authenticate with nothing to point at.
-CLAUDE_CREDS="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
-if [ -n "$CLAUDE_CREDS" ]; then
-  printf '%s' "$CLAUDE_CREDS" \
-    | "${SSH[@]}" "$TARGET" 'cat > ~/.claude/.credentials.json && chmod 600 ~/.claude/.credentials.json'
-  n=$("${SSH[@]}" "$TARGET" 'wc -c < ~/.claude/.credentials.json' 2>/dev/null | tr -d ' ')
-  printf '  %-28s installed 0600 (%s bytes, from Keychain)\n' ".claude/.credentials.json" "$n"
-elif security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
-  printf '  %-28s Keychain read denied\n' ".claude/.credentials.json"
-else
-  printf '  %-28s no Keychain entry\n' ".claude/.credentials.json"
-fi
-unset CLAUDE_CREDS
+identity_marker | "${SSH[@]}" "$TARGET" 'cat > ~/.workenv-identity && chmod 600 ~/.workenv-identity'
+"${SSH[@]}" "$TARGET" 'for rc in .bashrc .profile; do
+    [ -f "$HOME/$rc" ] || : > "$HOME/$rc"
+    awk "/# >>> workenv identity >>>/{s=1} !s{print} /# <<< workenv identity <<</{s=0}" \
+      "$HOME/$rc" > "$HOME/$rc.wkv" && mv "$HOME/$rc.wkv" "$HOME/$rc"
+  done'
+printf '%s\n' "$MARKER_BLOCK" | "${SSH[@]}" "$TARGET" 'tee -a ~/.bashrc >> ~/.profile'
+printf '  %-28s installed\n' ".workenv-identity"
 
 log "seed summary"
 "${SSH[@]}" "$TARGET" 'for p in .claude/skills .claude/commands .codex/skills .agents/skills; do
     [ -d ~/$p ] && printf "  %-20s %s entries\n" "$p" "$(find ~/$p -mindepth 1 -maxdepth 1 | wc -l | tr -d " ")"
   done
   echo "  --- credentials present ---"
-  for f in .codex/auth.json .grok/auth.json .claude/.credentials.json; do
+  for f in .codex/auth.json .grok/auth.json .claude/.credentials.json .gitconfig .config/gh/hosts.yml; do
     [ -f ~/$f ] && printf "  %-28s %s\n" "$f" "$(stat -c %a ~/$f)"
   done'
+printf '\nseeded as %s: %s identity file(s) present, %s absent from the profile\n' \
+  "$IDENTITY" "$present" "$missing"
+[ "$present" -gt 0 ] || die "profile '$IDENTITY' holds no credentials, so this guest can authenticate to nothing.
+  The profile tree exists but was never logged in. Capture a session with:
+    workenv-profile-import $IDENTITY [--from-gh-config <dir>]"
 echo SEED_DONE

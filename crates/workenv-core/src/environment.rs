@@ -133,8 +133,15 @@ impl Controller {
 
     fn created_provider_resource(&self, name: &str, binding: &Binding) -> Result<RecordedResponse> {
         let expected = self.create_fingerprint(binding, name)?;
+        let id = identity(name, &binding.extension, "create");
+        if let Some(owned) = self
+            .receipts
+            .latest_owned_recorded_response_for(&id, &expected)?
+        {
+            return Ok(owned);
+        }
         self.receipts
-            .latest_recorded_response_for(&identity(name, &binding.extension, "create"), &expected)?
+            .latest_recorded_response_for(&id, &expected)?
             .ok_or_else(|| anyhow::anyhow!("environment {name} has no recorded resource creation"))
     }
 

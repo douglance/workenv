@@ -1,10 +1,9 @@
 mod capacity;
 
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 
 pub(super) use capacity::capacity_report;
@@ -61,6 +60,15 @@ pub(super) fn spec(request: &AdapterRequest) -> Result<Spec> {
     })
 }
 
+/// The file the first-boot setup script touches once it has finished.
+///
+/// exe.dev calls a VM `running` one second after `new`, while nix and devenv are
+/// still installing -- measured at roughly three and a half minutes on a live
+/// guest. `up` raced that and failed with `devenv: command not found`, having
+/// been told the guest was present, so readiness is this marker rather than the
+/// hypervisor's view. The setup script writes it last and only on success.
+pub(super) const READY_MARKER: &str = "/opt/workenv/.provisioned";
+
 pub(super) fn observe_inventory(spec: &Spec, vms: &[Value]) -> Value {
     let matches = vms
         .iter()
@@ -100,10 +108,13 @@ pub(super) fn observed_response(
     receipt: Option<&Value>,
 ) -> AdapterResponse {
     data["owned"] = json!(receipt.is_some_and(|r| r["phase"] == "created"));
-    let status = if data["status"] == "present" {
-        ResponseStatus::Ready
-    } else {
-        ResponseStatus::Failed
+    // `not_ready` is Pending, not Failed. A guest still running its first-boot
+    // script is on its way to being usable, and calling that a failure told the
+    // caller to investigate something that only needed another minute.
+    let status = match data["status"].as_str() {
+        Some("present") => ResponseStatus::Ready,
+        Some("not_ready") => ResponseStatus::Pending,
+        _ => ResponseStatus::Failed,
     };
     AdapterResponse::new(request, status, data)
 }
@@ -138,49 +149,6 @@ pub(super) fn state_dir(request: &AdapterRequest) -> PathBuf {
 
 fn controller_state_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-pub(super) fn receipt_path(dir: &std::path::Path, key: &str) -> PathBuf {
-    dir.join(format!("{:x}.json", Sha256::digest(key.as_bytes())))
-}
-
-pub(super) fn read_receipt(path: &std::path::Path) -> Result<Option<Value>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
-}
-
-pub(super) fn write_receipt(path: &std::path::Path, value: &Value) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
-    Ok(())
-}
-
-pub(super) fn receipt_value(
-    request: &AdapterRequest,
-    spec: &Spec,
-    phase: &str,
-    fingerprint: &str,
-    result: &Value,
-) -> Value {
-    json!({"request_id":request.request_id,"fingerprint":fingerprint,"phase":phase,
-        "resource_id":spec.name,"provider_id":spec.name,"owned":phase=="created","result":result})
-}
-
-pub(super) fn fingerprint(operation: &str, spec: &Spec) -> String {
-    let body = json!({"operation":operation,"name":spec.name,"cpus":spec.cpus,
-        "memory_gb":spec.memory_gb,"disk_gb":spec.disk_gb,"region":spec.region,"adopt":spec.adopt});
-    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| Vec::new());
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-pub(super) fn receipt_waits(receipt: Option<&Value>) -> bool {
-    receipt.is_some_and(|r| {
-        matches!(
-            r["phase"].as_str(),
-            Some("creating" | "destroying" | "unknown")
-        )
-    })
 }
 
 pub(super) fn pending(request: &AdapterRequest, spec: &Spec, message: &str) -> AdapterResponse {

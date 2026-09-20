@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# The guest first-boot script must install the pinned linux herdr and stay
+# inside exe.dev's 10 KiB setup-script cap. Hashes come from tools.json, not
+# from this file, so a bump that forgets the installer is a red test.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/../.." && pwd)"
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+composed="$(
+  python3 -c '
+from pathlib import Path
+root = Path("'"$root"'")
+parts = [
+    (root / "provisioning/workenv-cloud-setup").read_text(),
+    (root / "provisioning/workenv-herdr-install").read_text(),
+    (root / "provisioning/shells/default/devenv.nix").read_text(),
+    (root / "devenv.yaml").read_text(),
+]
+text = "\n".join(parts)
+print(len(text.encode()))
+'
+)"
+install="$(cat "$root/provisioning/workenv-herdr-install")"
+x86="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["native_tools"]["herdr"]["by_system"]["x86_64-linux"]["sha256"])' "$root/tools.json")"
+arm="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["native_tools"]["herdr"]["by_system"]["aarch64-linux"]["sha256"])' "$root/tools.json")"
+
+printf '\nherdr guest setup\n'
+check "composed setup_script stays under 10 KiB" 1 "$(python3 -c 'import sys; print(1 if int(sys.argv[1]) <= 10240 else 0)' "$composed")"
+check "installer pins tools.json x86_64-linux sha256" 1 \
+  "$(python3 -c 'import sys; print(1 if sys.argv[1] in sys.argv[2] else 0)' "$x86" "$install")"
+check "installer pins tools.json aarch64-linux sha256" 1 \
+  "$(python3 -c 'import sys; print(1 if sys.argv[1] in sys.argv[2] else 0)' "$arm" "$install")"
+check "installer starts a herdr systemd unit or nohup server" 1 \
+  "$(python3 -c 'import sys; t=sys.argv[1]; print(1 if "herdr server" in t and "HERDR_SERVER_ON" in t else 0)' "$install")"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

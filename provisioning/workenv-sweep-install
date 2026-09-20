@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Install the periodic cloud sweep as a launchd agent on the controller.
+#
+#   workenv-sweep-install --prefix wkv-r --lease-seconds 14400 [--interval 900]
+#   workenv-sweep-install --prefix wkv-r --uninstall
+#
+# `--root <fleet>` and `--orchard-environment <runner>` are passed through to the
+# sweep, which needs both to reach the Orchard side of the pool. Omit the latter
+# and only the cloud half is swept -- which the install output says plainly.
+#
+# One job per fleet, and the label carries the prefix. A fixed label meant the
+# second fleet's install replaced the first fleet's job rather than joining it,
+# leaving one pool unswept -- and a pool nothing sweeps is a pool of guests that
+# keep another identity's credentials until someone notices the bill.
+#
+# Ships in report-only mode. `--apply` has to be added to the plist by hand,
+# after reading a few runs of the log, because the argument that makes this
+# destructive should not be the one nobody looked at.
+set -euo pipefail
+
+LOG_DIR="$HOME/Library/Logs/workenv"
+SWEEP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workenv-sweep"
+# The single-fleet job this replaces. Booted out on install so the two do not
+# both sweep, which they would otherwise do with the same prefix and different
+# leases depending on which was installed last.
+LEGACY_LABEL="dev.workenv.sweep"
+
+PREFIX=""
+LEASE=""
+INTERVAL=900
+APPLY=0
+UNINSTALL=0
+ROOT=""
+ORCHARD_ENV=""
+
+die() { printf 'workenv-sweep-install: %s\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix)        PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
+    --lease-seconds) LEASE="${2:?--lease-seconds needs a value}"; shift 2 ;;
+    --interval)      INTERVAL="${2:?--interval needs a value}"; shift 2 ;;
+    --apply)         APPLY=1; shift ;;
+    --root)          ROOT="${2:?--root needs a fleet directory}"; shift 2 ;;
+    --orchard-environment) ORCHARD_ENV="${2:?--orchard-environment needs a runner name}"; shift 2 ;;
+    --uninstall)     UNINSTALL=1; shift ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$PREFIX" ] || die "--prefix is required, including to uninstall: one job per fleet"
+LABEL="dev.workenv.sweep.$(printf '%s' "$PREFIX" | tr -c 'A-Za-z0-9.-' '-')"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$LOG_DIR/sweep-$PREFIX.log"
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "removed $LABEL"
+  exit 0
+fi
+
+[ -n "$LEASE" ]  || die "--lease-seconds is required"
+[ -x "$SWEEP" ]  || die "$SWEEP is missing or not executable"
+
+mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
+
+apply_arg=""
+[ "$APPLY" -eq 1 ] && apply_arg='    <string>--apply</string>'
+root_arg=""
+[ -n "$ROOT" ] && root_arg="    <string>--root</string><string>$(cd "$ROOT" && pwd)</string>"
+# Without this the Mac half of the pool is never swept. Reported at install
+# time, because an expired runner holding an identity's credentials is exactly
+# what this job exists to remove.
+orchard_arg=""
+if [ -n "$ORCHARD_ENV" ]; then
+  orchard_arg="    <string>--orchard-environment</string><string>$ORCHARD_ENV</string>"
+fi
+
+cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SWEEP</string>
+    <string>--prefix</string><string>$PREFIX</string>
+    <string>--lease-seconds</string><string>$LEASE</string>
+$root_arg
+$orchard_arg
+$apply_arg
+  </array>
+  <key>StartInterval</key><integer>$INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+PLIST_EOF
+
+launchctl bootout "gui/$(id -u)/$LEGACY_LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+
+cat <<NOTE
+installed $LABEL
+  sweeps   $PREFIX
+  lease    ${LEASE}s
+  every    ${INTERVAL}s
+  orchard  ${ORCHARD_ENV:-NOT SWEPT -- pass --orchard-environment <runner>}
+  mode     $([ "$APPLY" -eq 1 ] && echo 'APPLY -- guests are removed' || echo 'report only')
+  log      $LOG
+
+launchd on this controller has been observed to keep a job alive while it never
+actually runs, so read the log before believing the schedule: a working install
+writes a SWEEP-DONE line within $INTERVAL seconds.
+NOTE

@@ -37,6 +37,78 @@ let
     replace_existing.type = "boolean";
     replace.type = "boolean";
   };
+  # The binding `config` this adapter reads, declared. `bindingType.config` is
+  # `lib.types.anything`, so a misspelled key is accepted by the module system,
+  # dropped by the adapter, and surfaces as an environment quietly using a
+  # different identity than the one configured -- the failure this whole
+  # integration exists to prevent. Declaring the shape turns that into an
+  # evaluation failure instead.
+  configKeys = [
+    "profile"
+    "profiles_dir"
+    "nib_token_env"
+    "nib_token_file"
+    "replace_existing"
+    "replace"
+  ];
+  profileFields = lib.attrNames profile;
+  # The same rule `validate_slug` applies in profile_files.rs: first character
+  # lowercase, then lowercase/digit/dash, at most 48 characters.
+  validSlug = name: builtins.isString name && builtins.match "[a-z][a-z0-9-]{0,47}" name != null;
+
+  # Every place a binding can name this extension: a host's provider, an
+  # environment's integrations, and an environment's connection.
+  identityBindings =
+    let
+      fromEnvironment =
+        name: environment:
+        map (binding: { inherit name binding; }) (
+          environment.integrations ++ lib.optional (environment.connection != null) environment.connection
+        );
+      fromHost =
+        name: host:
+        map (binding: {
+          name = "host ${name}";
+          inherit binding;
+        }) (lib.optional (host.provider != null) host.provider);
+    in
+    lib.filter (entry: entry.binding.extension == cfg.extensionId) (
+      lib.concatLists (lib.mapAttrsToList fromEnvironment config.workenv.environments)
+      ++ lib.concatLists (lib.mapAttrsToList fromHost config.workenv.hosts)
+    );
+
+  bindingAssertions =
+    entry:
+    let
+      bound = entry.binding.config;
+      unknown = lib.subtractLists configKeys (lib.attrNames bound);
+      spec = bound.profile or null;
+      unknownProfile = if spec == null then [ ] else lib.subtractLists profileFields (lib.attrNames spec);
+    in
+    [
+      {
+        assertion = unknown == [ ];
+        message = "workenv.identity binding on ${entry.name} sets config key(s) ${lib.concatStringsSep ", " unknown} that the adapter never reads; it reads ${lib.concatStringsSep ", " configKeys}.";
+      }
+      {
+        # The isolation claim, stated where it can fail. A configless binding is
+        # not a smaller version of a configured one: the adapter falls through to
+        # `input` for the spec, the controller sends `{}`, and the operation dies
+        # on "profile.name is required" -- so the integration silently does
+        # nothing and the environment holds whatever identity the machine has.
+        assertion = spec != null;
+        message = "workenv.identity binding on ${entry.name} carries no config.profile, which leaves the adapter inert and the environment on the machine's ambient identity.";
+      }
+      {
+        assertion = spec == null || (spec ? name && validSlug (spec.name or null));
+        message = "workenv.identity binding on ${entry.name} needs config.profile.name as a lowercase slug.";
+      }
+      {
+        assertion = unknownProfile == [ ];
+        message = "workenv.identity binding on ${entry.name} sets profile field(s) ${lib.concatStringsSep ", " unknownProfile} that profile_files.rs does not read; it reads ${lib.concatStringsSep ", " profileFields}.";
+      }
+    ];
+
   operations = {
     inspect = {
       description = "Inspect profile preparation and GitHub identity status.";
@@ -110,6 +182,8 @@ in
   config = lib.mkIf cfg.enable {
     workenv.rust.enable = lib.mkDefault true;
 
+    assertions = lib.concatMap bindingAssertions identityBindings;
+
     packages = with pkgs; [
       gh
       git
@@ -121,7 +195,15 @@ in
         version = workspaceManifest.workspace.package.version;
         protocol_version = 1;
         executable = "${cfg.package}/bin/${cfg.binaryName}";
-        location = "target";
+        # Controller, not target. Every operation this adapter has runs against
+        # the *operator's* machine: `login` drives `herdr` to open an interactive
+        # pane, and `apply` writes the profile tree under `profiles_dir` that the
+        # controller shell sources and `workenv-seed` reads. Declared `target`,
+        # those ran on the guest -- where `herdr` is absent, the nix store path in
+        # `executable` does not exist, and a profile tree would be written into a
+        # machine that is about to be destroyed. Nothing was noticed because every
+        # binding was configless and failed earlier, on `profile.name is required`.
+        location = "controller";
         systems = lib.platforms.linux ++ lib.platforms.darwin;
         runtime_inputs = [
           "apoc"

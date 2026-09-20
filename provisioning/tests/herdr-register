@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Registering a slot with Herdr is idempotent and uses slot.exe.xyz, not a
+# lima Host alias. Remove drops the saved machine on --down.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REG="$here/../workenv-herdr-register"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+mkdir -p "$tmp/bin"
+cat > "$tmp/bin/herdr" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$tmp/herdr.log"
+case "\$1 \$2" in
+  "machine list")
+    if [ -f "$tmp/machines.json" ]; then cat "$tmp/machines.json"; else echo '[]'; fi
+    ;;
+  "machine add")
+    python3 -c 'import json,sys
+json.dump([{"id":"m1","label":sys.argv[2],"target":sys.argv[1]}], open(sys.argv[3],"w"))
+' "\$3" "\$5" "$tmp/machines.json"
+    ;;
+  "machine remove")
+    echo '[]' > "$tmp/machines.json"
+    ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$tmp/bin/herdr"
+
+printf '\nherdr register\n'
+out="$(PATH="$tmp/bin:$PATH" HERDR_BIN="$tmp/bin/herdr" "$REG" work-r01)"
+check "first add reports HERDR_MACHINE_ON" HERDR_MACHINE_ON "$out"
+check "add target is work-r01.exe.xyz" 1 \
+  "$(grep -c 'machine add work-r01.exe.xyz --label work-r01' "$tmp/herdr.log" || true)"
+
+: > "$tmp/herdr.log"
+out="$(PATH="$tmp/bin:$PATH" HERDR_BIN="$tmp/bin/herdr" "$REG" work-r01)"
+check "second add is a no-op" HERDR_MACHINE_ON "$out"
+check "already-listed slot does not call add again" 0 \
+  "$(grep -c 'machine add' "$tmp/herdr.log" || true)"
+
+out="$(PATH="$tmp/bin:$PATH" HERDR_BIN="$tmp/bin/herdr" "$REG" --remove work-r01)"
+check "remove reports HERDR_MACHINE_REMOVED" HERDR_MACHINE_REMOVED "$out"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

@@ -241,12 +241,34 @@ fn private_new_file(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-fn resolve_executable(executable: &str) -> Result<String> {
+/// Used when the process has no `PATH`, which is how `APoC` launches workenv.
+const DEFAULT_UNIX_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin";
+
+pub(crate) fn resolve_executable(executable: &str) -> Result<String> {
+    resolve_on_path(
+        executable,
+        std::env::var_os("PATH").filter(|value| !value.is_empty()),
+    )
+}
+
+fn default_search_path() -> std::ffi::OsString {
+    let mut path = DEFAULT_UNIX_PATH.to_owned();
+    if let Some(home) = std::env::var_os("HOME") {
+        path.push(':');
+        path.push_str(&Path::new(&home).join(".local/bin").to_string_lossy());
+    }
+    path.into()
+}
+
+pub(crate) fn resolve_on_path(
+    executable: &str,
+    path_var: Option<std::ffi::OsString>,
+) -> Result<String> {
     let path = Path::new(executable);
     if path.is_absolute() || executable.contains(std::path::MAIN_SEPARATOR) {
         return Ok(executable.to_owned());
     }
-    let path_var = std::env::var_os("PATH").context("PATH is required to resolve executable")?;
+    let path_var = path_var.unwrap_or_else(default_search_path);
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(executable);
         if candidate.is_file() {

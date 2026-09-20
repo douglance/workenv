@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Prove a guest holds one identity and no trace of any other.
+#
+#   workenv-identity-check --via <exedev|orchard> <vm> --identity <profile>
+#   workenv-identity-check <ssh-target>               --identity <profile>
+#
+# This is the security claim of the whole fleet, so it is written to fail rather
+# than to pass: a guest is clean only when every credential it holds is
+# byte-identical to the named profile's, and nothing it holds matches any other
+# profile or comes from somewhere unaccounted for.
+#
+# Nothing secret crosses in either direction. The guest reports SHA-256 digests
+# of its own files; the comparison happens here, against digests computed from
+# the local profile trees. Sending another profile's credential into the guest
+# so as to search for it would place there exactly what it was checking for.
+#
+# One credential can honestly belong to two profiles. Anthropic auth is a single
+# store holding several accounts, chosen by ANTHROPIC_PROFILE, so an identical
+# .claude/.credentials.json in a work guest is not a personal credential leaking
+# -- provided the selection is actually in place. Such a file is reported SHARED
+# rather than waved through, and the selection itself is then read back from the
+# guest, because a shared credential with the wrong selection is precisely a
+# guest working as the other account.
+set -euo pipefail
+
+PROFILES_DIR="${WORKENV_PROFILES_DIR:-$HOME/.config/workenv/profiles}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND=""
+SLOT=""
+TARGET=""
+IDENTITY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --via)      BACKEND="${2:?--via needs exedev or orchard}"; SLOT="${3:?--via needs a vm name}"; shift 3 ;;
+    --exedev)   BACKEND=exedev; SLOT="${2:?--exedev needs a vm name}"; shift 2 ;;
+    --identity) IDENTITY="${2:?--identity needs a profile name}"; shift 2 ;;
+    -*)         echo "workenv-identity-check: unknown option $1" >&2; exit 1 ;;
+    *)          TARGET="$1"; shift ;;
+  esac
+done
+[ -n "$IDENTITY" ] || { echo "workenv-identity-check: --identity <profile> is required" >&2; exit 1; }
+
+# guest-relative path -> profile-relative path. The same pairing workenv-seed
+# installs, read in the opposite direction.
+PAIRS='.claude/.credentials.json:.claude/.credentials.json
+.codex/auth.json:.codex/auth.json
+.grok/auth.json:.grok/auth.json
+.config/gh/hosts.yml:.gh/hosts.yml
+.gitconfig:.gitconfig'
+
+# `|| true`: the Orchard path returns its own status rather than the command's,
+# so an inventory that came back empty because the guest was unreachable must not
+# be mistaken for a guest that is clean. That is why an empty inventory with a
+# missing marker reads as DIRTY below rather than as CLEAN.
+remote() {
+  if [ -n "$BACKEND" ]; then "$here/workenv-guest" "$BACKEND" "$SLOT" "$1" || true
+  else ssh -o BatchMode=yes "$TARGET" "$1" || true; fi
+}
+
+guest_paths="$(printf '%s\n' "$PAIRS" | cut -d: -f1 | tr '\n' ' ')"
+# `sha256sum` on Linux guests; the fallback keeps this honest on a Mac guest
+# rather than reporting an empty -- and therefore clean-looking -- inventory.
+observed="$(remote '
+  set -u
+  for f in '"$guest_paths"'; do
+    [ -f "$HOME/$f" ] || continue
+    if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$HOME/$f" | cut -d" " -f1)
+    else h=$(shasum -a 256 "$HOME/$f" | cut -d" " -f1); fi
+    printf "%s %s\n" "$f" "$h"
+  done
+  printf "GIT_EMAIL %s\n" "$(git config --global --get user.email 2>/dev/null || echo -)"
+  printf "GIT_NAME %s\n" "$(git config --global --get user.name 2>/dev/null || echo -)"
+  if [ -f "$HOME/.workenv-identity" ]; then
+    while IFS= read -r line; do printf "MARKER_%s\n" "$(printf "%s" "$line" | tr "=" " ")"; done < "$HOME/.workenv-identity"
+  fi
+  for rc in .bashrc .profile; do
+    grep -q "workenv identity" "$HOME/$rc" 2>/dev/null && printf "SOURCED %s\n" "$rc"
+  done
+  true
+')"
+
+digest() { # $1 = file -> sha256 or empty
+  [ -f "$1" ] || return 0
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+profiles="$(ls -1 "$PROFILES_DIR" 2>/dev/null || true)"
+[ -n "$profiles" ] || { echo "workenv-identity-check: no profiles under $PROFILES_DIR" >&2; exit 1; }
+
+fail=0
+shared=0
+accounted=0
+printf 'guest identity material, against %s known profile(s)\n\n' "$(printf '%s\n' "$profiles" | wc -l | tr -d ' ')"
+
+while read -r gpath ghash; do
+  # Only the path lines are digests. Naming the metadata keys instead would mean
+  # a new one silently joining the digest comparison and reporting itself
+  # UNACCOUNTED -- which is a failure, so it would at least be loud, but loud
+  # about the wrong thing.
+  case "$gpath" in .*) ;; *) continue ;; esac
+  ppath="$(printf '%s\n' "$PAIRS" | awk -F: -v g="$gpath" '$1==g {print $2}')"
+  owners=""
+  for p in $profiles; do
+    [ "$(digest "$PROFILES_DIR/$p/$ppath")" = "$ghash" ] && owners="$owners $p"
+  done
+  owners="${owners# }"
+  if [ -z "$owners" ]; then
+    printf '  %-30s UNACCOUNTED -- matches no profile on this controller\n' "$gpath"
+    fail=1
+  elif [ "$owners" = "$IDENTITY" ]; then
+    printf '  %-30s %s\n' "$gpath" "$owners"
+    accounted=$((accounted + 1))
+  elif printf '%s\n' $owners | grep -qx "$IDENTITY"; then
+    # Held by this profile *and* others. Honest for a store several accounts
+    # share; the selection check below is what decides which account it acts as.
+    printf '  %-30s SHARED with: %s\n' "$gpath" "${owners// /, }"
+    shared=$((shared + 1))
+    accounted=$((accounted + 1))
+  else
+    printf '  %-30s FOREIGN -- belongs to: %s\n' "$gpath" "$owners"
+    fail=1
+  fi
+done <<EOF
+$observed
+EOF
+
+# Non-secret marks, checked separately: a guest can carry the right credential
+# files and still be configured to commit as someone else.
+gemail="$(printf '%s\n' "$observed" | awk '$1=="GIT_EMAIL" {print $2}')"
+gname="$(printf '%s\n' "$observed" | awk '$1=="GIT_NAME" {print $2}')"
+for p in $profiles; do
+  spec="$PROFILES_DIR/$p/profile.json"
+  [ -f "$spec" ] || continue
+  pemail="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spec"].get("git_email",""))' "$spec" 2>/dev/null || true)"
+  [ -n "$pemail" ] || continue
+  if [ "$pemail" = "$gemail" ] && [ "$p" != "$IDENTITY" ]; then
+    printf '  %-30s FOREIGN -- commits would be authored as %s\n' "git user.email" "$p"
+    fail=1
+  fi
+done
+printf '  %-30s %s <%s>\n' "git author" "$gname" "$gemail"
+
+# The selection, read back rather than assumed. A guest carrying a shared
+# credential and the wrong -- or no -- ANTHROPIC_PROFILE is a guest acting as the
+# other account, which no digest comparison can see.
+marker_profile="$(printf '%s\n' "$observed" | awk '$1=="MARKER_WORKENV_PROFILE" {print $2}')"
+marker_anthropic="$(printf '%s\n' "$observed" | awk '$1=="MARKER_ANTHROPIC_PROFILE" {print $2}')"
+sourced="$(printf '%s\n' "$observed" | awk '$1=="SOURCED" {print $2}' | tr '\n' ' ')"
+declared_anthropic=""
+[ -f "$PROFILES_DIR/$IDENTITY/profile.json" ] && declared_anthropic="$(
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spec"].get("anthropic_profile",""))' \
+    "$PROFILES_DIR/$IDENTITY/profile.json" 2>/dev/null || true)"
+
+printf '\n  %-30s %s\n' "declared identity" "${marker_profile:--}"
+printf '  %-30s %s\n' "sourced from" "${sourced:--}"
+if [ "$marker_profile" != "$IDENTITY" ]; then
+  printf '  %-30s MISMATCH -- guest says %s\n' "identity marker" "${marker_profile:-nothing}"
+  fail=1
+fi
+if [ -n "$declared_anthropic" ]; then
+  printf '  %-30s %s\n' "anthropic account" "${marker_anthropic:--}"
+  if [ "$marker_anthropic" != "$declared_anthropic" ]; then
+    printf '  %-30s MISMATCH -- %s expects %s\n' "anthropic account" "$IDENTITY" "$declared_anthropic"
+    fail=1
+  fi
+fi
+# A guest holding nothing is unseeded, not clean. Without this, a profile tree
+# that exists but was never logged in produced a guest with no credential at all
+# and a marker naming the right profile -- no foreign identity, so nothing to
+# report, and "CLEAN" on a guest that can authenticate to nothing. The claim
+# this command makes is that the guest acts as one identity, which requires it
+# to hold one.
+if [ "$accounted" -eq 0 ]; then
+  printf '  %-30s UNSEEDED -- no credential in this guest belongs to %s\n' "identity material" "$IDENTITY"
+  fail=1
+fi
+if [ "$shared" -gt 0 ] && [ -z "$sourced" ]; then
+  printf '  %-30s NOT SOURCED -- %s shared credential(s) would act as their other owner\n' \
+    "identity marker" "$shared"
+  fail=1
+fi
+
+printf '\n'
+if [ "$fail" -eq 0 ]; then
+  printf 'CLEAN: this guest acts as %s, with %s shared credential(s) correctly selected\n' \
+    "$IDENTITY" "$shared"
+else
+  printf 'DIRTY: this guest holds or acts on identity material that is not %s\n' "$IDENTITY" >&2
+fi
+exit "$fail"

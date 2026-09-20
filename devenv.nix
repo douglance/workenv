@@ -37,6 +37,14 @@
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/orchard-schemas.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/adapter-coverage.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
     nix-instantiate --eval --strict --json --expr 'import ./modules/tests/personal-preset.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
+    nix-instantiate --eval --strict --json --expr 'import ./modules/tests/fleet-slots.nix { pkgs = import ${pkgs.path} { system = "${pkgs.stdenv.hostPlatform.system}"; }; }'
+    # The provisioning scripts carry the isolation guarantee, and nothing in the
+    # Rust or Nix suites executes them. These run against stubbed ssh and a
+    # stubbed CLI, so they cost nothing and need no cluster.
+    ./provisioning/tests/wkv-routing
+    ./provisioning/tests/identity-isolation
+    ./provisioning/tests/seed-relay-chunk
+    ./provisioning/tests/github-clone-url
     nixfmt --check \
       devenv.nix \
       modules/*.nix \

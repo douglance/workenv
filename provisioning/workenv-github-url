@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Rewrite a GitHub SSH remote so a guest can clone with the seeded gh helper.
+#
+#   workenv-github-url <git-remote>
+#
+# Controller SSH config (Host github-work → github.com, a dedicated key)
+# does not exist in the guest. The identity profile's gitconfig authenticates
+# only https://github.com, via `gh auth git-credential`. Passing the controller
+# alias through unchanged is why live clone died with "correct access rights"
+# after a CLEAN seed.
+set -euo pipefail
+url="${1:?usage: workenv-github-url <git-remote>}"
+path=""
+case "$url" in
+  https://github.com/* | http://github.com/*)
+    printf '%s\n' "$url"
+    exit 0
+    ;;
+  git@github.com:* | git@github-*:*)
+    path="${url#*:}"
+    ;;
+  ssh://git@github.com/* | ssh://git@github-*/*)
+    path="${url#ssh://git@}"
+    path="${path#*/}"
+    ;;
+  *)
+    printf '%s\n' "$url"
+    exit 0
+    ;;
+esac
+printf 'https://github.com/%s\n' "$path"

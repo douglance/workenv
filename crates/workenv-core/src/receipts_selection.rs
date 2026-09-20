@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use workenv_protocol::AdapterResponse;
 
 use super::receipts::{ReceiptIdentity, ReceiptRecord, RecordedResponse};
@@ -42,6 +43,39 @@ pub(crate) fn latest_matching_record(
             continue;
         };
         if record.response.is_none() {
+            continue;
+        }
+        return Ok(Some((record, modified)));
+    }
+    Ok(None)
+}
+
+/// Whether this create actually made a resource this environment owns.
+///
+/// Destroy used to take the newest create receipt with *any* response. A later
+/// `up` retry that failed recorded `owned: false` and permanently blocked
+/// teardown of the VM the earlier create had really made.
+pub(crate) fn is_owned_resource(response: &AdapterResponse) -> bool {
+    response.data.get("owned") == Some(&Value::Bool(true))
+        && response
+            .data
+            .get("resource_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+}
+
+pub(crate) fn latest_owned_matching_record(
+    dir: &Path,
+    id: &ReceiptIdentity,
+) -> Result<Option<(ReceiptRecord, SystemTime)>> {
+    for (modified, path) in receipt_paths_newest_first(dir)? {
+        let Some(record) = matching_record(&path, id)? else {
+            continue;
+        };
+        let Some(response) = &record.response else {
+            continue;
+        };
+        if !is_owned_resource(response) {
             continue;
         }
         return Ok(Some((record, modified)));

@@ -27,7 +27,8 @@ pub(super) fn observe_execution(
 }
 
 fn run_code(root: &Path, argv: &[String]) -> Result<Value> {
-    let output = Command::new("apoc")
+    let apoc = crate::execution::resolve_executable("apoc")?;
+    let output = Command::new(apoc)
         .args(argv)
         .current_dir(root)
         .output()
@@ -35,9 +36,41 @@ fn run_code(root: &Path, argv: &[String]) -> Result<Value> {
     let value: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("APoC returned invalid JSON: {}", stderr(&output)))?;
     if !output.status.success() {
-        bail!("APoC Code Mode failed: {}", value["error"]);
+        bail!(
+            "APoC Code Mode failed: {}",
+            failure_message(&value, &output)
+        );
     }
     Ok(value)
+}
+
+/// Everything `APoC` said about a failure, rather than one field that is often
+/// absent.
+///
+/// `value["error"]` alone renders as the literal `null` whenever `APoC` exits
+/// non-zero without that key -- which is what it does when the daemon rejects or
+/// times out a call. That message named neither the cause nor where to look, so
+/// this falls through `error`, `message`, `code` and `status`, and appends
+/// stderr when the JSON carries nothing at all.
+fn failure_message(value: &Value, output: &std::process::Output) -> String {
+    let described = ["error", "message", "code", "status"]
+        .into_iter()
+        .filter_map(|key| match value.get(key) {
+            Some(found) if !found.is_null() => Some(match found.as_str() {
+                Some(text) => format!("{key}: {text}"),
+                None => format!("{key}: {found}"),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let trailer = stderr(output).trim().to_owned();
+    match (described.is_empty(), trailer.is_empty()) {
+        (true, true) => format!("no diagnostic; apoc exited {}", output.status),
+        (true, false) => trailer,
+        (false, true) => described,
+        (false, false) => format!("{described} ({trailer})"),
+    }
 }
 
 fn code_argv(spec: &ExecutionSpec, code: &str) -> Vec<String> {
@@ -175,4 +208,48 @@ fn exit_code(value: &Value) -> Option<i32> {
 
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use serde_json::json;
+
+    use super::failure_message;
+
+    fn output(stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn failure_without_an_error_key_still_names_the_cause() {
+        let value = json!({"code":"EXECUTION_TIMEOUT","status":"error"});
+        let message = failure_message(&value, &output(""));
+        assert!(message.contains("EXECUTION_TIMEOUT"), "{message}");
+        assert!(message.contains("error"), "{message}");
+    }
+
+    #[test]
+    fn failure_carrying_nothing_falls_back_to_stderr() {
+        let message = failure_message(&json!({}), &output("daemon refused the call"));
+        assert_eq!(message, "daemon refused the call");
+    }
+
+    #[test]
+    fn failure_carrying_nothing_at_all_still_reports_the_exit() {
+        let message = failure_message(&json!({}), &output(""));
+        assert!(message.contains("no diagnostic"), "{message}");
+    }
+
+    #[test]
+    fn an_error_key_is_preferred_and_stderr_is_kept_beside_it() {
+        let value = json!({"error":"boom"});
+        let message = failure_message(&value, &output("context"));
+        assert_eq!(message, "error: boom (context)");
+    }
 }

@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# `wkv` routes a repository to the right fleet and claims a free slot there.
+#
+# The routing decision is what selects a guest's credentials, so getting it
+# wrong is not a usability bug -- it is the isolation failure, arriving as a
+# working guest holding the wrong identity. Nothing else covers it: the Nix
+# suites see the manifest and not the script, and a live run exercises one
+# fleet at a time.
+#
+# `workenv` and `ssh` are stubbed. The point is the decision, not the cluster.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WKV="$here/../wkv"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() { # $1 = what, $2 = expected, $3 = actual
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+# Two fleets, two profiles, two prefixes -- the shape the isolation claim needs.
+# Within each fleet the pool spans both backends on one numbering, which is the
+# shape "no tiers" actually means: runners 01-02 in the cloud, 03 on a Mac.
+manifest() { # $1 = prefix, $2 = profile
+  python3 -c '
+import json,sys
+prefix, profile = sys.argv[1], sys.argv[2]
+def runner(host, directory):
+    return {"host":host,"directory":directory,"source":"path:/s","ephemeral":True,
+            "profiles":[],"connection":None,
+            "integrations":[{"extension":"workenv.identity",
+                             "config":{"profile":{"name":profile}}}]}
+envs = {f"{prefix}{i:02d}": runner("cloud", "/home/exedev/work") for i in range(1,3)}
+envs[f"{prefix}03"] = runner("macs", "/home/admin/work")
+# A non-runner environment in the same manifest, which must not be claimed.
+envs["workenv"] = {"host":"local","directory":"/x","source":"/x","ephemeral":False,
+                   "profiles":[],"connection":None,"integrations":[]}
+print(json.dumps({"ok":True,"environments":envs}))
+' "$1" "$2"
+}
+
+mkdir -p "$tmp/bin" "$tmp/personal-fleet" "$tmp/repos-fleet"
+manifest wkv-r personal > "$tmp/personal-fleet/manifest.json"
+manifest work-r work     > "$tmp/repos-fleet/manifest.json"
+
+cat > "$tmp/bin/workenv" <<'STUB'
+#!/usr/bin/env bash
+# --root <dir> environment list  ->  that fleet's manifest
+# --root <dir> environment plan <slot>  ->  that runner's provider and identity,
+# which is how wkv learns a runner's backend instead of guessing from its name.
+root=""
+while [ $# -gt 0 ]; do
+  case "$1" in --root) root="$2"; shift 2 ;; *) break ;; esac
+done
+if [ "${1:-}" = environment ] && [ "${2:-}" = list ]; then cat "$root/manifest.json"; exit 0; fi
+if [ "${1:-}" = environment ] && [ "${2:-}" = plan ]; then
+  python3 -c '
+import json,sys
+doc = json.load(open(sys.argv[1]))
+env = doc["environments"][sys.argv[2]]
+providers = {"cloud": "workenv.exedev", "macs": "workenv.orchard"}
+print(json.dumps({"ok":True,"environment":sys.argv[2],"host":env["host"],
+                  "directory":env["directory"],"source":env["source"],
+                  "provider":{"extension":providers[env["host"]],"config":{}},
+                  "integrations":env["integrations"]}))
+' "$root/manifest.json" "$3"
+  exit 0
+fi
+printf 'STUB_WORKENV %s\n' "$*"
+STUB
+# Slot 01 of each fleet is already taken, so a correct claim lands on 02.
+cat > "$tmp/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf '{"vms":[{"vm_name":"wkv-r01"},{"vm_name":"work-r01"}]}\n'
+STUB
+# Both backends are asked what is taken, because a name taken on either is taken.
+# Runner 02 is busy on the Mac side, so a correct claim skips to 03 -- which a
+# script that only asked exe.dev would hand out while it was in use.
+cat > "$tmp/bin/orchard" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = list ] && [ "${2:-}" = vms ]; then
+  printf 'Name\tStatus\n'
+  printf 'wkv-r02\trunning\n'
+  printf 'work-r02\trunning\n'
+fi
+STUB
+chmod +x "$tmp/bin/workenv" "$tmp/bin/ssh" "$tmp/bin/orchard"
+
+printf 'name\troot\tprefix\tglob\n' > /dev/null
+cat > "$tmp/fleets.conf" <<CONF
+# name	fleet root	slot prefix	path glob
+work	$tmp/repos-fleet	work-r	$tmp/repos/work/*
+personal	$tmp/personal-fleet	wkv-r	*
+CONF
+
+mkdir -p "$tmp/repos/work/billing" "$tmp/repos/personal/tooling"
+for d in "$tmp/repos/work/billing" "$tmp/repos/personal/tooling"; do
+  git -C "$d" init -q 2>/dev/null
+  git -C "$d" remote add origin "https://example.invalid/$(basename "$d").git"
+done
+
+# awk, not sed: BSD sed has no \| alternation in a basic regular expression, so
+# a pattern that works on Linux silently matches nothing here and every check
+# compares an empty string against an expectation.
+run() { # $1 = repo dir -> "<slot> <profile>" from the claim line
+  PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" \
+    WORKENV_ORCHARD_BIN="$tmp/bin/orchard" WKV_AGENT=true "$WKV" "$1" 2>&1 \
+    | awk '$2 == "<-" {
+             for (i = 1; i <= NF; i++) {
+               if ($i == "as")  p = $(i + 1)
+               if ($i == "via") b = $(i + 1)
+             }
+             print $1, p, b; exit
+           }'
+}
+
+printf '\nwkv routing\n'
+check "a work path claims a work runner as work"     "work-r03 work orchard"     "$(run "$tmp/repos/work/billing")"
+check "any other path claims a personal runner"      "wkv-r03 personal orchard"  "$(run "$tmp/repos/personal/tooling")"
+
+# ~/.local/bin/wkv is a symlink. Helpers live next to the real file; looking
+# them up next to the symlink dies with workenv-github-url: No such file.
+ln -s "$WKV" "$tmp/bin/wkv"
+run_symlink() {
+  PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" \
+    WORKENV_ORCHARD_BIN="$tmp/bin/orchard" WKV_AGENT=true wkv "$1" 2>&1 \
+    | awk '$2 == "<-" {
+             for (i = 1; i <= NF; i++) {
+               if ($i == "as")  p = $(i + 1)
+               if ($i == "via") b = $(i + 1)
+             }
+             print $1, p, b; exit
+           }'
+}
+check "a PATH symlink still claims a work runner" "work-r03 work orchard" \
+  "$(run_symlink "$tmp/repos/work/billing")"
+
+# The catch-all must be last. A fleets.conf whose first line matches everything
+# silently sends every repository to one identity, which is the failure mode
+# with no symptom.
+cat > "$tmp/fleets.conf" <<CONF
+personal	$tmp/personal-fleet	wkv-r	*
+work	$tmp/repos-fleet	work-r	$tmp/repos/work/*
+CONF
+check "first match wins, so order decides" "wkv-r03 personal orchard" "$(run "$tmp/repos/work/billing")"
+
+# A slot with no declared profile must stop the run rather than seed a guest
+# with whatever the machine holds.
+cat > "$tmp/fleets.conf" <<CONF
+personal	$tmp/personal-fleet	wkv-r	*
+CONF
+python3 -c '
+import json,sys
+doc = json.load(open(sys.argv[1]))
+for name, env in doc["environments"].items():
+    env["integrations"] = []
+json.dump(doc, open(sys.argv[1], "w"))
+' "$tmp/personal-fleet/manifest.json"
+out="$(PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" \
+  WORKENV_ORCHARD_BIN="$tmp/bin/orchard" WKV_AGENT=true "$WKV" "$tmp/repos/personal/tooling" 2>&1 || true)"
+case "$out" in
+  *"declares no identity profile"*) check "a profileless runner refuses to run" yes yes ;;
+  *) check "a profileless runner refuses to run" yes "no: $out" ;;
+esac
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

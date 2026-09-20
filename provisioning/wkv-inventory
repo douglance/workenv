@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Show every live workenv and attach to one. `wkv --list` and `wkv --jump`
+# exec this so the claim path does not grow past its line cap.
+#
+#   wkv --list              every fleet's taken guests, then free counts
+#   wkv --jump              pick a taken slot (tty) or print usage
+#   wkv --jump <slot>       ssh into that guest's checkout
+set -euo pipefail
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  link="$(readlink "$src")"; case "$link" in /*) src="$link" ;; *) src="$(cd "$(dirname "$src")" && pwd)/$link" ;; esac
+done
+here="$(cd "$(dirname "$src")" && pwd)"
+WORKENV="${WORKENV_BIN:-workenv}"
+FLEETS_CONF="${WKV_FLEETS:-$HOME/.config/workenv/fleets.conf}"
+ORCHARD="${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}"
+die() { printf 'wkv: %s\n' "$*" >&2; exit 1; }
+
+fleet_lines() { grep -v '^[[:space:]]*#' "$FLEETS_CONF" | grep -v '^[[:space:]]*$'; }
+
+fleet_root_for_slot() {
+  local slot="$1" _name root prefix _glob
+  while IFS=$'\t' read -r _name root prefix _glob; do
+    case "$slot" in
+      "$prefix"*) (cd "$root" && pwd); return 0 ;;
+    esac
+  done < <(fleet_lines)
+  return 1
+}
+
+wk() { "$WORKENV" --root "$1" "${@:2}" </dev/null; }
+
+# Empty or invalid JSON is "no declared slots", not a fatal list.
+fleet_slots() {
+  wk "$1" environment list --format json 2>/dev/null | python3 -c '
+import json,re,sys
+prefix = sys.argv[1]
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+envs = doc.get("environments", doc) if isinstance(doc, dict) else {}
+if not isinstance(envs, dict):
+    sys.exit(0)
+for name in sorted(envs):
+    if not re.fullmatch(re.escape(prefix) + r"[0-9]+", name):
+        continue
+    profile = ""
+    for binding in envs[name].get("integrations") or []:
+        if binding.get("extension") == "workenv.identity":
+            profile = (binding.get("config") or {}).get("profile", {}).get("name", "")
+    print(name + "\t" + profile)
+' "$2" || true
+}
+
+slot_facts() {
+  wk "$1" environment plan "$2" --format json 2>/dev/null | python3 -c '
+import json,sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+provider = (doc.get("provider") or {}).get("extension", "")
+backend = {"workenv.exedev": "exedev", "workenv.orchard": "orchard"}.get(provider, "")
+profile = ""
+for binding in doc.get("integrations") or []:
+    if binding.get("extension") == "workenv.identity":
+        profile = (binding.get("config") or {}).get("profile", {}).get("name", "")
+print(backend)
+print(profile)
+print(doc.get("directory", ""))
+' || true
+}
+
+taken_exedev() {
+  ssh -n -o BatchMode=yes exe.dev ls --json 2>/dev/null \
+    | tr ',' '\n' | sed -n "s/.*\"vm_name\":\"\($1[0-9][0-9]*\)\".*/\1/p" || true
+}
+
+taken_orchard() {
+  "$ORCHARD" list vms </dev/null 2>/dev/null \
+    | awk 'NR>1 {print $1}' | grep -E "^$1[0-9]+$" || true
+}
+
+list_all() {
+  printf '%-12s %-10s %-10s %-8s %s\n' SLOT FLEET IDENTITY VIA STATE
+  while IFS=$'\t' read -r name root prefix _; do
+    [ -d "$root" ] || continue
+    root="$(cd "$root" && pwd)"
+    table="$(fleet_slots "$root" "$prefix")"
+    cloud="$(taken_exedev "$prefix")"
+    macs="$(taken_orchard "$prefix")"
+    busy="$(printf '%s\n%s\n' "$cloud" "$macs" | grep -v '^$' | sort -u || true)"
+    declared="$(printf '%s\n' "$table" | cut -f1 | grep -v '^$' | sort || true)"
+    while IFS= read -r slot; do
+      [ -n "$slot" ] || continue
+      via=exedev
+      if printf '%s\n' "$macs" | grep -qx "$slot"; then via=orchard; fi
+      ident="$(printf '%s\n' "$table" | awk -F'\t' -v s="$slot" '$1==s {print $2; exit}')"
+      printf '%-12s %-10s %-10s %-8s %s\n' \
+        "$slot" "$name" "${ident:-?}" "$via" taken
+      if [ "$via" = exedev ]; then
+        "$here/workenv-herdr-register" "$slot" >/dev/null 2>&1 || true
+      fi
+    done <<< "$busy"
+    free="$(comm -23 \
+      <(printf '%s\n' "$declared") \
+      <(printf '%s\n' "$busy") || true)"
+    nfree="$(printf '%s\n' "$free" | grep -c . || true)"
+    printf '%s  free: %s\n' "$name" "$nfree"
+  done < <(fleet_lines)
+}
+
+jump() {
+  local slot="$1" root backend identity workdir
+  root="$(fleet_root_for_slot "$slot" || true)"
+  backend=exedev
+  identity=""
+  workdir=""
+  if [ -n "${root:-}" ]; then
+    { read -r backend || true
+      read -r identity || true
+      read -r workdir || true
+    } < <(slot_facts "$root" "$slot")
+  fi
+  [ -n "$backend" ] || backend=exedev
+  [ -n "$workdir" ] || workdir=/home/exedev/work
+  printf 'wkv: jump %s (%s) as %s\n' "$slot" "$backend" "${identity:-?}"
+  "$here/workenv-herdr-ensure" --via "$backend" "$slot" \
+    || printf 'wkv: herdr ensure failed; attaching anyway\n' >&2
+  case "$backend" in
+    orchard)
+      exec "$ORCHARD" ssh vm "$slot" -- \
+        "cd '$workdir' && devenv shell --from path:/opt/workenv/shells/default"
+      ;;
+    *)
+      exec ssh -t -o BatchMode=yes exe.dev ssh "$slot" \
+        "cd '$workdir' && devenv shell --from path:/opt/workenv/shells/default"
+      ;;
+  esac
+}
+
+pick_slot() {
+  local busy slot
+  busy="$(
+    while IFS=$'\t' read -r _ _ prefix _; do
+      taken_exedev "$prefix"
+      taken_orchard "$prefix"
+    done < <(fleet_lines) | grep -v '^$' | sort -u
+  )"
+  [ -n "$busy" ] || die "no live workenvs; claim one with wkv from a git repo"
+  list_all >&2
+  if [ -t 0 ]; then
+    printf 'jump slot: ' >&2
+    read -r slot
+    [ -n "$slot" ] || die "no slot"
+    printf '%s\n' "$slot"
+  else
+    printf '%s\n' "$busy" | awk 'END{print}'
+  fi
+}
+
+[ -f "$FLEETS_CONF" ] || die "no fleets table at $FLEETS_CONF"
+case "${1:-}" in
+  --list) list_all ;;
+  --jump)
+    slot="${2:-}"
+    [ -n "$slot" ] || slot="$(pick_slot)"
+    jump "$slot"
+    ;;
+  *) die "usage: wkv --list | wkv --jump [slot]" ;;
+esac

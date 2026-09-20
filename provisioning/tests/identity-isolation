@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# `workenv-identity-check` says CLEAN only when a guest holds one identity.
+#
+# This is the test the security claim rests on, so it is written the way the
+# claim is: the interesting cases are the ones that must FAIL. A checker that
+# only ever sees a correctly seeded guest proves nothing, because the failure it
+# exists to catch -- a previous tenant's credential left behind -- looks exactly
+# like success from the inside.
+#
+# The guest is a directory and `ssh` is a stub that runs the remote script
+# against it. That is enough: everything the checker decides, it decides from
+# digests it computes here.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECK="$here/../workenv-identity-check"
+WIPE="$here/../workenv-identity-wipe"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() { # $1 = what, $2 = expected, $3 = actual
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+# `ssh ... exe.dev ssh <slot> <script>` -> run <script> with HOME as the guest.
+mkdir -p "$tmp/bin"
+cat > "$tmp/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+# Drop options and the two hops; the last argument is the remote script.
+script="${@: -1}"
+HOME="$GUEST" bash -c "$script"
+STUB
+# `orchard ssh vm <slot> -- <script>`, including the behaviour that makes this
+# backend dangerous: it exits 0 whatever the command did, and exits 0 when the
+# guest was never reached at all. GUEST_UNREACHABLE=1 reproduces the latter.
+cat > "$tmp/bin/orchard" <<'STUB'
+#!/usr/bin/env bash
+# `orchard ssh vm <vm> -- sh -c <script>`: the script is the last argument, and
+# the `sh -c` wrapper is what gives this backend the same shell semantics the
+# exe.dev relay provides for free.
+script="${@: -1}"
+[ "$(( $# ))" -ge 2 ] && [ "${@: -2:1}" = "-c" ] || { echo "orchard stub: expected sh -c" >&2; exit 64; }
+if [ "${GUEST_UNREACHABLE:-0}" = 1 ]; then exit 0; fi
+HOME="$GUEST" bash -c "$script" || true
+exit 0
+STUB
+chmod +x "$tmp/bin/ssh" "$tmp/bin/orchard"
+
+profiles="$tmp/profiles"
+make_profile() { # $1 = name, $2 = secret material, $3 = email
+  local root="$profiles/$1"
+  mkdir -p "$root/.claude" "$root/.codex" "$root/.gh"
+  printf '{"token":"%s"}' "$2" > "$root/.claude/.credentials.json"
+  printf '{"token":"%s"}' "$2" > "$root/.codex/auth.json"
+  printf 'github.com:\n  oauth_token: %s\n' "$2" > "$root/.gh/hosts.yml"
+  printf '[user]\n\temail = %s\n' "$3" > "$root/.gitconfig"
+  python3 -c '
+import json,sys
+json.dump({"schema_version":1,"digest":"d","spec":{"name":sys.argv[2],"git_email":sys.argv[3]}},
+          open(sys.argv[1],"w"))
+' "$root/profile.json" "$1" "$3"
+}
+make_profile personal personal-secret-aaa operator@personal.example
+make_profile work     work-secret-bbb     operator@work.example
+
+# The real fleet's shape, not a convenient one: Anthropic auth is a single store
+# both profiles hold byte-identically, and only ANTHROPIC_PROFILE separates the
+# accounts. Give work the same claude credential and its own selection.
+cp "$profiles/personal/.claude/.credentials.json" "$profiles/work/.claude/.credentials.json"
+python3 -c '
+import json,sys
+doc = json.load(open(sys.argv[1]))
+doc["spec"]["anthropic_profile"] = "work"
+json.dump(doc, open(sys.argv[1], "w"))
+' "$profiles/work/profile.json"
+
+seed() { # $1 = guest dir, $2 = profile -- what workenv-seed installs
+  rm -rf "$1"; mkdir -p "$1/.claude" "$1/.codex" "$1/.config/gh"
+  cp "$profiles/$2/.claude/.credentials.json" "$1/.claude/.credentials.json"
+  cp "$profiles/$2/.codex/auth.json"          "$1/.codex/auth.json"
+  cp "$profiles/$2/.gh/hosts.yml"             "$1/.config/gh/hosts.yml"
+  cp "$profiles/$2/.gitconfig"                "$1/.gitconfig"
+  {
+    printf 'WORKENV_PROFILE=%s\n' "$2"
+    anthropic="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spec"].get("anthropic_profile",""))' "$profiles/$2/profile.json")"
+    [ -n "$anthropic" ] && printf 'ANTHROPIC_PROFILE=%s\n' "$anthropic"
+  } > "$1/.workenv-identity"
+  for rc in .bashrc .profile; do
+    printf '# >>> workenv identity >>>\nset -a; . "$HOME/.workenv-identity"; set +a\n# <<< workenv identity <<<\n' > "$1/$rc"
+  done
+  true
+}
+
+verdict() { # $1 = guest dir, $2 = identity, $3 = backend (default exedev)
+  if GUEST="$1" PATH="$tmp/bin:$PATH" WORKENV_PROFILES_DIR="$profiles" WORKENV_ORCHARD_BIN="$tmp/bin/orchard" \
+     "$CHECK" --via "${3:-exedev}" slot --identity "$2" >"$tmp/out" 2>&1
+  then echo CLEAN; else echo DIRTY; fi
+}
+
+printf '\nidentity isolation\n'
+
+guest="$tmp/guest"
+seed "$guest" personal
+check "a guest seeded as personal is clean as personal" CLEAN "$(verdict "$guest" personal)"
+check "the same guest is dirty when claimed as work"    DIRTY "$(verdict "$guest" work)"
+
+# The Lima pool's bug, exactly: re-let a slot to the next tenant and the file the
+# incoming profile happens not to overwrite is the outgoing tenant's.
+seed "$guest" work
+cp "$profiles/personal/.codex/auth.json" "$guest/.codex/auth.json"
+check "one leftover file from the previous tenant is caught" DIRTY "$(verdict "$guest" work)"
+
+# A credential from nowhere this controller knows is not "probably fine".
+seed "$guest" work
+printf '{"token":"from-somewhere-else"}' > "$guest/.claude/.credentials.json"
+check "an unaccounted credential is caught" DIRTY "$(verdict "$guest" work)"
+
+# Right files, wrong author: a guest that commits as the other identity.
+seed "$guest" work
+printf '[user]\n\temail = operator@personal.example\n' > "$guest/.gitconfig"
+check "committing as the other identity is caught" DIRTY "$(verdict "$guest" work)"
+
+# The shared-credential case, both ways round. Same claude credential in both
+# profiles: clean for work only while the selection that makes it work is in
+# place, and a guest that lost the selection is acting as personal however
+# correct its files look.
+seed "$guest" work
+check "a shared credential is clean when the selection is set" CLEAN "$(verdict "$guest" work)"
+
+seed "$guest" work
+rm -f "$guest/.workenv-identity"
+check "a shared credential with no selection is caught" DIRTY "$(verdict "$guest" work)"
+
+seed "$guest" work
+printf 'WORKENV_PROFILE=work\nANTHROPIC_PROFILE=personal\n' > "$guest/.workenv-identity"
+check "a shared credential with the wrong account is caught" DIRTY "$(verdict "$guest" work)"
+
+seed "$guest" work
+for rc in .bashrc .profile; do : > "$guest/$rc"; done
+check "a selection nothing sources is caught" DIRTY "$(verdict "$guest" work)"
+
+# And the wipe actually removes what the checker looks for.
+seed "$guest" personal
+GUEST="$guest" PATH="$tmp/bin:$PATH" "$WIPE" --exedev slot --quiet
+remaining="$(find "$guest" -type f \( -name '.credentials.json' -o -name 'auth.json' -o -name 'hosts.yml' -o -name '.gitconfig' -o -name '.workenv-identity' \) | wc -l | tr -d ' ')"
+check "wipe leaves no credential path behind" 0 "$remaining"
+check "wipe removes the sourcing block too"   0 "$(grep -l 'workenv identity' "$guest"/.bashrc "$guest"/.profile 2>/dev/null | wc -l | tr -d ' ')"
+# A wiped guest holds nothing, so it belongs to nobody -- which must read as
+# unclaimed rather than as clean for whoever asks next.
+check "a wiped guest is not clean as anyone"  DIRTY "$(verdict "$guest" work)"
+
+# The same verdicts over Orchard, where the transport reports success whatever
+# happened. A checker that trusted exit codes would call all of these clean.
+seed "$guest" personal
+check "orchard: a correctly seeded guest is clean" CLEAN "$(verdict "$guest" personal orchard)"
+check "orchard: the same guest is dirty as work"   DIRTY "$(verdict "$guest" work orchard)"
+
+# The trap. `orchard ssh` exits 0 for a guest it never reached, so an empty
+# inventory arrives looking exactly like a guest holding nothing -- and a guest
+# holding nothing must never read as clean for whoever asks next.
+unreachable="$(GUEST="$guest" GUEST_UNREACHABLE=1 PATH="$tmp/bin:$PATH" \
+  WORKENV_PROFILES_DIR="$profiles" WORKENV_ORCHARD_BIN="$tmp/bin/orchard" \
+  "$CHECK" --via orchard slot --identity personal >/dev/null 2>&1 && echo CLEAN || echo DIRTY)"
+check "orchard: an unreachable guest is not clean" DIRTY "$unreachable"
+
+# A profile that exists but was never logged in. The guest ends up holding no
+# credential and a marker naming the right identity: no foreign material, so
+# nothing to report -- and it must still not read as clean, because the claim is
+# that the guest acts as an identity and it cannot act as anything.
+rm -rf "$guest"; mkdir -p "$guest"
+printf 'WORKENV_PROFILE=personal\n' > "$guest/.workenv-identity"
+for rc in .bashrc .profile; do
+  printf '# >>> workenv identity >>>\nset -a; . "$HOME/.workenv-identity"; set +a\n# <<< workenv identity <<<\n' > "$guest/$rc"
+done
+check "an unseeded guest is not clean" DIRTY "$(verdict "$guest" personal)"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

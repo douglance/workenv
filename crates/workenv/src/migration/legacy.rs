@@ -152,7 +152,11 @@ impl Plan {
 }
 
 fn identity_config(root: &Path, worker: &Worker) -> Value {
-    let mut config = json!({ "profiles_root": root.join("profiles") });
+    // The key the identity adapter actually reads, named from the one shared
+    // definition rather than spelled out here. It was spelled out here once, as
+    // `profiles_root`, and the adapter has always read `profiles_dir`.
+    let mut config = json!({});
+    config[workenv_protocol::PROFILES_DIR_KEY] = json!(root.join("profiles"));
     if let Some(profile) = &worker.profile {
         config["profile"] = json!(profile);
     }

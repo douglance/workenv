@@ -4,7 +4,7 @@
 //! skips the devenv shell only when every declared name resolves on PATH. The
 //! list is therefore a safety mechanism, and an incomplete one fails silently:
 //! nine of the ten adapter modules did not declare `apoc`, while every shell-out
-//! in every adapter goes through `Command::new("apoc")` in
+//! in every adapter goes through the one `resolve_executable("apoc")` in
 //! workenv-platform/src/execution_code.rs. Because `/usr/bin/ssh` resolves on
 //! every macOS and Linux host, the providers took the unwrapped path
 //! unconditionally, so a controller without `apoc` on PATH got an opaque failure
@@ -30,15 +30,19 @@ fn executor_name(root: &Path) -> Result<String> {
     let path = root.join("crates/workenv-platform/src/execution_code.rs");
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let marker = "Command::new(\"";
+    // The launch resolves the name on PATH before spawning it, so the literal
+    // lives in that call rather than in `Command::new`, which now receives a
+    // resolved path. Reading the resolver is what keeps this check pointed at
+    // the same string the process is actually started with.
+    let marker = "resolve_executable(\"";
     let start = source
         .find(marker)
-        .with_context(|| format!("no Command::new(\"..\") in {}", path.display()))?
+        .with_context(|| format!("no resolve_executable(\"..\") in {}", path.display()))?
         + marker.len();
     let rest = &source[start..];
     let end = rest
         .find('"')
-        .context("unterminated Command::new literal")?;
+        .context("unterminated resolve_executable literal")?;
     Ok(rest[..end].to_owned())
 }
 

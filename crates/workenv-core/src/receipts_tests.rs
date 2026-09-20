@@ -2,8 +2,9 @@ use std::{sync::Mutex, time::Duration};
 
 use anyhow::Context as _;
 
+use serde_json::json;
 use tempfile::TempDir;
-use workenv_protocol::{PROTOCOL_VERSION, ResponseStatus};
+use workenv_protocol::{AdapterResponse, PROTOCOL_VERSION, ResponseStatus};
 
 use super::*;
 
@@ -168,6 +169,38 @@ fn an_outcomeless_attempt_does_not_hide_an_earlier_answer() -> Result<()> {
         .response;
     assert_eq!(recorded.request_id, "request-1");
     assert_eq!(recorded.status, ResponseStatus::Changed);
+    Ok(())
+}
+
+#[test]
+fn latest_owned_skips_a_newer_unowned_create() -> Result<()> {
+    let temp = TempDir::new()?;
+    let store = ReceiptStore::new(temp.path());
+    let id = identity();
+    store.apply(&id, "request-1", "fingerprint", |_| {
+        Ok(AdapterResponse {
+            data: json!({"owned": true, "resource_id": "vm-1"}),
+            ..response("request-1", ResponseStatus::Changed)
+        })
+    })?;
+    std::thread::sleep(Duration::from_millis(10));
+    store.apply(&id, "request-2", "fingerprint", |_| {
+        Ok(AdapterResponse {
+            data: json!({"owned": false, "resource_id": "vm-1"}),
+            ..response("request-2", ResponseStatus::Failed)
+        })
+    })?;
+    let latest = store
+        .latest_recorded_response_for(&id, "fingerprint")?
+        .context("missing latest")?
+        .response;
+    assert_eq!(latest.request_id, "request-2");
+    let owned = store
+        .latest_owned_recorded_response_for(&id, "fingerprint")?
+        .context("unowned receipt hid the owned create")?
+        .response;
+    assert_eq!(owned.request_id, "request-1");
+    assert_eq!(owned.data["owned"], json!(true));
     Ok(())
 }
 

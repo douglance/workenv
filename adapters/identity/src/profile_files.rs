@@ -155,7 +155,7 @@ pub(crate) fn explicit_replacement(request: &AdapterRequest) -> bool {
 }
 
 pub(crate) fn profile_root(request: &AdapterRequest, name: &str) -> PathBuf {
-    string(&request.config, "profiles_dir")
+    string(&request.config, workenv_protocol::PROFILES_DIR_KEY)
         .map_or_else(default_profiles_dir, PathBuf::from)
         .join(name)
 }

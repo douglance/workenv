@@ -9,11 +9,76 @@ worker. All are arch-aware (`x86_64` and `aarch64`) and idempotent.
 | `workenv-lima` | VM host (macOS) | slot registry, capacity probe, claim/release/reap |
 | `workenv-lima-proxy` | controller | ssh ProxyCommand resolving Lima's port at connect time |
 | `workenv-provision` | the guest | nix, devenv, agent CLIs, apoc, PATH |
-| `workenv-seed` | the controller | skills, agent configs, credentials |
+| `workenv-seed` | the controller | one identity profile's credentials, plus skills and agent configs |
+| `workenv-identity-wipe` | controller | remove every identity artefact from a guest |
+| `workenv-identity-check` | controller | prove a guest holds one identity and no other |
+| `workenv-profile-import` | controller | capture this machine's live logins into a profile |
 | `workenv-desktop` | the guest | Xvnc + openbox + browser + noVNC, on demand |
 | `workenv-desk-forward` | VM host (macOS) | supervised tailnet publish of one guest's noVNC port |
 | `workenv-desk-publish` | controller | publish desktops for a set of slots, verified from here |
 | `workenv-worker-enroll` | controller | enrol another Mac as an Orchard worker |
+| `workenv-controller-relocate` | controller | move the Orchard controller to another Mac, keeping `127.0.0.1:6120` here |
+| `wkv` | controller | take a repository into a free runner and put an agent in it |
+| `workenv-guest` | controller | run one command in a runner, whichever backend made it |
+| `workenv-cloud-setup` | the guest | first-boot fragment: nix + devenv, composed into `presets/pool.nix` |
+| `workenv-cloud-provision` | the guest | standalone minimal provisioner (nix + devenv only) |
+| `workenv-sweep` | controller | remove runners whose lease has expired, on either backend |
+| `workenv-sweep-install` | controller | run that sweep on a launchd schedule, one job per fleet |
+| `tests/wkv-routing` | controller | `wkv` sends a repository to the right fleet |
+| `tests/identity-isolation` | controller | the wipe and the check actually catch a foreign identity |
+
+## The runner pool
+
+One pool, every box, no tiers. A repository asks for a free runner and gets one;
+where it lands is the scheduler's business. `presets/runners.nix` declares the
+pool as a single numbering -- `wkv-r01` upward -- carved into segments only
+because an environment names exactly one host:
+
+    wkv-r01..r08   exe.dev        created by its API, reached through its relay
+    wkv-r09..r13   the Macs       created by Orchard, reached by `orchard ssh vm`
+
+Every runner is otherwise identical: the same first-boot script installs nix and
+devenv, the same baked shell supplies the toolchain, the same identity profile is
+seeded, and the guest is destroyed afterwards. `provisioning/workenv-guest` is
+the one place that knows the two ways in, so adding a backend is one case in one
+file rather than three copies that drift.
+
+Runners on Macs need no baked image. Orchard's `create` accepts a
+`startup_script`, so a stock Ubuntu provisions itself exactly as a cloud runner
+does -- which is what removes the old problem of `workenv-base` being a `local`
+Tart image that only one Mac could schedule against.
+
+Segment sizes come from measurement. Raise them by editing `runners.nix`; the
+Nix suite refuses a pool whose segments overlap or leave a gap.
+
+## Identities
+
+A guest holds exactly one identity. Which one is a declared fact in the fleet's
+manifest -- every slot binds `workenv.identity` with a `config.profile` -- and
+`modules/identity.nix` refuses to evaluate a binding that carries none, because
+a configless binding leaves the adapter inert and the guest on whatever
+credentials the controller happens to hold.
+
+```sh
+# once per profile, on the controller
+workenv --root fleet extension call workenv.identity apply --environment workenv
+workenv-profile-import personal        # refuses if the live gh session is not this profile
+
+# every claim, automatically
+wkv                                    # routes by path, seeds, and verifies before handing over
+wkv --verify wkv-c01                   # the same check on demand
+```
+
+Profiles live under `~/.config/workenv/profiles/<name>/`. `workenv-seed
+--identity <name>` reads only that tree and never falls back to `$HOME`: the
+fallback is the failure, because it turns "this profile has no login yet" into
+"this guest silently ran as the other account".
+
+Fleets are routed by path in `~/.config/workenv/fleets.conf`, which is the only
+place either fleet knows the other exists. Its catch-all line must stay last.
+
+See the recorded exception in `AGENTS.md` for why credentials are copied into a
+guest at all, and what bounds it.
 
 ## Usage
 
@@ -30,6 +95,62 @@ instead of recreating, so it is safe to use as a repair.
 
 The individual scripts remain callable: `workenv-seed <target>` and, on the guest,
 `workenv-provision`.
+
+## The cloud tier
+
+Orchard guests come from Macs, and the Macs in this fleet are the operator's own
+workstation. exe.dev is the tier that actually carries concurrent work: measured
+here, a VM is created in 2 s, reaches ssh-ready in 4 s, and is fully provisioned
+with nix and devenv in about 210 s — the last of those done by the provider's
+own first-boot `setup_script`, because an exe.dev VM has no address for the
+`bootstrap` integration to reach. Once provisioned, entering the baked shell and
+running a command in it takes about 5 s.
+
+Those two numbers are the whole reason `create` waits. exe.dev calls a VM
+`running` one second after `new`, while the setup script still has minutes left,
+and `up` believed it: `apply` reached a guest with no devenv on it and failed
+with `devenv: command not found`. So the setup script writes
+`/opt/workenv/.provisioned` as its last act, and the provider treats *that* as
+present — not the hypervisor's view. A guest that takes longer than the
+provider's four-minute budget comes back pending rather than failed, and a
+second `up` finishes it.
+
+`presets/cloud.nix` declares eight identical, project-agnostic slots
+(`wkv-c01`..`wkv-c08`) on one `wkv-cloud` host. No slot names a repository, so
+any project can take any free slot — which is what removes the need for a project
+registry and for re-evaluating the manifest every time a project is added.
+
+```sh
+./provisioning/wkv                 # claim a free slot for the repo you are in
+./provisioning/wkv --list          # which slots are taken
+./provisioning/wkv --down wkv-c03  # destroy the guest behind one slot
+```
+
+`wkv` seeds credentials before it clones, not after: most of these repositories
+are private, and a clone attempted first fails on authentication in a way that
+reads as a broken remote rather than an unseeded guest.
+
+### Expiry
+
+Nothing reclaims a slot on its own, and a forgotten guest costs a slot from a
+fixed pool. `workenv-sweep` removes guests older than a lease:
+
+```sh
+./provisioning/workenv-sweep --prefix wkv-c --lease-seconds 14400          # report
+./provisioning/workenv-sweep --prefix wkv-c --lease-seconds 14400 --apply  # remove
+./provisioning/workenv-sweep-install --prefix wkv-c --lease-seconds 14400 --interval 900
+```
+
+Both `--prefix` and `--lease-seconds` are required, with no defaults, for the
+same reason `workenv.orchard`'s `reap` schema requires them: an omitted prefix
+means "every VM on the account is mine to delete". Only guests carrying the
+`workenv` tag *and* the prefix are candidates, a guest whose `created_at` cannot
+be read is reported rather than removed, and nothing is removed at all without
+`--apply`. Verified against live guests: a guest outside the prefix survives a
+sweep that reaps one inside it, and a report-only run removes nothing.
+
+The launchd agent installs in report-only mode. Add `--apply` once a few runs of
+`~/Library/Logs/workenv/sweep.log` read the way you expect.
 
 ## Remote desktops
 
@@ -795,10 +916,10 @@ Verified on both architectures from the nix store:
 
 ## Not portable as-is
 
-- **`work`** is *not* macOS-specific — it is a Node CLI. But it needs 22 dependencies
-  including private `@work/*` workspace packages and `incur`, i.e. its 1.2 GB
-  monorepo. Reaching it over http from the controller is the better answer than
-  installing it in every ephemeral guest.
+- **The work CLI** is *not* macOS-specific — it is a Node CLI. But it needs 22
+  dependencies including private workspace packages, i.e. its 1.2 GB monorepo.
+  Reaching it over http from the controller is the better answer than installing
+  it in every ephemeral guest.
 - **`tmppr`** is the same shape: a local monorepo with 68 dependencies and no built
   `dist`, unpublished to npm.
 - **`todoist` and `uidotsh`** are `http` MCP transports and need nothing installed.

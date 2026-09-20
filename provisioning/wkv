@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Take a repository into a disposable guest and put an agent in it.
+# Take a repository into a disposable guest, as one declared identity, and put
+# an agent in it.
 #
-#   wkv            [repo-dir]     claim a slot, clone, seed, attach
-#   wkv --down     <slot>         destroy the guest behind a slot
-#   wkv --list                    show which slots are taken
+#   wkv            [repo-dir]     claim a slot, seed, clone, attach
+#   wkv --down     <slot>         wipe the identity and destroy the guest
+#   wkv --verify   <slot>         prove the guest holds one identity and no other
+#   wkv --list                    every live workenv, then free counts
+#   wkv --jump     [slot]         ssh into a taken guest (picks if omitted)
 #
 # Lives here rather than as a `workenv` subcommand: AGENTS.md forbids adding
 # command workflows to the CLI, and this is exactly that -- an opinionated
@@ -14,97 +17,282 @@
 # globally, so several workenvs on one project cannot come from one environment
 # per project. Any free slot takes any repository, which is why adding a project
 # needs no registry entry and no manifest change.
+#
+# One pool per fleet, spanning every box. A runner is a runner: the Macs and the
+# cloud VMs are one numbering, and which backend a given runner came from is read
+# out of the manifest here rather than chosen. Nothing below decides where work
+# lands -- it asks for a free runner and reaches whichever one it got.
+#
+# Which *fleet* a repository goes to does decide which identity its guest holds,
+# so that is routed by path: see ~/.config/workenv/fleets.conf.
 set -euo pipefail
 
-ROOT="${WORKENV_FLEET_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fleet" && pwd)}"
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  link="$(readlink "$src")"; case "$link" in /*) src="$link" ;; *) src="$(cd "$(dirname "$src")" && pwd)/$link" ;; esac
+done
+here="$(cd "$(dirname "$src")" && pwd)"
 WORKENV="${WORKENV_BIN:-workenv}"
 AGENT_CMD="${WKV_AGENT:-claude --dangerously-skip-permissions}"
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLEETS_CONF="${WKV_FLEETS:-$HOME/.config/workenv/fleets.conf}"
 step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
+die() { printf 'wkv: %s\n' "$*" >&2; exit 1; }
 
-wk() { "$WORKENV" --root "$ROOT" "$@"; }
-
-# Every slot the manifest declares, in order.
-slots() {
-  wk environment list --format json 2>/dev/null \
-    | sed -n 's/.*"\(wkv-c[0-9][0-9]\)".*/\1/p' \
-    | tr ' ' '\n' | grep -o 'wkv-c[0-9][0-9]' | sort -u
+# --- fleets ---------------------------------------------------------------
+# name <tab> fleet root <tab> slot prefix <tab> path glob. First match wins, so
+# the catch-all belongs last. A second fleet adds its line from its own
+# repository; nothing about it is written here, which is what keeps another
+# organisation's names out of this one (AGENTS.md:10-11).
+ensure_fleets_conf() {
+  [ -f "$FLEETS_CONF" ] && return 0
+  install -d -m 700 "$(dirname "$FLEETS_CONF")"
+  cat > "$FLEETS_CONF" <<CONF
+# name	fleet root	slot prefix	path glob (first match wins)
+personal	$here/../fleet	wkv-r	*
+CONF
+  printf 'wkv: wrote a default fleet table to %s\n' "$FLEETS_CONF" >&2
 }
 
-# Slots that already have a VM. Asked of the provider, never of a local file:
-# a slot's state is the cluster's answer, and anything cached here would be
-# wrong exactly when a second terminal claimed a slot a moment ago.
-taken() {
-  ssh -o BatchMode=yes exe.dev ls --json 2>/dev/null \
-    | tr ',' '\n' | sed -n 's/.*"vm_name":"\(wkv-c[0-9][0-9]\)".*/\1/p' | sort -u
+fleet_lines() { grep -v '^[[:space:]]*#' "$FLEETS_CONF" | grep -v '^[[:space:]]*$'; }
+
+# A slot prefix is a glob, so this cannot live inside `"$(...)"`: the quotes
+# around `"$prefix"*` would close the substitution and bash would parse `*` as
+# syntax. --verify and --down both need it.
+fleet_root_for_slot() {
+  local slot="$1" _name root prefix _glob
+  while IFS=$'\t' read -r _name root prefix _glob; do
+    case "$slot" in
+      "$prefix"*) (cd "$root" && pwd); return 0 ;;
+    esac
+  done < <(fleet_lines)
+  return 1
 }
+
+# Route a repository to a fleet. Path, not remote: a repository's location on
+# this machine is knowable without network, and the operator's own directory
+# layout is the thing that actually separates the two bodies of work.
+route() { # $1 = absolute repo dir -> "name root prefix"
+  local dir="$1" name root prefix glob
+  while IFS=$'\t' read -r name root prefix glob; do
+    # shellcheck disable=SC2254 -- the glob is data, and must stay unquoted.
+    case "$dir" in
+      $glob) printf '%s\t%s\t%s\n' "$name" "$(cd "$root" && pwd)" "$prefix"; return 0 ;;
+    esac
+  done < <(fleet_lines)
+  die "no fleet in $FLEETS_CONF matches $dir"
+}
+
+wk() { "$WORKENV" --root "$1" "${@:2}"; }
+
+# Every runner the fleet declares, with the identity it declares, read from the
+# manifest rather than assumed here. A runner's profile is a declared fact; a
+# second copy of it in this script is a second thing to keep in step, and the one
+# that would be wrong when it mattered.
+fleet_slots() { # $1 = root, $2 = prefix -> "slot<tab>profile" lines
+  wk "$1" environment list --format json 2>/dev/null | python3 -c '
+import json,re,sys
+prefix = sys.argv[1]
+doc = json.load(sys.stdin)
+envs = doc.get("environments", doc)
+for name in sorted(envs):
+    if not re.fullmatch(re.escape(prefix) + r"[0-9]+", name):
+        continue
+    profile = ""
+    for binding in envs[name].get("integrations", []):
+        if binding.get("extension") == "workenv.identity":
+            profile = (binding.get("config") or {}).get("profile", {}).get("name", "")
+    print(f"{name}\t{profile}")
+' "$2"
+}
+
+# One runner, fully resolved: which backend created it, which identity it
+# carries, and where its checkout goes. `environment plan` is the only command
+# that answers all three, and it answers them from the manifest -- so the guest's
+# backend is never inferred from its name.
+# One value per line, never tab-separated. Tab is an IFS *whitespace* character,
+# so `IFS=$'\t' read -r a b c` collapses a run of tabs: a runner with no declared
+# profile printed "orchard<tab><tab>/home/admin/work" and read back as
+# backend=orchard, profile=/home/admin/work, directory=empty -- a missing
+# identity silently becoming a path, which is the one field in this script that
+# must never be guessed.
+slot_facts() { # $1 = root, $2 = slot -> backend, profile, directory, one per line
+  wk "$1" environment plan "$2" --format json 2>/dev/null | python3 -c '
+import json,sys
+doc = json.load(sys.stdin)
+provider = (doc.get("provider") or {}).get("extension", "")
+backend = {"workenv.exedev": "exedev", "workenv.orchard": "orchard"}.get(provider, "")
+profile = ""
+for binding in doc.get("integrations", []):
+    if binding.get("extension") == "workenv.identity":
+        profile = (binding.get("config") or {}).get("profile", {}).get("name", "")
+# Printed one per line rather than joined: see the note above slot_facts. Also
+# no f-string -- this program sits in a single-quoted shell string so it cannot
+# use single quotes, and nesting double quotes inside an f-string is a
+# SyntaxError before python 3.12.
+directory = doc.get("directory", "")
+print(backend)
+print(profile)
+print(directory)
+'
+}
+
+# Runners that already have a guest, asked of both backends and never of a local
+# file: a runner's state is the cluster's answer, and anything cached here would
+# be wrong exactly when a second terminal claimed one a moment ago. Both are
+# asked every time because the pool spans both and a name taken on either is
+# taken.
+taken() { # $1 = prefix
+  {
+    ssh -o BatchMode=yes exe.dev ls --json 2>/dev/null \
+      | tr ',' '\n' | sed -n "s/.*\"vm_name\":\"\($1[0-9][0-9]*\)\".*/\1/p"
+    "${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" list vms 2>/dev/null \
+      | awk 'NR>1 {print $1}' | grep -E "^$1[0-9]+$" || true
+  } | sort -u
+}
+
+ensure_fleets_conf
 
 case "${1:-}" in
   --list)
-    printf 'taken:\n'; taken | sed 's/^/  /'
-    printf 'free:\n'; comm -23 <(slots) <(taken) | sed 's/^/  /'
-    exit 0
+    exec "$here/wkv-inventory" --list
+    ;;
+  --jump)
+    shift
+    exec "$here/wkv-inventory" --jump "$@"
+    ;;
+  --verify)
+    slot="${2:?usage: wkv --verify <slot>}"
+    profile="${3:-}"
+    [ -n "$profile" ] || profile="$(
+      while IFS=$'\t' read -r _ root prefix _; do
+        fleet_slots "$(cd "$root" && pwd)" "$prefix" | awk -F'\t' -v s="$slot" '$1==s {print $2}'
+      done < <(fleet_lines)
+    )"
+    [ -n "$profile" ] || die "no fleet declares runner $slot"
+    root="$(fleet_root_for_slot "$slot")"
+    read -r backend < <(slot_facts "$root" "$slot")
+    [ -n "$backend" ] || die "runner $slot names no provider this script can reach"
+    exec "$here/workenv-identity-check" --via "$backend" "$slot" --identity "$profile"
     ;;
   --down)
     slot="${2:?usage: wkv --down <slot>}"
+    root="$(fleet_root_for_slot "$slot")" || die "no fleet claims slot $slot"
+    [ -n "$root" ] || die "no fleet claims slot $slot"
+    # Wipe before destroy, though destroy removes the VM outright. Two reasons:
+    # a destroy that fails half way leaves a reachable guest behind, and running
+    # the wipe on every teardown is what keeps it exercised -- a release path
+    # that only runs in the case nobody tests is a release path that does not
+    # work.
+    step "wipe identity"
+    read -r backend < <(slot_facts "$root" "$slot")
+    if [ -n "$backend" ]; then
+      "$here/workenv-identity-wipe" --via "$backend" "$slot" \
+        || printf 'wkv: guest unreachable; destroying anyway\n' >&2
+    else
+      printf 'wkv: cannot resolve a backend for %s; destroying without a wipe\n' "$slot" >&2
+    fi
+    step "destroy"
     # A fresh key every time. A mutation replays its previous answer for a
     # reused key, so a recycled one would report a teardown that never ran.
-    wk environment destroy "$slot" --idempotency-key "wkv-down-$slot-$(date +%s)"
+    wk "$root" environment destroy "$slot" --idempotency-key "wkv-down-$slot-$(date +%s)"
+    "$here/workenv-herdr-register" --remove "$slot" >/dev/null 2>&1 || true
     exit 0
     ;;
 esac
 
 REPO_DIR="$(cd "${1:-$PWD}" && pwd)"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
-  || { echo "$REPO_DIR is not a git repository" >&2; exit 1; }
+  || die "$REPO_DIR is not a git repository"
 REMOTE="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
-[ -n "$REMOTE" ] || { echo "$REPO_DIR has no 'origin' remote to clone from" >&2; exit 1; }
+[ -n "$REMOTE" ] || die "$REPO_DIR has no 'origin' remote to clone from"
+# Controller SSH Host aliases are not in the guest. The seeded gitconfig talks
+# to https://github.com via gh; rewrite GitHub SSH remotes to that.
+CLONE_URL="$("$here/workenv-github-url" "$REMOTE")"
 NAME="$(basename "$REPO_DIR")"
-BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+# `symbolic-ref`, not `rev-parse --abbrev-ref`. On a branch with no commits yet
+# the latter prints "HEAD" *and* exits non-zero, so the `|| echo main` fallback
+# appended a second line and the branch became "HEAD\nmain" -- which reaches
+# `git clone --branch` as a broken argument.
+BRANCH="$(git -C "$REPO_DIR" symbolic-ref --short -q HEAD || echo main)"
 
-step "claim a slot"
-SLOT="$(comm -23 <(slots) <(taken) | head -1)"
-[ -n "$SLOT" ] || { echo "every slot is in use; free one with 'wkv --down <slot>'" >&2; exit 1; }
-echo "  $SLOT  <- $NAME ($BRANCH)"
+IFS=$'\t' read -r FLEET ROOT PREFIX < <(route "$REPO_DIR")
+
+step "claim a slot in the $FLEET fleet"
+SLOTS="$(fleet_slots "$ROOT" "$PREFIX")"
+[ -n "$SLOTS" ] || die "fleet $FLEET declares no slots matching $PREFIX"
+SLOT="$(comm -23 <(echo "$SLOTS" | cut -f1) <(taken "$PREFIX") | head -1)"
+[ -n "$SLOT" ] || die "every $FLEET slot is in use; free one with 'wkv --down <slot>'"
+{ read -r BACKEND; read -r IDENTITY; read -r WORKDIR; } < <(slot_facts "$ROOT" "$SLOT")
+[ -n "$IDENTITY" ] || die "runner $SLOT declares no identity profile; the fleet's manifest is the place to fix that, not this script"
+[ -n "$BACKEND" ] || die "runner $SLOT names no provider this script can reach"
+[ -n "$WORKDIR" ] || die "runner $SLOT declares no directory"
+echo "  $SLOT  <- $NAME ($BRANCH)  as $IDENTITY  via $BACKEND"
 
 step "up"
 # `up` is create + apply: the provider's setup_script installs nix and devenv on
-# first boot, then apply makes the directory and realises the devenv shell. The
-# slot carries no integrations, so nothing here depends on the guest having an
-# ssh address -- which it does not.
-wk environment up "$SLOT" --idempotency-key "wkv-up-$SLOT-$(date +%s)"
+# first boot, then apply makes the directory and realises the devenv shell, and
+# the identity integration prepares this profile's tree on the controller.
+#
+# Twice, because `create` waits for first-boot provisioning only up to its own
+# budget and reports pending beyond it. Measured, provisioning takes about 210 s
+# against a 240 s budget, so the first attempt almost always finishes -- and when
+# a slow guest does not, the second costs one command rather than a puzzled
+# operator. A fresh key each time: a reused one replays the previous answer.
+wk "$ROOT" environment up "$SLOT" --idempotency-key "wkv-up-$SLOT-$(date +%s)" \
+  || wk "$ROOT" environment up "$SLOT" --idempotency-key "wkv-up-$SLOT-$(date +%s)"
 
-# One hop into the guest. stdin does not survive the relay -- a `cat > file`
-# through it wrote zero bytes and reported success -- so anything that must
-# arrive goes through argv, base64'd.
-guest() { ssh -o BatchMode=yes exe.dev ssh "$SLOT" "$@"; }
-put() {
-  local b64; b64="$(base64 < "$1" | tr -d '\n')"
-  guest "printf %s '$b64' | base64 -d > '$2'"
-}
+guest() { "$here/workenv-guest" "$BACKEND" "$SLOT" "$@"; }
 
 # Seeding comes before the clone, not after. Most of these repositories are
 # private, and a clone attempted before the guest holds any credential fails on
 # authentication -- which reads as a broken remote rather than an unseeded guest.
-step "seed"
-"$here/workenv-seed" --exedev "$SLOT"
+step "seed as $IDENTITY"
+"$here/workenv-seed" --via "$BACKEND" "$SLOT" --identity "$IDENTITY"
+
+step "herdr server"
+"$here/workenv-herdr-ensure" --via "$BACKEND" "$SLOT" \
+  || die "refusing to hand over a guest with no Herdr server"
+
+# Every time, not only when someone remembers. This is the fleet's security
+# claim, and a claim checked only in a dedicated test run is a claim about the
+# test run.
+step "verify isolation"
+"$here/workenv-identity-check" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" \
+  || die "refusing to hand over a guest that holds another identity's credentials"
 
 step "clone $NAME"
-guest "rm -rf /home/exedev/work && git clone --depth 50 --branch '$BRANCH' '$REMOTE' /home/exedev/work 2>&1 | tail -2" || {
-  echo "clone failed. If the remote is private, the guest has no git credential:" >&2
-  echo "  the identity profile's gh credential helper is what supplies one, and" >&2
-  echo "  it is not bound to these slots yet. A public remote clones fine." >&2
-  exit 1
-}
+# Exit codes from the relay are not trustworthy; CLONE_DONE is. devenv puts
+# git and gh on PATH, which the seeded credential helper needs.
+clone_out="$(guest "rm -rf '$WORKDIR' && devenv shell --from path:/opt/workenv/shells/default -- env GIT_TERMINAL_PROMPT=0 git clone --depth 50 --branch '$BRANCH' '$CLONE_URL' '$WORKDIR' && test -d '$WORKDIR/.git' && echo CLONE_DONE" || true)"
+printf '%s\n' "$clone_out"
+case "$clone_out" in
+  *CLONE_DONE*) ;;
+  *)
+    printf 'wkv: clone failed\n%s\n' "$clone_out" >&2
+    echo "If the remote is private, check that profile '$IDENTITY'" >&2
+    echo "  holds a gh login that can read it:  workenv-profile-import $IDENTITY" >&2
+    exit 1
+    ;;
+esac
 
 step "attach"
 cat <<NOTE
-  slot      $SLOT
+  runner    $SLOT ($BACKEND)
+  fleet     $FLEET
+  identity  $IDENTITY
   project   $NAME ($BRANCH)
-  checkout  /home/exedev/work
+  checkout  $WORKDIR
   shell     devenv shell --from path:/opt/workenv/shells/default
 
   when finished:  wkv --down $SLOT
 NOTE
-exec ssh -t -o BatchMode=yes exe.dev ssh "$SLOT" \
-  "cd /home/exedev/work && devenv shell --from path:/opt/workenv/shells/default -- $AGENT_CMD"
+# A tty for the agent, which is why this is not `workenv-guest`: that helper
+# exists for scripted commands and passes no -t. WKV_NO_ATTACH=1 stops after
+# the NOTE so a claim can be verified without starting the agent.
+if [ "${WKV_NO_ATTACH:-}" = 1 ]; then exit 0; fi
+case "$BACKEND" in
+  exedev)  exec ssh -t -o BatchMode=yes exe.dev ssh "$SLOT" \
+             "cd '$WORKDIR' && devenv shell --from path:/opt/workenv/shells/default -- $AGENT_CMD" ;;
+  orchard) exec "${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" ssh vm "$SLOT" -- \
+             "cd '$WORKDIR' && devenv shell --from path:/opt/workenv/shells/default -- $AGENT_CMD" ;;
+esac

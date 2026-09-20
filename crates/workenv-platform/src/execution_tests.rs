@@ -34,6 +34,23 @@ fn executable_basename_resolves_against_current_path() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn missing_path_still_resolves_sh_from_unix_defaults() -> Result<()> {
+    let resolved = resolve_on_path("sh", None)?;
+    assert!(Path::new(&resolved).is_file(), "{resolved}");
+    Ok(())
+}
+
+#[test]
+fn missing_path_resolves_apoc_from_home_local_bin() -> Result<()> {
+    let home = std::env::var("HOME")?;
+    let apoc = Path::new(&home).join(".local/bin/apoc");
+    anyhow::ensure!(apoc.is_file(), "need a real apoc at {}", apoc.display());
+    let resolved = resolve_on_path("apoc", None)?;
+    assert_eq!(Path::new(&resolved), apoc.as_path());
+    Ok(())
+}
+
 fn spec_with_stdin() -> ExecutionSpec {
     ExecutionSpec {
         executable: "cat".to_owned(),

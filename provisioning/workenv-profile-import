@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Capture the controller's current logins into a named identity profile.
+#
+#   workenv-profile-import <profile> [--replace] [--from-gh-config <dir>]
+#
+# `--from-gh-config` names the gh configuration directory holding the session to
+# capture, for the common case where the second identity is already logged in
+# somewhere else on this machine -- a per-tree GH_CONFIG_DIR, say. Without it the
+# machine's default session is used, and capturing a second identity then needs
+# an interactive login that displaces the first.
+#
+# The other half of `workenv-seed`. The adapter's `apply` builds a profile's
+# directory, .envrc and .gitconfig; its `login` drives an interactive browser
+# flow per service. This is the third case, and the common one: the operator is
+# ALREADY logged in on this machine as the identity in question, and the
+# credentials only need moving into the profile that owns them.
+#
+# The safety this adds is the github_login check. Importing while logged in as
+# the wrong account is the one mistake that produces a profile which works
+# perfectly and is the wrong person -- undetectable afterwards, because a
+# credential file carries no label. The profile's declared `github_login` is
+# compared against the live `gh` session, and a mismatch refuses.
+set -euo pipefail
+
+PROFILES_DIR="${WORKENV_PROFILES_DIR:-$HOME/.config/workenv/profiles}"
+PROFILE_NAME="${1:?usage: workenv-profile-import <profile> [--replace] [--from-gh-config <dir>]}"
+shift
+REPLACE=0
+GH_DIR="$HOME/.config/gh"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --replace)        REPLACE=1; shift ;;
+    --from-gh-config) GH_DIR="${2:?--from-gh-config needs a directory}"; shift 2 ;;
+    *) echo "workenv-profile-import: unknown argument $1" >&2; exit 1 ;;
+  esac
+done
+[ -d "$GH_DIR" ] || { echo "workenv-profile-import: no gh config at $GH_DIR" >&2; exit 1; }
+
+ROOT="$PROFILES_DIR/$PROFILE_NAME"
+SPEC="$ROOT/profile.json"
+[ -f "$SPEC" ] || {
+  cat >&2 <<MSG
+workenv-profile-import: no prepared profile at $ROOT
+
+  The adapter owns a profile's layout, digest and .gitconfig; this only fills in
+  credentials. Prepare it first, from the fleet that declares it:
+
+    workenv --root fleet extension call workenv.identity apply --environment workenv
+
+MSG
+  exit 1
+}
+
+declared="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["spec"].get("github_login",""))' "$SPEC")"
+live="$(GH_CONFIG_DIR="$GH_DIR" gh api user --jq .login 2>/dev/null || true)"
+
+if [ -n "$declared" ]; then
+  [ -n "$live" ] || { echo "workenv-profile-import: no live gh session in $GH_DIR; log in as $declared there first" >&2; exit 1; }
+  [ "$declared" = "$live" ] || {
+    cat >&2 <<MSG
+workenv-profile-import: refusing to import the wrong identity
+
+  profile '$PROFILE_NAME' declares github_login  $declared
+  $GH_DIR is logged in as  $live
+
+  Point --from-gh-config at $declared's session, or log in as $declared, before
+  importing. Otherwise the profile holds $live's credentials under $declared's
+  name and nothing afterwards could tell.
+MSG
+    exit 1
+  }
+fi
+
+existing="$(find "$ROOT" -type f \( -name auth.json -o -name .credentials.json -o -name hosts.yml \) 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$existing" -gt 0 ] && [ "$REPLACE" -eq 0 ]; then
+  echo "workenv-profile-import: $ROOT already holds $existing credential file(s); pass --replace to overwrite" >&2
+  exit 1
+fi
+
+install_file() { # stdin -> $1, 0600
+  install -d -m 700 "$(dirname "$1")"
+  cat > "$1"
+  chmod 600 "$1"
+  printf '  %-34s %s bytes\n' "${1#$ROOT/}" "$(wc -c < "$1" | tr -d ' ')"
+}
+
+printf 'importing the live session into %s\n' "$PROFILE_NAME"
+
+# Claude Code keeps credentials in the macOS Keychain, not a file. Captured into
+# a variable first: a redirection into the destination truncates it the moment
+# the pipe opens, which is before `security -w` is known to have succeeded, and a
+# denied read then replaced a working credential with a 0-byte one.
+creds="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+if [ -n "$creds" ]; then
+  printf '%s' "$creds" | install_file "$ROOT/.claude/.credentials.json"
+else
+  printf '  %-34s unavailable (Keychain denied or absent)\n' ".claude/.credentials.json"
+fi
+unset creds
+
+for pair in \
+  "$HOME/.codex/auth.json:$ROOT/.codex/auth.json" \
+  "$HOME/.grok/auth.json:$ROOT/.grok/auth.json" \
+  "$GH_DIR/hosts.yml:$ROOT/.gh/hosts.yml" ; do
+  src="${pair%%:*}"; dst="${pair##*:}"
+  if [ -f "$src" ]; then install_file "$dst" < "$src"
+  else printf '  %-34s absent on this machine\n' "${dst#$ROOT/}"; fi
+done
+
+# macOS gh keeps the oauth token in the Keychain; hosts.yml names the user only
+# (measured: 95 bytes, no oauth_token key). A Linux guest has no Keychain, and
+# gh dies looking for org.freedesktop.secrets, so private clones fail.
+token="$(GH_CONFIG_DIR="$GH_DIR" gh auth token 2>/dev/null || true)"
+if [ -n "$token" ]; then
+  printf '%s' "$token" | python3 -c '
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+token = sys.stdin.read().strip()
+text = path.read_text() if path.exists() else ""
+if "oauth_token:" in text:
+    sys.exit(0)
+out, inserted = [], False
+for line in text.splitlines(True):
+    out.append(line)
+    if not inserted and line.strip().rstrip(":") == "github.com":
+        out.append("    oauth_token: " + token + "\n")
+        inserted = True
+if not inserted:
+    sys.stderr.write("workenv-profile-import: hosts.yml has no github.com host\n")
+    sys.exit(1)
+path.write_text("".join(out))
+' "$ROOT/.gh/hosts.yml"
+  chmod 600 "$ROOT/.gh/hosts.yml"
+  printf '  %-34s oauth_token copied from live gh session\n' ".gh/hosts.yml"
+else
+  printf '  %-34s no live token; Linux guests cannot clone private GitHub\n' ".gh/hosts.yml"
+fi
+unset token
+
+printf '\n%s is ready. Seed a guest with it:  workenv-seed --exedev <slot> --identity %s\n' \
+  "$PROFILE_NAME" "$PROFILE_NAME"

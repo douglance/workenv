@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Remove runners whose lease has expired, across every backend in the pool.
+#
+#   workenv-sweep --prefix wkv-r --lease-seconds 14400            # report only
+#   workenv-sweep --prefix wkv-r --lease-seconds 14400 --apply    # actually remove
+#   workenv-sweep --prefix work-r --lease-seconds 14400 --root ~/Developer/work-fleet \
+#                 --orchard-environment work-r09
+#
+# Runs on the CONTROLLER. Nothing is removed without `--apply`, because the
+# failure mode here is deleting a guest someone is working in, and a sweep that
+# reports first can be read before it is trusted.
+#
+# Why a script rather than the orchard adapter's `reap`: `reap` walks the
+# Orchard cluster, and the tier that actually carries work today is exe.dev,
+# which Orchard does not know about. The guard that matters is the same one
+# `reap` enforces in its schema -- an omitted prefix would mean "every VM on the
+# account is mine to delete" -- so both arguments are required here too, with no
+# defaults to fall back on.
+set -euo pipefail
+
+PREFIX=""
+LEASE=""
+APPLY=0
+# The fleet root whose manifest binds the Orchard provider. Defaults to this
+# repository's fleet; a second fleet's sweep passes its own.
+ROOT="${WORKENV_FLEET_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fleet" && pwd)}"
+# A runner in this fleet that binds the Orchard provider. Empty means the Mac
+# half of the pool is not swept, which is reported rather than assumed harmless.
+ORCHARD_ENV="${WORKENV_SWEEP_ORCHARD_ENV:-}"
+TAG="${WORKENV_SWEEP_TAG:-workenv}"
+
+die() { printf 'workenv-sweep: %s\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix)         PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
+    --lease-seconds)  LEASE="${2:?--lease-seconds needs a value}"; shift 2 ;;
+    --apply)          APPLY=1; shift ;;
+    --root)           ROOT="${2:?--root needs a fleet directory}"; shift 2 ;;
+    --orchard-environment) ORCHARD_ENV="${2:?--orchard-environment needs a runner name}"; shift 2 ;;
+    -h|--help)        sed -n '2,16p' "$0"; exit 0 ;;
+    *)                die "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$PREFIX" ] || die "--prefix is required; without one every guest looks like ours"
+[ -n "$LEASE" ]  || die "--lease-seconds is required"
+case "$LEASE" in ''|*[!0-9]*) die "--lease-seconds must be a whole number of seconds" ;; esac
+# Matches the orchard reap schema's floor. A lease measured in seconds would
+# reap a guest that is still being created.
+[ "$LEASE" -ge 60 ] || die "--lease-seconds must be at least 60"
+
+now=$(date -u +%s)
+
+# Epoch seconds for one RFC 3339 timestamp, or empty when it cannot be read.
+# exe.dev reports `created_at` as `2026-09-13T19:13:48Z` -- measured against a
+# live record rather than assumed, because a misparsed timestamp reads as an
+# ancient guest and would be swept on its first run.
+epoch_of() {
+  local stamp="$1"
+  if date -u -d "$stamp" +%s 2>/dev/null; then return 0; fi          # GNU
+  date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$stamp" +%s 2>/dev/null || true # BSD/macOS
+}
+
+# The pool spans both backends, so the sweep has to as well. A sweep that only
+# knew exe.dev left every expired Mac runner standing -- holding an identity's
+# credentials -- while reporting SWEEP-DONE, which is worse than not running.
+#
+# Orchard's own `reap` does the age arithmetic on the controller and takes the
+# prefix and lease directly, so there is nothing to reimplement here. A fresh
+# idempotency key each run: a reused one replays the previous answer instead of
+# sweeping (receipts.rs:124-127).
+# launchd gives an agent a minimal PATH, so a bare `workenv` is not found and the
+# Orchard half of the sweep silently did nothing but print a python traceback
+# into the log. Resolved here, absolutely, with PATH only as a fallback.
+WORKENV_CMD="${WORKENV_BIN:-}"
+if [ -z "$WORKENV_CMD" ]; then
+  if [ -x "$HOME/.local/bin/workenv" ]; then WORKENV_CMD="$HOME/.local/bin/workenv"
+  else WORKENV_CMD="workenv"; fi
+fi
+
+# `reap` is reached through a binding, so it needs the name of an environment
+# that binds the Orchard provider. Any runner in the pool does -- the operation
+# is about the cluster, not about that guest.
+#
+# Taken as an argument rather than discovered. Discovering it meant a second
+# `workenv` command, and each one is a devenv manifest evaluation whenever the
+# manifest cache is cold -- measured at around 600 s on this controller under
+# load, on a job that fires every 900 s. The cache is warm in steady state and
+# cold after every edit to the repository, so during development this job would
+# spend its whole period evaluating Nix twice over and never reach the reap.
+# One command it is. Validated by the call itself failing if the name is wrong.
+sweep_orchard() {
+  local env_name mode
+  env_name="$ORCHARD_ENV"
+  if [ -z "$env_name" ]; then
+    printf 'skip    orchard  no --orchard-environment given, so the Mac half is unswept\n'
+    return 0
+  fi
+  mode=true
+  [ "$APPLY" -eq 1 ] && mode=false
+  "$WORKENV_CMD" --root "$ROOT" extension call workenv.orchard reap \
+    --environment "$env_name" \
+    --idempotency-key "sweep-$PREFIX-$(date -u +%Y%m%d%H%M%S)-$$" \
+    --input "{\"name_prefix\":\"$PREFIX\",\"lease_seconds\":$LEASE,\"dry_run\":$mode}" \
+    2>&1 | sed 's/^/orchard /' \
+    || printf 'failed  orchard  reap refused\n'
+}
+
+inventory=$(ssh -o BatchMode=yes -o ConnectTimeout=15 exe.dev ls --json) \
+  || die "could not read the exe.dev inventory"
+
+# One `name<TAB>created_at` line per guest that carries our tag and prefix.
+# Selected here rather than in the loop so an untagged or unrelated VM is never
+# a candidate, whatever the rest of this script does.
+candidates=$(printf '%s' "$inventory" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+prefix, tag = sys.argv[1], sys.argv[2]
+for vm in data.get("vms", []):
+    name = vm.get("vm_name", "")
+    if not name.startswith(prefix):
+        continue
+    if tag not in (vm.get("tags") or []):
+        continue
+    print("{}\t{}".format(name, vm.get("created_at", "")))
+' "$PREFIX" "$TAG")
+
+reaped=0 kept=0 skipped=0
+while IFS=$'\t' read -r name created; do
+  [ -n "$name" ] || continue
+  born=$(epoch_of "$created")
+  if [ -z "$born" ]; then
+    # Reported, never removed. A guest whose age cannot be read is a guest whose
+    # lease cannot be judged, and deleting on an unreadable field is how a sweep
+    # takes out something it does not own.
+    printf 'skip    %s  unreadable created_at %s\n' "$name" "${created:-<missing>}"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  age=$((now - born))
+  if [ "$age" -lt "$LEASE" ]; then
+    printf 'keep    %s  age=%ss lease=%ss\n' "$name" "$age" "$LEASE"
+    kept=$((kept + 1))
+    continue
+  fi
+  if [ "$APPLY" -eq 1 ]; then
+    if ssh -o BatchMode=yes -o ConnectTimeout=15 exe.dev rm "$name" --json >/dev/null 2>&1; then
+      printf 'reap    %s  age=%ss\n' "$name" "$age"
+      reaped=$((reaped + 1))
+    else
+      printf 'failed  %s  age=%ss  remove refused\n' "$name" "$age"
+      skipped=$((skipped + 1))
+    fi
+  else
+    printf 'would   %s  age=%ss lease=%ss\n' "$name" "$age" "$LEASE"
+    reaped=$((reaped + 1))
+  fi
+done <<EOF
+$candidates
+EOF
+
+sweep_orchard
+
+printf 'SWEEP-DONE apply=%s reaped=%s kept=%s skipped=%s\n' "$APPLY" "$reaped" "$kept" "$skipped"

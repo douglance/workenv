@@ -12,8 +12,8 @@ use workenv_platform::{read_json, with_exclusive_lock, write_json_atomic};
 use workenv_protocol::{AdapterResponse, ResponseStatus};
 
 use crate::receipts_selection::{
-    ensure_fingerprint, first_recorded_between, latest_matching_record, receipt_paths_newest_first,
-    recorded_response,
+    ensure_fingerprint, first_recorded_between, latest_matching_record,
+    latest_owned_matching_record, receipt_paths_newest_first, recorded_response,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +79,21 @@ impl ReceiptStore {
             return Ok(None);
         }
         let Some((record, modified)) = latest_matching_record(&self.dir, id)? else {
+            return Ok(None);
+        };
+        ensure_fingerprint(&record, expected_fingerprint)?;
+        recorded_response(&record, modified).map(Some)
+    }
+
+    pub(crate) fn latest_owned_recorded_response_for(
+        &self,
+        id: &ReceiptIdentity,
+        expected_fingerprint: &str,
+    ) -> Result<Option<RecordedResponse>> {
+        if !self.dir.is_dir() {
+            return Ok(None);
+        }
+        let Some((record, modified)) = latest_owned_matching_record(&self.dir, id)? else {
             return Ok(None);
         };
         ensure_fingerprint(&record, expected_fingerprint)?;

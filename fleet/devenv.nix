@@ -12,10 +12,10 @@
 {
   imports = [
     ../presets/personal.nix
-    # The cloud tier lives in its own module because Nix refuses a duplicate
-    # attribute: a generated `environments` set cannot sit beside the individual
-    # `environments."wkv-01"` assignments in one attrset, while the module system
+    # The runner pool lives in its own module because Nix refuses a duplicate
+    # attribute: a generated `environments` set cannot sit beside individual
+    # `environments."name"` assignments in one attrset, while the module system
     # merges the same option across two modules without complaint.
-    ../presets/cloud.nix
+    ../presets/runners.nix
   ];
 }

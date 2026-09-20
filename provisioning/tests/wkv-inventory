@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Inventory must list every fleet's live guests even when one fleet's manifest
+# cannot be read, and --jump must attach to a taken slot without claiming another.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WKV="$here/../wkv"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+mkdir -p "$tmp/bin" "$tmp/repos-fleet" "$tmp/personal-fleet"
+python3 -c '
+import json,sys
+prefix, profile, host = sys.argv[1], sys.argv[2], sys.argv[3]
+def runner(h, directory):
+    return {"host":h,"directory":directory,"source":"path:/s","ephemeral":True,
+            "profiles":[],"connection":None,
+            "integrations":[{"extension":"workenv.identity",
+                             "config":{"profile":{"name":profile}}}]}
+envs = {f"{prefix}{i:02d}": runner(host, "/home/exedev/work") for i in range(1,3)}
+print(json.dumps({"ok":True,"environments":envs}))
+' work-r work cloud > "$tmp/repos-fleet/manifest.json"
+# personal fleet root exists but has no usable manifest, which is how a live
+# wkv-r01 disappeared from --list when environment list failed.
+printf 'not json\n' > "$tmp/personal-fleet/manifest.json"
+
+cat > "$tmp/bin/workenv" <<'STUB'
+#!/usr/bin/env bash
+root=""
+while [ $# -gt 0 ]; do
+  case "$1" in --root) root="$2"; shift 2 ;; *) break ;; esac
+done
+if [ "${1:-}" = environment ] && [ "${2:-}" = list ]; then cat "$root/manifest.json"; exit 0; fi
+if [ "${1:-}" = environment ] && [ "${2:-}" = plan ]; then
+  python3 -c '
+import json,sys
+doc = json.load(open(sys.argv[1]))
+env = doc["environments"][sys.argv[2]]
+print(json.dumps({"ok":True,"directory":env["directory"],
+                  "provider":{"extension":"workenv.exedev","config":{}},
+                  "integrations":env["integrations"]}))
+' "$root/manifest.json" "$3"
+  exit 0
+fi
+exit 1
+STUB
+cat > "$tmp/bin/ssh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$tmp/ssh.log"
+if printf '%s' "\$*" | grep -q -- '-t'; then
+  printf 'JUMPED\n'
+  exit 0
+fi
+printf '{"vms":[{"vm_name":"wkv-r01"},{"vm_name":"work-r01"}]}\n'
+STUB
+cat > "$tmp/bin/orchard" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = list ] && [ "${2:-}" = vms ]; then
+  printf 'Name\tStatus\n'
+fi
+STUB
+cat > "$tmp/bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+echo '[]'
+STUB
+chmod +x "$tmp/bin/workenv" "$tmp/bin/ssh" "$tmp/bin/orchard" "$tmp/bin/herdr"
+
+cat > "$tmp/fleets.conf" <<CONF
+work	$tmp/repos-fleet	work-r	$tmp/repos/work/*
+personal	$tmp/personal-fleet	wkv-r	*
+CONF
+
+inv() {
+  PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" \
+    WORKENV_ORCHARD_BIN="$tmp/bin/orchard" WORKENV_BIN="$tmp/bin/workenv" \
+    "$WKV" "$@"
+}
+
+listed="$(inv --list 2>/dev/null || true)"
+has_velo="$(printf '%s\n' "$listed" | grep -c 'work-r01' || true)"
+has_personal="$(printf '%s\n' "$listed" | grep -c 'wkv-r01' || true)"
+printf '\nwkv inventory\n'
+check "list still shows a taken work slot when the other fleet is broken" 1 "$has_velo"
+check "list still shows a taken personal slot when its manifest is unreadable" 1 "$has_personal"
+
+: > "$tmp/ssh.log"
+jumped="$(inv --jump work-r01 2>/dev/null || true)"
+check "jump attaches to the named taken slot" 1 \
+  "$(printf '%s\n' "$jumped" | grep -c JUMPED || true)"
+check "jump uses a tty ssh hop to the slot" 1 \
+  "$(grep -c -- '-t' "$tmp/ssh.log" || true)"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

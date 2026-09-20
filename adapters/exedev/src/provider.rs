@@ -1,22 +1,26 @@
 //! exe.dev provider logic.
+mod calls;
 mod execute;
 mod model;
+mod receipt;
 mod runner;
+mod wire;
 
 use std::fs;
 
 use anyhow::Result;
 use fs2::FileExt;
-use serde_json::{Value, json};
+use serde_json::json;
 use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 
 use model::{
-    Spec, adopt_response, capacity_report, destroyed, fingerprint, observe_inventory,
-    observed_response, pending, pending_data, previous_identity, previous_owned, read_receipt,
-    receipt_path, receipt_value, receipt_waits, response, setup_args, spec, state_dir,
-    status_for_create, write_receipt,
+    Spec, adopt_response, destroyed, observed_response, pending, pending_data, previous_identity,
+    previous_owned, response, spec, state_dir, status_for_create,
 };
-use runner::{ProviderResult, Runner, SshRunner};
+use receipt::{
+    fingerprint, read_receipt, receipt_path, receipt_value, receipt_waits, write_receipt,
+};
+use runner::{Runner, SshRunner};
 
 pub(crate) fn handle(request: &AdapterRequest) -> Result<AdapterResponse> {
     let cwd = std::env::current_dir()?;
@@ -82,7 +86,7 @@ impl<R: Runner> Provider<R> {
                 Some("request ID is bound to a different provider operation"),
             ));
         }
-        let observed = self.observe(spec).map_err(anyhow::Error::msg)?;
+        let observed = self.observe_until_ready(spec);
         if spec.adopt {
             return Ok(adopt_response(request, observed));
         }
@@ -129,9 +133,7 @@ impl<R: Runner> Provider<R> {
             &receipt_value(request, spec, "creating", state.digest, &json!({})),
         )?;
         let create_error = self.create_vm(request, spec).err();
-        let mut after = self
-            .observe(spec)
-            .unwrap_or_else(|e| json!({"status":"unknown","error":e}));
+        let mut after = self.observe_until_ready(spec);
         if after["status"] == "missing" {
             after = pending_data(
                 spec,
@@ -241,52 +243,6 @@ impl<R: Runner> Provider<R> {
             &receipt_value(request, spec, "unknown", &digest, &data),
         )?;
         Ok(AdapterResponse::new(request, ResponseStatus::Pending, data))
-    }
-
-    fn inventory(&mut self) -> ProviderResult<Vec<Value>> {
-        let value = self.runner.observe(&["ls".into(), "--json".into()])?;
-        value
-            .get("vms")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| "provider inventory is incomplete".into())
-    }
-
-    fn observe(&mut self, spec: &Spec) -> ProviderResult<Value> {
-        Ok(observe_inventory(spec, &self.inventory()?))
-    }
-
-    fn capacity(&mut self, spec: &Spec) -> ProviderResult<Value> {
-        let plan = self
-            .runner
-            .observe(&["billing".into(), "plan".into(), "--json".into()])?;
-        let inventory = self.inventory()?;
-        Ok(capacity_report(spec, &plan, &inventory))
-    }
-
-    fn create_vm(&mut self, request: &AdapterRequest, spec: &Spec) -> ProviderResult<Value> {
-        self.runner.mutate_stdin(
-            request.request_id.as_str(),
-            &[
-                "new".into(),
-                "--name".into(),
-                spec.name.clone(),
-                "--cpu".into(),
-                spec.cpus.to_string(),
-                "--memory".into(),
-                format!("{}GB", spec.memory_gb),
-                "--disk".into(),
-                format!("{}GB", spec.disk_gb),
-                "--tag".into(),
-                "workenv".into(),
-                "--no-email".into(),
-                "--json".into(),
-            ]
-            .into_iter()
-            .chain(setup_args(spec))
-            .collect::<Vec<_>>(),
-            spec.setup_script.as_deref(),
-        )
     }
 }
 

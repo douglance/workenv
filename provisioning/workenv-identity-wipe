@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Remove every identity artefact from a guest, and say what is left.
+#
+#   workenv-identity-wipe --via <exedev|orchard> <vm-name> [--quiet]
+#   workenv-identity-wipe <ssh-target>                     [--quiet]
+#
+# Called before every seed, not only on release. A slot is a reused name, and
+# seeding on top of a previous tenant leaves that tenant's credentials in place
+# wherever the incoming profile has no file of its own -- a personal login
+# surviving into a work guest because work has not logged into grok yet. That is
+# the deleted Lima pool's worst bug, which re-let a running guest to the next
+# tenant with the previous tenant's ~/.claude/.credentials.json still on disk.
+#
+# ~/.ssh is deliberately untouched. The relay reaches this guest through keys
+# placed there by the platform, so clearing it would strand the guest -- and a
+# guest never holds a login key of the operator's in the first place, because
+# nothing puts one there.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND=""
+SLOT=""
+TARGET=""
+QUIET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --via)    BACKEND="${2:?--via needs exedev or orchard}"; SLOT="${3:?--via needs a vm name}"; shift 3 ;;
+    --exedev) BACKEND=exedev; SLOT="${2:?--exedev needs a vm name}"; shift 2 ;;
+    --quiet)  QUIET=1; shift ;;
+    -*)       echo "workenv-identity-wipe: unknown option $1" >&2; exit 1 ;;
+    *)        TARGET="$1"; shift ;;
+  esac
+done
+
+# One list, used by the wipe and by the check that follows it, so a path added
+# to one cannot be forgotten by the other.
+PATHS='.claude/.credentials.json .codex/auth.json .grok/auth.json .gitconfig .git-credentials .netrc .config/gh/hosts.yml .config/gh/config.yml .workenv-identity'
+
+# `rm -f` on each named path, then report anything still standing. The report is
+# the point: a wipe that silently removed nothing looks identical to one that
+# worked, and this is the step a released slot's safety rests on.
+REMOTE='
+  set -u
+  for f in '"$PATHS"'; do rm -f "$HOME/$f"; done
+  rm -rf "$HOME/.config/gh"
+  # The marker is sourced from the login shells, so removing the file alone
+  # leaves a block that fails on every shell start and, worse, reads as if an
+  # identity were still configured.
+  for rc in .bashrc .profile; do
+    [ -f "$HOME/$rc" ] || continue
+    awk "/# >>> workenv identity >>>/{s=1} !s{print} /# <<< workenv identity <<</{s=0}" \
+      "$HOME/$rc" > "$HOME/$rc.wkv" && mv "$HOME/$rc.wkv" "$HOME/$rc"
+  done
+  left=""
+  for f in '"$PATHS"'; do [ -e "$HOME/$f" ] && left="$left $f"; done
+  if [ -n "$left" ]; then printf "WIPE_INCOMPLETE:%s\n" "$left"; exit 1; fi
+  printf "WIPE_CLEAN\n"
+'
+
+# `|| true`, and the verdict read from the sentinel. The Orchard path does not
+# propagate the command's exit code, so a non-zero status here means nothing and
+# a zero one proves nothing; only WIPE_CLEAN does.
+if [ -n "$BACKEND" ]; then
+  out="$("$here/workenv-guest" "$BACKEND" "$SLOT" "$REMOTE" || true)"
+else
+  [ -n "$TARGET" ] || { echo "usage: workenv-identity-wipe <ssh-target> | --via <backend> <vm>" >&2; exit 1; }
+  out="$(ssh -o BatchMode=yes "$TARGET" "$REMOTE" || true)"
+fi
+
+case "$out" in
+  *WIPE_CLEAN*) [ "$QUIET" -eq 1 ] || printf 'identity wiped; no credential path remains\n' ;;
+  *) printf 'workenv-identity-wipe: %s\n' "$out" >&2; exit 1 ;;
+esac
