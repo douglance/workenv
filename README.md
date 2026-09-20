@@ -115,7 +115,7 @@ manifest. Historical operating instructions are under `docs/archive/v0.1/`.
 
 Keep credentials outside Git, the Nix store, command arguments, protocol
 messages, and receipts. Identity integrations use scoped configuration and
-explicit login. Personal environments remain separate from Work credentials,
+explicit login. Personal environments remain separate from work credentials,
 customer data, and production access.
 
 ## Development

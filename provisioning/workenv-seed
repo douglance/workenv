@@ -207,8 +207,13 @@ log "source trees the provisioner builds from"
 # repo, so those sources must be present before it runs. Excludes are what keep
 # this small: apoc's .build is 2.3G and its `target` is a symlink into a host
 # cache that cargo then chokes on.
-WORKENV_SRC="${WORKENV_SRC:-$HOME/Developer/src/workenv}"
-APOC_SRC="${APOC_SRC:-$HOME/Developer/src/apoc}"
+# Asked of the script's own location rather than guessed from $HOME: this file
+# lives in the checkout it is about, so a hard-coded path here was only ever a
+# record of one operator's directory layout that silently skipped the copy on
+# anyone else's. apoc is the sibling checkout, which is the one thing that still
+# has to be assumed; both are overridable.
+WORKENV_SRC="${WORKENV_SRC:-$(cd "$here/.." && pwd)}"
+APOC_SRC="${APOC_SRC:-$(cd "$here/../.." && pwd)/apoc}"
 if [ -d "$WORKENV_SRC/modules" ]; then
   "${SSH[@]}" "$TARGET" 'mkdir -p ~/src/workenv'
   "${RS[@]}" --exclude '.state/' --exclude 'target/' --exclude '.git/' \

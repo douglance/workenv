@@ -41,10 +41,16 @@
     # The provisioning scripts carry the isolation guarantee, and nothing in the
     # Rust or Nix suites executes them. These run against stubbed ssh and a
     # stubbed CLI, so they cost nothing and need no cluster.
-    ./provisioning/tests/wkv-routing
-    ./provisioning/tests/identity-isolation
-    ./provisioning/tests/seed-relay-chunk
-    ./provisioning/tests/github-clone-url
+    # Every suite in the directory, found rather than listed: the four that were
+    # named here were the four that existed when the line was written, and three
+    # more have been added since without anything noticing they never ran. The
+    # count is asserted because a glob that matches nothing would otherwise make
+    # this step pass by running no tests at all.
+    suites=(./provisioning/tests/*)
+    test "''${#suites[@]}" -ge 7
+    for suite in "''${suites[@]}"; do
+      "$suite"
+    done
     nixfmt --check \
       devenv.nix \
       modules/*.nix \

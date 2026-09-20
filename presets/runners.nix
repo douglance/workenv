@@ -7,13 +7,13 @@
 #
 # Segment sizes are measured, not guessed. As of 2026-09-14:
 #
-#   exe.dev        8 runners   paid capacity, 50 provisioned VMs available
-#   desk-01       14 cpu / 64 GB                          -> 2 runners (desk)
-#   desk-02      10 cpu / 32 GB                          -> 2 runners
-#   box-03           8 cpu /  8 GB, load ~800               -> 1 runner (may not
-#                                                            place an 8 GB guest)
+#   exe.dev   8 runners   paid capacity, 50 provisioned VMs available
+#   desk-01   14 cpu / 64 GB   -> 2 runners (the controller's own desk)
+#   desk-02   10 cpu / 32 GB   -> 2 runners
+#   box-03     8 cpu /  8 GB   -> 1 runner, load ~800 and may not place an
+#                                 8 GB guest
 #
-# desk-03 (NDI Meet Mac) is not in this fleet.
+# A fourth Mac exists on the network and is deliberately not in this fleet.
 #
 # So five Mac runners, `wkv-r09..wkv-r13`, against a measured ceiling of five.
 # The scheduler places them; nothing here names a machine. Raising the count is
