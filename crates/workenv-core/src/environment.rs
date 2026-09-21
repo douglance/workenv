@@ -87,7 +87,9 @@ impl Controller {
             let response = self.setup_binding(binding, "inspect", name, None)?;
             results.push(outcome::step(&binding.extension, &response));
         }
-        Ok(outcome::aggregate(name, "status", &results))
+        let mut report = outcome::aggregate(name, "status", &results);
+        report["conditions"] = json!(crate::conditions::derive(self, name, &results));
+        Ok(report)
     }
 
     pub(crate) fn destroy(&self, name: &str, key: Option<&str>) -> Result<Value> {
@@ -131,7 +133,11 @@ impl Controller {
         Ok(outcome::aggregate(name, "destroy", &results))
     }
 
-    fn created_provider_resource(&self, name: &str, binding: &Binding) -> Result<RecordedResponse> {
+    pub(crate) fn created_provider_resource(
+        &self,
+        name: &str,
+        binding: &Binding,
+    ) -> Result<RecordedResponse> {
         let expected = self.create_fingerprint(binding, name)?;
         let id = identity(name, &binding.extension, "create");
         if let Some(owned) = self

@@ -71,6 +71,22 @@ included. Future authenticated fetches and pushes require a target login.
 5. Run `workenv environment status dev --format json` to inspect the applied
    configuration and enabled integration diagnostics.
 
+`status` also reports `conditions`, each `true`, `false` or `unknown` with a
+reason, so the answer to "why not ready?" is at the top of the report rather
+than inside the first step's data:
+
+| Condition | True when |
+|---|---|
+| `Applied` | devenv's applied state is current for this configuration |
+| `IntegrationsReady` | every integration that can inspect itself reports ready |
+| `Ready` | both of the above. This is the one to wait on. |
+| `Fenced` | the provider created the resource behind a host-side network fence. Present only for environments with a provider; `unknown` where the provider records no fence, as exe.dev does. Not part of `Ready`. |
+
+`workenv environment status dev --wait-ready true --timeout 300` re-reads status
+until `Ready` is true or the timeout passes, then returns the last report with
+a `waited` summary. It only reads: it never creates or applies, so it does not
+replace a second `up` after a pending one.
+
 Apply prepares the target directory and declared project checkout, realizes its selected devenv shell and
 profiles, and invokes configured setup integrations. The bootstrap stage runs
 first when a controller bootstrap integration is declared. Devenv owns packages

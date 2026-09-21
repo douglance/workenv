@@ -2,6 +2,7 @@
 mod adapter;
 mod adapter_invocation;
 mod adapter_response;
+mod conditions;
 mod config;
 mod connection;
 mod controller;

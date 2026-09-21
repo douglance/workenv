@@ -25,9 +25,9 @@ pub(crate) fn commands() -> Cli {
     let mut group = Cli::create("environment")
         .description("Prepare and access explicitly configured development environments.")
         .command("list", list())
+        .command("status", crate::status::command())
         .command("connect", crate::connect::command());
     for (name, description, mutating) in [
-        ("status", "Inspect environment readiness.", false),
         (
             "plan",
             "Inspect the explicit setup operations for an environment.",

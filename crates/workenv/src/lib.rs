@@ -7,6 +7,7 @@ mod environment;
 mod extension;
 mod migration;
 mod report;
+mod status;
 
 pub use commands::build;
 pub use context::set_server_root;
