@@ -31,3 +31,33 @@ fn a_report_naming_a_missing_executable_is_not_satisfied() {
         &json!({ "ok": true, "required": [], "missing": [] })
     ));
 }
+
+#[test]
+fn a_link_into_a_missing_nix_store_says_the_store_is_not_there() {
+    let dangling = Dangling {
+        link: "/home/op/.local/bin/devenv".into(),
+        missing: "/nix/store/abc-devenv-2.2.2".into(),
+    };
+    let entry = missing_behind_a_link("devenv", &dangling);
+    assert_eq!(entry["present"], json!(false));
+    assert_eq!(
+        entry["dangling"]["missing"],
+        json!("/nix/store/abc-devenv-2.2.2")
+    );
+    let hint = entry["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("not mounted"), "{hint}");
+}
+
+#[test]
+fn a_link_into_anything_else_says_to_restore_rather_than_reinstall() {
+    let dangling = Dangling {
+        link: "/usr/local/bin/tool".into(),
+        missing: "/Volumes/tools".into(),
+    };
+    let hint = missing_behind_a_link("tool", &dangling)["hint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(hint.contains("rather than reinstalling"), "{hint}");
+    assert!(!hint.contains("Nix"), "{hint}");
+}

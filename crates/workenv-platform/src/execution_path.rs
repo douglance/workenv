@@ -19,6 +19,81 @@ pub fn locate_executable(executable: &str) -> Option<String> {
     resolve_executable(executable).ok()
 }
 
+/// An executable that is on the search path as a link to something that is not
+/// there: the link, and the first piece of its chain that does not exist.
+///
+/// "Not found" and "a link to something missing" call for opposite remedies.
+/// The first means install it; the second usually means something it lives on
+/// -- a volume, a store, a checkout -- is absent, and reinstalling is the wrong
+/// move. On a Mac whose Nix store volume had not unlocked at boot, every Nix
+/// tool was the second kind, and was reported as the first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dangling {
+    /// The link found on the search path.
+    pub link: std::path::PathBuf,
+    /// The first piece of its chain that does not exist.
+    pub missing: std::path::PathBuf,
+}
+
+/// Look for `executable` as a dangling link anywhere on the search path.
+#[must_use]
+pub fn dangling_executable(executable: &str) -> Option<Dangling> {
+    dangling_on_path(
+        executable,
+        std::env::var_os("PATH").filter(|value| !value.is_empty()),
+    )
+}
+
+pub(crate) fn dangling_on_path(
+    executable: &str,
+    path_var: Option<std::ffi::OsString>,
+) -> Option<Dangling> {
+    let path_var = path_var.unwrap_or_else(default_search_path);
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(executable))
+        .find(|link| link.symlink_metadata().is_ok() && !link.exists())
+        .map(|link| Dangling {
+            missing: first_missing(&link),
+            link,
+        })
+}
+
+/// Follow a path through every link in it, component by component, and return
+/// the first place that does not exist. Bounded, because links can loop.
+fn first_missing(path: &Path) -> std::path::PathBuf {
+    let mut remaining: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .map(|part| part.as_os_str().to_owned())
+        .collect();
+    let mut current = std::path::PathBuf::new();
+    let mut hops = 0;
+    while let Some(part) = remaining.pop_front() {
+        current.push(&part);
+        match std::fs::read_link(&current) {
+            Ok(target) if hops < 64 => {
+                hops += 1;
+                // An absolute target replaces the base; a relative one is read
+                // from the link's own directory. Either way the walk restarts
+                // from the resolved path with the unwalked parts after it.
+                let base = current.parent().map(Path::to_path_buf).unwrap_or_default();
+                prepend(&mut remaining, &base.join(target));
+                current = std::path::PathBuf::new();
+            }
+            Ok(_) => return current,
+            Err(_) if current.symlink_metadata().is_err() => return current,
+            Err(_) => {}
+        }
+    }
+    current
+}
+
+/// Put a path's components in front of the ones still to walk.
+fn prepend(remaining: &mut std::collections::VecDeque<std::ffi::OsString>, path: &Path) {
+    for part in path.components().rev() {
+        remaining.push_front(part.as_os_str().to_owned());
+    }
+}
+
 pub(crate) fn resolve_executable(executable: &str) -> Result<String> {
     resolve_on_path(
         executable,
@@ -75,5 +150,8 @@ pub(crate) fn resolve_on_path(
 }
 
 #[cfg(test)]
+// Test-only, and only these: a fixture that cannot unwrap says less than one
+// that panics loudly when the fixture is wrong.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[path = "execution_path_tests.rs"]
 mod tests;

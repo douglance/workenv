@@ -80,3 +80,54 @@ fn failure(result: Result<String>) -> String {
         Err(error) => error.to_string(),
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_link_into_something_missing_names_the_piece_that_is_gone() -> Result<()> {
+    // The shape that hid a locked Nix volume: bin/tool -> state/tool-2 (a
+    // directory link) -> store/abc-tool, where the store is not there.
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir()?;
+    let bin = root.path().join("bin");
+    let state = root.path().join("state");
+    fs::create_dir_all(&bin)?;
+    fs::create_dir_all(&state)?;
+    let store_entry = root.path().join("store/abc-tool");
+    symlink(&store_entry, state.join("tool-2"))?;
+    symlink(state.join("tool-2/bin/tool"), bin.join("tool"))?;
+
+    let found = dangling_on_path("tool", Some(bin.as_os_str().to_owned()))
+        .expect("a dangling link on the path is reported");
+    assert_eq!(found.link, bin.join("tool"));
+    // Compared against the resolved root: the walk follows every link, and on a
+    // Mac the temporary directory itself sits under one (/var -> /private/var).
+    assert_eq!(found.missing, root.path().canonicalize()?.join("store"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_working_link_and_a_plain_absence_are_not_dangling() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir()?;
+    let real = root.path().join("real-tool");
+    fs::write(&real, b"#!/bin/sh\n")?;
+    symlink(&real, root.path().join("tool"))?;
+    let search = Some(root.path().as_os_str().to_owned());
+    assert!(dangling_on_path("tool", search.clone()).is_none());
+    assert!(dangling_on_path("absent", search).is_none());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_loop_ends_instead_of_spinning() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir()?;
+    symlink(root.path().join("b"), root.path().join("a"))?;
+    symlink(root.path().join("a"), root.path().join("b"))?;
+    symlink(root.path().join("a"), root.path().join("tool"))?;
+    let found = dangling_on_path("tool", Some(root.path().as_os_str().to_owned()));
+    assert!(found.is_some());
+    Ok(())
+}

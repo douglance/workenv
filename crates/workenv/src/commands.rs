@@ -44,6 +44,12 @@ const NEXT_WHEN_MISSING: &str = concat!(
     "on a host that has none"
 );
 
+/// What to do when a missing executable is really a link to something absent.
+const NEXT_WHEN_DANGLING: &str = concat!(
+    "restore what the dangling links point into (see each entry's hint) ",
+    "rather than reinstalling; the executables themselves are still installed"
+);
+
 /// Prerequisites before configuration, because reading the configuration needs
 /// them.
 ///
@@ -56,11 +62,21 @@ fn diagnose(globals: &Value) -> Result<Value> {
     let prerequisites = prerequisites::report();
     let configuration = configuration(globals);
     if !prerequisites::satisfied(&prerequisites) {
+        // A link into something missing is fixed by restoring that thing; saying
+        // "install" there sends the reader to reinstall what is already installed.
+        let behind_links = prerequisites["required"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|entry| entry.get("dangling").is_some()));
+        let next = if behind_links {
+            NEXT_WHEN_DANGLING
+        } else {
+            NEXT_WHEN_MISSING
+        };
         return Ok(json!({
             "ok": false,
             "configuration": configuration,
             "prerequisites": prerequisites,
-            "next": NEXT_WHEN_MISSING,
+            "next": next,
         }));
     }
     let mut diagnosis = context::controller(globals)?.doctor()?;
