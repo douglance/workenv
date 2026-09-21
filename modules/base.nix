@@ -152,6 +152,16 @@ in
               default = null;
               description = "Optional access integration, otherwise use a devenv shell.";
             };
+
+            # Carried into the manifest and never interpreted by workenv itself.
+            # The runner pool's `wkv` reads it, so the agent a runner starts -- and
+            # whether it runs without asking -- is a reviewable line here rather
+            # than a default buried in a shell script.
+            agent = lib.mkOption {
+              type = lib.types.nullOr (lib.types.attrsOf lib.types.anything);
+              default = null;
+              description = "Non-secret declaration of the agent started in this environment by a workflow outside workenv.";
+            };
           };
         }
       );

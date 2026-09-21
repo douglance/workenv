@@ -37,6 +37,13 @@
   macFirst ? 9,
   macLast ? 14,
   profilesDir ? null,
+  # The Mac runners' host-side fence. A parameter so the fleet suite can build a
+  # pool without one and prove the assertion below refuses it.
+  macFence ? {
+    isolated = true;
+  },
+  # What every runner starts, and whether it runs without asking.
+  agent ? null,
 }:
 
 let
@@ -125,7 +132,7 @@ let
       cpu = 4;
       memory = 8192;
       startup_script = setupScript;
-      network.isolated = true;
+      network = macFence;
     };
   };
 
@@ -139,6 +146,7 @@ let
           profile
           profilesDir
           source
+          agent
           ;
       }
       // args
@@ -161,6 +169,13 @@ in
     {
       assertion = cloudFirst <= cloudLast && macFirst <= macLast;
       message = "runner pool segments must be non-empty ranges.";
+    }
+    {
+      # The one place an agent runs without asking must be a place it cannot
+      # reach the operator's network from. A Mac runner sits on that network
+      # unless it is fenced; a cloud runner was never on it.
+      assertion = agent == null || !(agent.unattended or false) || (macFence.isolated or false);
+      message = "runner pool declares an unattended agent, but its Mac runners are not fenced (macFence.isolated); an agent that never asks would be running on the operator's own network.";
     }
   ];
 

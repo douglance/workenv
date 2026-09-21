@@ -56,6 +56,14 @@ pub struct Environment {
     pub integrations: Vec<Binding>,
     /// Optional access integration, otherwise use a devenv shell.
     pub connection: Option<Binding>,
+    /// The agent a workflow outside workenv starts in this environment, as a
+    /// non-secret declaration such as a command and whether it runs unattended.
+    ///
+    /// Carried, never interpreted: core has no opinion about agents, and an
+    /// environment without one serializes exactly as before, so declaring this
+    /// changes nothing for environments that do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Value>,
 }
 
 /// One enabled extension and its non-secret settings.

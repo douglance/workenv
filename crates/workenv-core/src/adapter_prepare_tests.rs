@@ -201,6 +201,7 @@ fn environment() -> Environment {
         ephemeral: false,
         integrations: Vec::new(),
         connection: None,
+        agent: None,
     }
 }
 

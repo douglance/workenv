@@ -147,3 +147,31 @@ fn a_failing_handler_reports_the_whole_error_chain() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn an_environment_without_an_agent_serializes_exactly_as_before() -> Result<()> {
+    // The applied record and the create fingerprint both compare serialized
+    // environments. If an absent agent serialized as `"agent": null`, adding the
+    // field would mark every existing environment as changed and orphan every
+    // provider receipt. Nix emits `null` for it, so reading that back must also
+    // come out absent.
+    let declared = json!({
+        "host":"local","directory":"/tmp/dev","source":"path:/tmp/config",
+        "profiles":[],"ephemeral":false,"integrations":[],"connection":null,
+        "agent":null
+    });
+    let environment: workenv_protocol::Environment = serde_json::from_value(declared)?;
+    let written = serde_json::to_value(&environment)?;
+    assert!(written.get("agent").is_none(), "{written}");
+
+    let with_agent = json!({
+        "host":"local","directory":"/tmp/dev","source":"path:/tmp/config",
+        "connection":null,"agent":{"command":"agent","unattended":true}
+    });
+    let environment: workenv_protocol::Environment = serde_json::from_value(with_agent)?;
+    assert_eq!(
+        serde_json::to_value(&environment)?["agent"]["unattended"],
+        json!(true)
+    );
+    Ok(())
+}

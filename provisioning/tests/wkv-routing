@@ -31,6 +31,7 @@ prefix, profile = sys.argv[1], sys.argv[2]
 def runner(host, directory):
     return {"host":host,"directory":directory,"source":"path:/s","ephemeral":True,
             "profiles":[],"connection":None,
+            "agent":{"command":"claude --dangerously-skip-permissions","unattended":True},
             "integrations":[{"extension":"workenv.identity",
                              "config":{"profile":{"name":profile}}}]}
 envs = {f"{prefix}{i:02d}": runner("cloud", "/home/exedev/work") for i in range(1,3)}
@@ -65,6 +66,7 @@ providers = {"cloud": "workenv.exedev", "macs": "workenv.orchard"}
 print(json.dumps({"ok":True,"environment":sys.argv[2],"host":env["host"],
                   "directory":env["directory"],"source":env["source"],
                   "provider":{"extension":providers[env["host"]],"config":{}},
+                  "agent":env.get("agent"),
                   "integrations":env["integrations"]}))
 ' "$root/manifest.json" "$3"
   exit 0
@@ -146,6 +148,55 @@ personal	$tmp/personal-fleet	wkv-r	*
 work	$tmp/repos-fleet	work-r	$tmp/repos/work/*
 CONF
 check "first match wins, so order decides" "wkv-r03 personal orchard" "$(run "$tmp/repos/work/billing")"
+
+# --- the declared agent -----------------------------------------------------
+# What a runner starts is read from the manifest. The claim prints it, and it is
+# settled before `up`, so a refused agent never costs a guest.
+cat > "$tmp/fleets.conf" <<CONF
+personal	$tmp/personal-fleet	wkv-r	*
+CONF
+claim() { # extra env assignments... -> the whole claim output
+  env PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" \
+    WORKENV_ORCHARD_BIN="$tmp/bin/orchard" "$@" "$WKV" "$tmp/repos/personal/tooling" 2>&1 || true
+}
+agent_line() { awk '$1 == "agent" { $1 = ""; sub(/^ /, ""); print; exit }'; }
+set_agent() { # $1 = python literal for every runner's agent
+  python3 -c '
+import json,sys
+doc = json.load(open(sys.argv[1]))
+for name, env in doc["environments"].items():
+    if name.startswith("wkv-r"):
+        env["agent"] = eval(sys.argv[2])
+json.dump(doc, open(sys.argv[1], "w"))
+' "$tmp/personal-fleet/manifest.json" "$1"
+}
+
+check "the declared agent is the one started" "claude --dangerously-skip-permissions" \
+  "$(claim | agent_line)"
+check "WKV_AGENT still overrides the command" "true" "$(claim WKV_AGENT=true | agent_line)"
+
+set_agent '{"command": "claude --dangerously-skip-permissions", "unattended": False}'
+out="$(claim)"
+case "$out" in
+  *"not declared unattended"*) check "a bypassing agent on an attended runner is refused" yes yes ;;
+  *) check "a bypassing agent on an attended runner is refused" yes "no: $out" ;;
+esac
+case "$out" in
+  *"environment up"*) check "the refusal comes before any guest is created" yes "no: $out" ;;
+  *) check "the refusal comes before any guest is created" yes yes ;;
+esac
+out="$(claim WKV_AGENT="codex --yolo")"
+case "$out" in
+  *"not declared unattended"*) check "an override cannot bypass the rule" yes yes ;;
+  *) check "an override cannot bypass the rule" yes "no: $out" ;;
+esac
+set_agent 'None'
+out="$(claim)"
+case "$out" in
+  *"declares no agent"*) check "a runner that declares no agent is refused" yes yes ;;
+  *) check "a runner that declares no agent is refused" yes "no: $out" ;;
+esac
+set_agent '{"command": "claude --dangerously-skip-permissions", "unattended": True}'
 
 # A slot with no declared profile must stop the run rather than seed a guest
 # with whatever the machine holds.

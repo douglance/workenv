@@ -33,7 +33,6 @@ while [ -L "$src" ]; do
 done
 here="$(cd "$(dirname "$src")" && pwd)"
 WORKENV="${WORKENV_BIN:-workenv}"
-AGENT_CMD="${WKV_AGENT:-claude --dangerously-skip-permissions}"
 FLEETS_CONF="${WKV_FLEETS:-$HOME/.config/workenv/fleets.conf}"
 step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
 die() { printf 'wkv: %s\n' "$*" >&2; exit 1; }
@@ -130,10 +129,36 @@ for binding in doc.get("integrations", []):
 # use single quotes, and nesting double quotes inside an f-string is a
 # SyntaxError before python 3.12.
 directory = doc.get("directory", "")
+agent = doc.get("agent") or {}
 print(backend)
 print(profile)
 print(directory)
+print(agent.get("command", ""))
+print("true" if agent.get("unattended") is True else "false")
 '
+}
+
+# The flags that make an agent act without asking. Listed so that a command
+# carrying one cannot run on a runner that was not declared unattended.
+bypasses_prompts() { # $1 = command
+  case " $1 " in
+    *" --dangerously-skip-permissions "* | *" --dangerously-bypass-approvals-and-sandbox "* | *" --yolo "*) return 0 ;;
+  esac
+  return 1
+}
+
+# The agent a runner starts is declared in the fleet's manifest beside its
+# identity, not defaulted here: "runs without asking" belongs where a reviewer of
+# the fleet reads it, and the pool refuses to evaluate it on an unfenced Mac.
+# Settled at claim time, before anything is created, so a refusal costs nothing.
+# WKV_AGENT still overrides the command, but not the rule.
+resolve_agent() { # $1 = slot, $2 = declared command, $3 = declared unattended
+  local command="${WKV_AGENT:-$2}"
+  [ -n "$command" ] || die "runner $1 declares no agent; declare agent.command in the fleet's manifest, or set WKV_AGENT"
+  if bypasses_prompts "$command" && [ "$3" != true ]; then
+    die "runner $1 is not declared unattended, so it will not start '$command', which acts without asking. Declare agent.unattended in the fleet, where the pool checks it against the fence."
+  fi
+  printf '%s\n' "$command"
 }
 
 # Runners that already have a guest, asked of both backends and never of a local
@@ -222,11 +247,19 @@ SLOTS="$(fleet_slots "$ROOT" "$PREFIX")"
 [ -n "$SLOTS" ] || die "fleet $FLEET declares no slots matching $PREFIX"
 SLOT="$(comm -23 <(echo "$SLOTS" | cut -f1) <(taken "$PREFIX") | head -1)"
 [ -n "$SLOT" ] || die "every $FLEET slot is in use; free one with 'wkv --down <slot>'"
-{ read -r BACKEND; read -r IDENTITY; read -r WORKDIR; } < <(slot_facts "$ROOT" "$SLOT")
+{
+  read -r BACKEND
+  read -r IDENTITY
+  read -r WORKDIR
+  read -r DECLARED_AGENT
+  read -r UNATTENDED
+} < <(slot_facts "$ROOT" "$SLOT")
 [ -n "$IDENTITY" ] || die "runner $SLOT declares no identity profile; the fleet's manifest is the place to fix that, not this script"
 [ -n "$BACKEND" ] || die "runner $SLOT names no provider this script can reach"
 [ -n "$WORKDIR" ] || die "runner $SLOT declares no directory"
+AGENT_CMD="$(resolve_agent "$SLOT" "$DECLARED_AGENT" "$UNATTENDED")" || exit 1
 echo "  $SLOT  <- $NAME ($BRANCH)  as $IDENTITY  via $BACKEND"
+echo "  agent  $AGENT_CMD"
 
 step "up"
 # `up` is create + apply: the provider's setup_script installs nix and devenv on

@@ -244,6 +244,8 @@ assert lib.length (failures fleet) <= allowedFailures;
 # pool that lost its Orchard segment cannot pass this by having nothing to check.
 assert macSlots != [ ];
 assert lib.all fenced macSlots;
+# Every runner declares the agent it starts, so `wkv` has nothing to default.
+assert lib.all (name: (environments.${name}.agent.command or "") != "") slots;
 # --- the guard ------------------------------------------------------------
 # A configless binding: the shape every environment in this fleet had, which
 # evaluated cleanly and left the adapter inert.
@@ -285,6 +287,31 @@ assert poolRefused {
   macFirst = 6;
   macLast = 8;
 };
+# An agent that never asks, on Mac runners with no fence: the one combination
+# the pool exists to refuse. The same agent behind a fence is accepted, which is
+# what shows the refusal is about the fence and not about the agent.
+assert poolRefused {
+  cloudFirst = 1;
+  cloudLast = 4;
+  macFirst = 5;
+  macLast = 8;
+  macFence.isolated = false;
+  agent = {
+    command = "agent --yolo";
+    unattended = true;
+  };
+};
+assert
+  !(poolRefused {
+    cloudFirst = 1;
+    cloudLast = 4;
+    macFirst = 5;
+    macLast = 8;
+    agent = {
+      command = "agent --yolo";
+      unattended = true;
+    };
+  });
 # An inverted range, which produces a segment of nothing at all.
 assert poolRefused {
   cloudFirst = 4;
@@ -307,6 +334,8 @@ assert fenceRefused {
 {
   slotsCarryTheirProfile = true;
   macRunnersFenced = true;
+  agentsDeclared = true;
+  unattendedNeedsAFence = true;
   fenceRefusesEachDefect = true;
   macRunners = lib.length macSlots;
   noBindingWithoutAProfile = true;

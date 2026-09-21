@@ -34,6 +34,9 @@
   directory,
   source,
   profilesDir ? null,
+  # The agent every runner in this segment starts. Declared by the fleet, not
+  # defaulted here, so that "runs without asking" is a line someone wrote.
+  agent ? null,
 }:
 
 let
@@ -52,7 +55,12 @@ let
   };
 in
 lib.genAttrs names (_: {
-  inherit host directory source;
+  inherit
+    host
+    directory
+    source
+    agent
+    ;
   ephemeral = true;
   integrations = [ identity ];
   # No connection binding. Core refuses an environment whose repeated bindings of

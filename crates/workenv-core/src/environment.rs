@@ -23,7 +23,7 @@ impl Controller {
             "provider":host.provider,"integrations":integrations,"profiles":environment.profiles,
             "up_stages":["create","apply","register"],
             "apply_stages":["bootstrap","prepare_directory","prepare","devenv_shell","integrations"],
-            "ephemeral":environment.ephemeral}))
+            "ephemeral":environment.ephemeral,"agent":environment.agent}))
     }
 
     pub(crate) fn create(&self, name: &str, key: Option<&str>) -> Result<Value> {

@@ -33,6 +33,7 @@ fn plan_with(integration: &str, connection: &str, provider: &str) -> Plan {
             ephemeral: false,
             integrations: vec![binding(integration), binding("workenv.ssh")],
             connection: Some(binding(connection)),
+            agent: None,
         },
     );
     plan.hosts.insert(

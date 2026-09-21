@@ -92,6 +92,7 @@ fn manifest() -> Manifest {
                 ephemeral: true,
                 integrations: Vec::new(),
                 connection: None,
+                agent: None,
             },
         )]
         .into(),

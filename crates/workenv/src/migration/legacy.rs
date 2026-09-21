@@ -110,6 +110,7 @@ impl Plan {
                 ephemeral: worker.lifetime.as_deref() == Some("ephemeral"),
                 integrations,
                 connection: Some(binding(HERDR_EXTENSION, json!({ "session": session }))),
+                agent: None,
             },
         );
         Ok(())

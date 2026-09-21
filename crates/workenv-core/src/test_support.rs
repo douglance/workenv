@@ -170,6 +170,7 @@ pub(super) fn environment(ephemeral: bool) -> Environment {
             config: Value::Null,
         }],
         connection: None,
+        agent: None,
     }
 }
 

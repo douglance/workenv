@@ -30,4 +30,12 @@ import ./pool.nix {
   macFirst = 9;
   macLast = 13;
   profile = (import ./profiles.nix).personal;
+  # Unattended: the agent runs without asking for permission. Allowed because the
+  # Mac runners are fenced from the host and the cloud runners are remote, and
+  # the pool refuses to evaluate otherwise. This used to be a default inside
+  # `provisioning/wkv`, where nobody reviewing the fleet would see it.
+  agent = {
+    command = "claude --dangerously-skip-permissions";
+    unattended = true;
+  };
 }
