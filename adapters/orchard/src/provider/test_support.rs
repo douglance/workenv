@@ -3,10 +3,12 @@ use super::Cluster;
 use super::client::Removal;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use workenv_protocol::{AdapterRequest, Target};
+use workenv_protocol::{AdapterRequest, AdapterResponse, Target};
+
+use super::ready::Clock;
 
 /// A cluster that answers from a fixed table, or fails a named collection.
 pub(super) struct FakeCluster {
@@ -157,4 +159,30 @@ pub(super) fn worker(name: &str, cores: u64, vms: u64) -> Value {
         "last_seen": "2026-09-10T22:39:36-04:00",
         "resources": {"org.cirruslabs.logical-cores": cores, "org.cirruslabs.tart-vms": vms},
     })
+}
+
+/// A clock that moves only when something waits on it, so a guest can take
+/// minutes to boot and provision in a test that takes none.
+#[derive(Default)]
+pub(super) struct FakeClock {
+    now: Cell<u64>,
+}
+
+impl Clock for FakeClock {
+    fn sleep(&self, seconds: u64) {
+        self.now.set(self.now.get() + seconds);
+    }
+
+    fn elapsed(&self) -> u64 {
+        self.now.get()
+    }
+}
+
+/// Dispatch on fake time, with every guest reporting its setup finished.
+///
+/// The real dispatcher waits on the wall clock; a pending create used to sleep
+/// through the whole running budget -- three real minutes -- in the test that
+/// covers it.
+pub(super) fn handle_now<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
+    super::dispatch(request, cluster, &FakeClock::default(), &|_| true)
 }

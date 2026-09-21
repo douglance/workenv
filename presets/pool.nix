@@ -71,13 +71,17 @@ let
     # Resolves devenv.lock and warms the store, so the first real command in this
     # guest does not pay input resolution.
     (cd "$SHELL_DIR" && devenv shell -- true) || true
-    # Written last, and only here. exe.dev reports a VM `running` one second
-    # after `new`, while this script is still installing nix and devenv --
-    # measured at roughly three and a half minutes on a live guest. `up` raced
-    # that and died with `devenv: command not found`, having been told the guest
-    # was present, so the provider waits for this file rather than for the
-    # hypervisor. `set -eu` above is what makes its absence meaningful: a script
-    # that failed part way never reaches this line.
+    # Written last, and only here. A provider reports a guest `running` when it
+    # boots, while this script is still installing nix and devenv -- measured at
+    # roughly three and a half minutes on a live guest. `up` raced that and died
+    # with `devenv: command not found`, having been told the guest was present,
+    # so both providers wait for this file rather than for the hypervisor. Only
+    # exe.dev did until the Orchard adapter learned to; before that, a Mac
+    # runner was handed over mid-install. A setup that outlasts a create's budget
+    # comes back pending, and the next `up` finishes the wait. `set -eu` above is
+    # what makes its absence meaningful: a script that failed part way never
+    # reaches this line. The path is the protocol's provisioned marker, and a test
+    # there fails if this line names any other.
     touch /opt/workenv/.provisioned
   '';
 

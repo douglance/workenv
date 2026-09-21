@@ -1,7 +1,9 @@
 //! Removing a guest, including when the bookkeeping has drifted.
-use serde_json::Value;
+use serde_json::{Value, json};
+use workenv_protocol::{AdapterRequest, AdapterResponse, ResponseStatus};
 
 use super::client::{Cluster, Removal};
+use super::{failed, response};
 
 /// Resolve which guest a teardown refers to.
 ///
@@ -61,5 +63,29 @@ pub(super) fn run<C: Cluster>(cluster: &C, name: &str) -> Result<Destroyed, Stri
     match cluster.remove(name).map_err(|error| format!("{error:#}"))? {
         Removal::Removed => Ok(Destroyed::Removed),
         Removal::Absent => Ok(Destroyed::AlreadyGone),
+    }
+}
+
+/// Answer `destroy` by removing the guest this environment created.
+pub(super) fn answer<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
+    let name = target(
+        &request.target.environment,
+        request.previous.as_ref(),
+        &request.input,
+    );
+    match run(cluster, &name) {
+        Ok(Destroyed::Removed) => response(
+            request,
+            ResponseStatus::Changed,
+            json!({"name": name, "removed": true}),
+            None,
+        ),
+        Ok(Destroyed::AlreadyGone) => response(
+            request,
+            ResponseStatus::Ready,
+            json!({"name": name, "removed": false, "reason": "already absent"}),
+            None,
+        ),
+        Err(error) => failed(request, &error),
     }
 }

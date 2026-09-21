@@ -17,3 +17,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// because an unknown config key is not one. Both sides now name this constant,
 /// which is what makes them unable to drift again.
 pub const PROFILES_DIR_KEY: &str = "profiles_dir";
+
+/// The file a runner's first-boot setup writes as its last act.
+///
+/// A provider reporting a guest `running` says the machine booted, not that its
+/// setup finished: exe.dev answers `running` a second after `new` and Orchard as
+/// soon as Tart starts, while Nix is still installing. The next step then reaches
+/// a guest with no devenv on it. Both providers wait for this file instead, and
+/// the pool's setup script writes it -- three places that must name one path,
+/// which is why it is defined once and checked against the Nix that writes it.
+pub const PROVISIONED_MARKER: &str = "/opt/workenv/.provisioned";

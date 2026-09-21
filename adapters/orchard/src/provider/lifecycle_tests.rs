@@ -1,13 +1,15 @@
 //! Orchard create and destroy tests.
 use super::handle_with;
-use super::test_support::{FakeCluster, pending, request, request_with, running};
+use super::test_support::{
+    FakeClock, FakeCluster, handle_now, pending, request, request_with, running,
+};
 use serde_json::json;
 use workenv_protocol::ResponseStatus;
 
 #[test]
 fn create_reports_changed_once_the_guest_runs() {
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_now(&request("create"), &cluster);
     assert_eq!(response.status, ResponseStatus::Changed);
     assert_eq!(response.data["name"], json!("env"));
     assert_eq!(cluster.created.borrow().len(), 1);
@@ -18,7 +20,7 @@ fn create_on_an_already_running_guest_is_ready_not_changed() {
     // Re-running create must not claim a change it did not make, or every
     // apply reads as a rebuild and nothing downstream can trust `changed`.
     let cluster = FakeCluster::new().guests(vec![Some(running("env"))]);
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_now(&request("create"), &cluster);
     assert_eq!(response.status, ResponseStatus::Ready);
     assert!(
         cluster.created.borrow().is_empty(),
@@ -29,7 +31,7 @@ fn create_on_an_already_running_guest_is_ready_not_changed() {
 #[test]
 fn create_names_the_guest_for_the_environment_not_the_worker() {
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
-    handle_with(&request("create"), &cluster);
+    handle_now(&request("create"), &cluster);
     assert_eq!(cluster.created.borrow()[0]["name"], json!("env"));
 }
 
@@ -41,7 +43,7 @@ fn create_attaches_no_labels_of_its_own() {
     // cluster with ample free capacity.
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
     let req = request_with("create", json!({"lease_seconds": 3600}), None);
-    handle_with(&req, &cluster);
+    handle_now(&req, &cluster);
     let body = cluster.created.borrow()[0].clone();
     assert!(
         body.get("labels").is_none(),
@@ -53,7 +55,7 @@ fn create_attaches_no_labels_of_its_own() {
 fn explicit_labels_are_passed_through_to_pin_placement() {
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
     let req = request_with("create", json!({"labels": {"machine": "box-03"}}), None);
-    handle_with(&req, &cluster);
+    handle_now(&req, &cluster);
     assert_eq!(
         cluster.created.borrow()[0]["labels"]["machine"],
         json!("box-03")
@@ -65,7 +67,7 @@ fn a_guest_that_vanishes_while_starting_fails_rather_than_pending() {
     // Vanishing means something else deleted it. Reporting pending would hide
     // that and leave the caller waiting for a guest nobody is going to start.
     let cluster = FakeCluster::new().guests(vec![Some(pending("env")), None]);
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_now(&request("create"), &cluster);
     assert_eq!(response.status, ResponseStatus::Failed);
     assert!(response.error.unwrap_or_default().contains("disappeared"));
 }
@@ -85,7 +87,7 @@ fn destroy_gate_would_accept(data: &serde_json::Value) -> bool {
 #[test]
 fn a_created_guest_can_actually_be_torn_down() {
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_now(&request("create"), &cluster);
     assert_eq!(response.status, ResponseStatus::Changed);
     assert!(
         destroy_gate_would_accept(&response.data),
@@ -101,7 +103,7 @@ fn a_second_up_still_leaves_a_tearable_down() {
     // `up` after the first reports, and reporting `owned: false` here would keep
     // teardown impossible for exactly that case.
     let cluster = FakeCluster::new().guests(vec![Some(running("env"))]);
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_now(&request("create"), &cluster);
     assert_eq!(response.status, ResponseStatus::Ready);
     assert!(
         destroy_gate_would_accept(&response.data),
@@ -115,7 +117,7 @@ fn a_create_that_times_out_is_still_tearable() {
     // A timed-out create may well have left a guest running, so the pending
     // receipt has to carry ownership too or the leak is unreachable.
     let cluster = FakeCluster::new().guests(vec![Some(pending("env"))]);
-    let response = handle_with(&request("create"), &cluster);
+    let response = handle_now(&request("create"), &cluster);
     assert_eq!(response.status, ResponseStatus::Pending);
     assert!(
         destroy_gate_would_accept(&response.data),
@@ -180,7 +182,7 @@ fn the_guest_platform_is_derived_from_the_declared_system() {
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
     let mut req = request("create");
     req.target.system = "aarch64-linux".into();
-    handle_with(&req, &cluster);
+    handle_now(&req, &cluster);
     let body = cluster.created.borrow()[0].clone();
     assert_eq!(body["os"], json!("linux"));
     assert_eq!(body["arch"], json!("arm64"));
@@ -191,7 +193,7 @@ fn an_intel_system_maps_to_amd64() {
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
     let mut req = request("create");
     req.target.system = "x86_64-linux".into();
-    handle_with(&req, &cluster);
+    handle_now(&req, &cluster);
     assert_eq!(cluster.created.borrow()[0]["arch"], json!("amd64"));
 }
 
@@ -201,7 +203,7 @@ fn create_declares_the_worker_slot_it_consumes() {
     // written against the API without it produces a guest the scheduler never
     // places, pending forever with an empty status message.
     let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
-    handle_with(&request("create"), &cluster);
+    handle_now(&request("create"), &cluster);
     assert_eq!(
         cluster.created.borrow()[0]["resources"]["org.cirruslabs.tart-vms"],
         json!(1)
@@ -225,5 +227,30 @@ fn an_unreachable_controller_reports_the_whole_cause_chain() {
     assert!(
         error.contains("connection refused"),
         "the root cause is still being dropped: {error}"
+    );
+}
+
+#[test]
+fn a_running_guest_whose_setup_never_finishes_is_pending_and_still_tearable() {
+    // Running is not ready: the startup script installs Nix after boot. A create
+    // that waited out its budget on a guest still provisioning must say pending,
+    // and must still carry what teardown gates on, or the guest leaks.
+    let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
+    let req = request_with("create", json!({"startup_script": "install things"}), None);
+    let clock = FakeClock::default();
+    let response = super::dispatch(&req, &cluster, &clock, &|_| false);
+    assert_eq!(response.status, ResponseStatus::Pending);
+    assert!(
+        response
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains(".provisioned")),
+        "the reason names what it waited for: {:?}",
+        response.error
+    );
+    assert!(
+        destroy_gate_would_accept(&response.data),
+        "{}",
+        response.data
     );
 }

@@ -2,6 +2,7 @@
 use serde_json::{Map, Value, json};
 
 use super::client::Cluster;
+use super::ready::{self, Clock};
 
 /// The slot every Tart guest occupies on a worker.
 const TART_VM_RESOURCE: &str = "org.cirruslabs.tart-vms";
@@ -112,31 +113,32 @@ pub(super) enum Created {
     Pending(Value, String),
 }
 
-/// Create the guest if absent, then wait for it to run.
+/// Create the guest if absent, wait for it to run, then for its setup to finish.
 pub(super) fn run<C: Cluster>(
     cluster: &C,
     spec: &Spec,
-    sleep: &dyn Fn(u64),
+    clock: &dyn Clock,
+    provisioned: &dyn Fn(&str) -> bool,
 ) -> Result<Created, String> {
-    if let Some(existing) = cluster.guest(&spec.name).map_err(|e| e.to_string())? {
-        if status_of(&existing) == "running" {
-            return Ok(Created::Existing(existing));
+    let started = match cluster.guest(&spec.name).map_err(|e| e.to_string())? {
+        Some(existing) if status_of(&existing) == "running" => Created::Existing(existing),
+        Some(_) => await_running(cluster, &spec.name, clock)?,
+        None => {
+            cluster.create(&spec.body).map_err(|e| e.to_string())?;
+            await_running(cluster, &spec.name, clock)?
         }
-    } else {
-        cluster.create(&spec.body).map_err(|e| e.to_string())?;
-    }
-    await_running(cluster, &spec.name, sleep)
+    };
+    Ok(ready::await_provisioned(started, spec, clock, provisioned))
 }
 
 /// Poll until the guest runs, or report why it did not.
 fn await_running<C: Cluster>(
     cluster: &C,
     name: &str,
-    sleep: &dyn Fn(u64),
+    clock: &dyn Clock,
 ) -> Result<Created, String> {
-    let mut waited = 0;
     let mut last = json!({});
-    while waited < READY_TIMEOUT_SECS {
+    while clock.elapsed() < READY_TIMEOUT_SECS {
         // A guest that vanishes mid-wait was deleted by something else.
         // Reporting "still pending" would hide that entirely.
         let guest = cluster
@@ -148,8 +150,7 @@ fn await_running<C: Cluster>(
             "failed" => return Err(format!("guest {name} failed: {}", message_of(&guest))),
             _ => last = guest,
         }
-        sleep(POLL_SECS);
-        waited += POLL_SECS;
+        clock.sleep(POLL_SECS);
     }
     let reason = format!(
         "guest {name} was {} after {READY_TIMEOUT_SECS}s: {}",

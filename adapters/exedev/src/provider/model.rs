@@ -67,7 +67,7 @@ pub(super) fn spec(request: &AdapterRequest) -> Result<Spec> {
 /// guest. `up` raced that and failed with `devenv: command not found`, having
 /// been told the guest was present, so readiness is this marker rather than the
 /// hypervisor's view. The setup script writes it last and only on success.
-pub(super) const READY_MARKER: &str = "/opt/workenv/.provisioned";
+pub(super) const READY_MARKER: &str = workenv_protocol::PROVISIONED_MARKER;
 
 pub(super) fn observe_inventory(spec: &Spec, vms: &[Value]) -> Value {
     let matches = vms

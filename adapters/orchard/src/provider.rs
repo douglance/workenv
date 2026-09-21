@@ -36,6 +36,7 @@ mod inventory;
 #[cfg(test)]
 #[path = "provider/lifecycle_tests.rs"]
 mod lifecycle_tests;
+mod ready;
 mod reap;
 #[cfg(test)]
 #[path = "provider/reap_tests.rs"]
@@ -73,11 +74,26 @@ pub(crate) fn handle(request: &AdapterRequest) -> AdapterResponse {
 
 /// Dispatch with an injected cluster so tests need no controller.
 fn handle_with<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
+    let executor = executor();
+    let probe = ready::MarkerProbe::new(&executor);
+    dispatch(request, cluster, &ready::WallClock::start(), &|guest| {
+        probe.present(guest)
+    })
+}
+
+/// Dispatch with time and the setup probe injected too, so a test can make a
+/// guest take minutes to provision without taking minutes itself.
+fn dispatch<C: Cluster>(
+    request: &AdapterRequest,
+    cluster: &C,
+    clock: &dyn ready::Clock,
+    provisioned: &dyn Fn(&str) -> bool,
+) -> AdapterResponse {
     match request.operation.as_str() {
         "inventory" => report(request, cluster),
-        "create" => provision(request, cluster, &sleep_seconds),
-        "destroy" => teardown(request, cluster),
-        "reap" => sweep(request, cluster),
+        "create" => provision(request, cluster, clock, provisioned),
+        "destroy" => destroy::answer(request, cluster),
+        "reap" => reap::answer(request, cluster),
         // Reaching a guest needs no cluster read: the controller tunnels by
         // name, so this answers from the request alone.
         "connect" => access::connect(request),
@@ -93,16 +109,12 @@ fn handle_with<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResp
     }
 }
 
-/// Wait between readiness polls. Injected so tests do not sleep.
-fn sleep_seconds(seconds: u64) {
-    std::thread::sleep(std::time::Duration::from_secs(seconds));
-}
-
 /// Answer `create` by asking the controller to schedule a guest.
 fn provision<C: Cluster>(
     request: &AdapterRequest,
     cluster: &C,
-    sleep: &dyn Fn(u64),
+    clock: &dyn ready::Clock,
+    provisioned: &dyn Fn(&str) -> bool,
 ) -> AdapterResponse {
     let spec = create::spec(
         &request.target.environment,
@@ -110,7 +122,7 @@ fn provision<C: Cluster>(
         &request.config,
         &request.input,
     );
-    match create::run(cluster, &spec, sleep) {
+    match create::run(cluster, &spec, clock, provisioned) {
         // Already running is Ready, not Changed: re-running create must not
         // report a change it did not make, or every apply looks like a rebuild.
         Ok(create::Created::Existing(guest)) => response(
@@ -133,71 +145,6 @@ fn provision<C: Cluster>(
             guest_data(&spec.name, &guest),
             Some(&reason),
         ),
-        Err(error) => failed(request, &error),
-    }
-}
-
-/// Answer `destroy` by removing the guest this environment created.
-fn teardown<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
-    let name = destroy::target(
-        &request.target.environment,
-        request.previous.as_ref(),
-        &request.input,
-    );
-    match destroy::run(cluster, &name) {
-        Ok(destroy::Destroyed::Removed) => response(
-            request,
-            ResponseStatus::Changed,
-            json!({"name": name, "removed": true}),
-            None,
-        ),
-        Ok(destroy::Destroyed::AlreadyGone) => response(
-            request,
-            ResponseStatus::Ready,
-            json!({"name": name, "removed": false, "reason": "already absent"}),
-            None,
-        ),
-        Err(error) => failed(request, &error),
-    }
-}
-
-/// Answer `reap` by removing guests whose lease has run out.
-fn sweep<C: Cluster>(request: &AdapterRequest, cluster: &C) -> AdapterResponse {
-    let read = |field: &str| {
-        request
-            .input
-            .get(field)
-            .or_else(|| request.config.get(field))
-            .cloned()
-    };
-    let Some(lease) = read("lease_seconds").and_then(|value| value.as_i64()) else {
-        return failed(request, "reap needs lease_seconds");
-    };
-    // A prefix is required, not defaulted to empty. Defaulting would make an
-    // omitted setting mean "every guest in the cluster is mine to delete".
-    let Some(prefix) = read("name_prefix").and_then(|value| value.as_str().map(ToOwned::to_owned))
-    else {
-        return failed(request, "reap needs name_prefix naming the guests it owns");
-    };
-    let dry_run = read("dry_run")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    match reap::run(cluster, &prefix, lease, chrono::Utc::now(), dry_run) {
-        Ok(swept) => {
-            let data = json!({
-                "reaped": swept.reaped,
-                "kept": swept.kept,
-                "skipped": swept.skipped,
-                "dry_run": dry_run,
-            });
-            // Reaping nothing is a correct outcome, not a change.
-            let status = if swept.reaped.is_empty() || dry_run {
-                ResponseStatus::Ready
-            } else {
-                ResponseStatus::Changed
-            };
-            response(request, status, data, None)
-        }
         Err(error) => failed(request, &error),
     }
 }
