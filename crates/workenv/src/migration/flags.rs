@@ -6,11 +6,17 @@ pub(super) struct ExtensionFlags {
 }
 
 impl ExtensionFlags {
-    pub fn contains(&self, extension: &'static str) -> bool {
-        self.enabled.contains(extension)
-    }
-
     pub fn enable(&mut self, extension: &'static str) {
         self.enabled.insert(extension);
+    }
+
+    /// Withdraw a flag for an extension this repository turned out not to ship.
+    pub fn disable(&mut self, extension: &str) {
+        self.enabled.remove(extension);
+    }
+
+    /// The enabled names, so the renderer does not keep a second list of them.
+    pub fn names(&self) -> impl Iterator<Item = &&'static str> {
+        self.enabled.iter()
     }
 }

@@ -41,7 +41,19 @@ jobs:
           # modules agree with the file they already read. That assertion lives
           # in modules/tests/adapter-coverage.nix, against Cargo.lock.
           adapters="$(cd "${GITHUB_WORKSPACE}/adapters" && ls -d */ | sed 's#/##' | sort)"
-          test "$(printf '%s\n' "$adapters" | wc -l)" -ge 10
+          # Measured, not declared. This asserted `-ge 10`, a count written when
+          # there were ten adapters; deleting the Lima and herdr substrate left
+          # eight and turned this red with no defect behind it -- the third
+          # hand-kept number in this file to go stale the same way. What the step
+          # actually needs is that the list is not empty and that every name in it
+          # has a module to enable, and those two sides come from two directories.
+          test -n "$adapters"
+          for adapter in $adapters; do
+            test -f "${GITHUB_WORKSPACE}/modules/${adapter}.nix" || {
+              echo "adapter $adapter has no module to enable"
+              exit 1
+            }
+          done
 
           check_dir="$(mktemp -d)"
           cp "${GITHUB_WORKSPACE}/devenv.yaml" "$check_dir/devenv.yaml"

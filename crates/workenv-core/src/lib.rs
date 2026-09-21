@@ -18,6 +18,10 @@ mod manifest_cache;
 #[path = "manifest_cache_tests.rs"]
 mod manifest_cache_tests;
 mod outcome;
+// Test-only, and only these: a prerequisite test that cannot unwrap the source
+// it reads says less than one that panics loudly when the source moved.
+#[cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+pub mod prerequisites;
 mod readiness;
 mod receipts;
 mod receipts_selection;

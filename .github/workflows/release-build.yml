@@ -54,8 +54,14 @@ jobs:
             | jq -r '.packages[] | select(any(.targets[]; .kind[] == "bin")) | .name' \
             | grep -v '^xtask$' \
             | sort > "${RUNNER_TEMP}/shipped-binaries.txt"
-          # An empty or truncated list would package nothing and still exit 0.
-          test "$(wc -l < "${RUNNER_TEMP}/shipped-binaries.txt")" -ge 11
+          # An empty or truncated list would package nothing and still exit 0, so
+          # the count is asserted -- but against the adapters on disk plus the CLI
+          # rather than against a number. `-ge 11` was written when there were
+          # eleven; the workspace now builds nine, so this would have failed the
+          # next release for no reason. The two sides are `cargo metadata` and a
+          # directory listing, which is what makes the check worth running.
+          expected=$(( $(ls -d "${GITHUB_WORKSPACE}/adapters"/*/ | wc -l) + 1 ))
+          test "$(wc -l < "${RUNNER_TEMP}/shipped-binaries.txt")" -eq "$expected"
           cat "${RUNNER_TEMP}/shipped-binaries.txt"
       - name: Build
         run: |

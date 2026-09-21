@@ -244,6 +244,14 @@ fn private_new_file(path: &Path) -> std::io::Result<fs::File> {
 /// Used when the process has no `PATH`, which is how `APoC` launches workenv.
 const DEFAULT_UNIX_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin";
 
+/// Where an executable would be found, or nothing when it is absent. A caller
+/// reporting on the host wants the absence as a value, not as an error message
+/// it has to parse.
+#[must_use]
+pub fn locate_executable(executable: &str) -> Option<String> {
+    resolve_executable(executable).ok()
+}
+
 pub(crate) fn resolve_executable(executable: &str) -> Result<String> {
     resolve_on_path(
         executable,

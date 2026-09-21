@@ -149,6 +149,32 @@ async fn output_write_is_exclusive_and_replays_by_receipt() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_second_key_finding_the_same_proposal_reports_it_unchanged() -> Result<()> {
+    // Two keys aimed at one destination. The second writes nothing, because the
+    // file already holds exactly this proposal, and used to say `written`
+    // anyway -- two receipts claiming a write where only one happened.
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    write_fleet(root, &basic_fleet())?;
+    let output = root.join("migrated.nix");
+    let path = output.to_string_lossy().into_owned();
+
+    let (first_code, first, _) =
+        invoke(root, &["--output", &path, "--idempotency-key", "key-a"]).await?;
+    let after_first = std::fs::read_to_string(&output)?;
+    let (second_code, second, _) =
+        invoke(root, &["--output", &path, "--idempotency-key", "key-b"]).await?;
+
+    assert_eq!(first_code, Some(0));
+    assert_eq!(second_code, Some(0));
+    assert_eq!(first["status"], "written");
+    assert_eq!(second["status"], "unchanged");
+    // The destination is untouched, which is the thing the status now states.
+    assert_eq!(std::fs::read_to_string(&output)?, after_first);
+    Ok(())
+}
+
+#[tokio::test]
 async fn output_requires_idempotency_key_before_writing() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();

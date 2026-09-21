@@ -14,9 +14,9 @@ pub(super) fn write(root: &Path, output: &Path, key: &str, report: Value) -> Res
     if receipt.exists() {
         return replay(&receipt, &request);
     }
-    write_output(output, report["proposed_nix"].as_str().unwrap_or_default())?;
+    let outcome = write_output(output, report["proposed_nix"].as_str().unwrap_or_default())?;
     let mut written = report;
-    written["status"] = json!("written");
+    written["status"] = json!(outcome.status());
     written["output"] = json!({ "path": output });
     written["receipt"] = json!({ "path": receipt });
     write_json_atomic(&receipt, &json!({ "request": request, "report": written }))?;
@@ -34,11 +34,31 @@ fn replay(receipt: &Path, request: &Value) -> Result<Value> {
     Ok(report)
 }
 
-fn write_output(output: &Path, proposed_nix: &str) -> Result<()> {
+/// Whether the destination was created, or already held exactly this proposal.
+///
+/// Reporting `written` for both was a claim the run did not keep: a second key
+/// aimed at a destination another key had already produced touched nothing and
+/// still said it wrote. Anyone reconciling receipts against the filesystem would
+/// count two writes where there was one.
+pub(super) enum Outcome {
+    Written,
+    Unchanged,
+}
+
+impl Outcome {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+fn write_output(output: &Path, proposed_nix: &str) -> Result<Outcome> {
     if output.exists() {
         let existing = fs::read_to_string(output)?;
         if existing == proposed_nix {
-            return Ok(());
+            return Ok(Outcome::Unchanged);
         }
         bail!(
             "output {} already exists; refusing to overwrite it",
@@ -55,7 +75,7 @@ fn write_output(output: &Path, proposed_nix: &str) -> Result<()> {
         .with_context(|| format!("create {}", output.display()))?;
     file.write_all(proposed_nix.as_bytes())?;
     file.sync_all()?;
-    Ok(())
+    Ok(Outcome::Written)
 }
 
 fn request(key: &str, output: &Path, report: &Value) -> Value {

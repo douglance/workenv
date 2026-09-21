@@ -12,25 +12,15 @@ pub(super) fn module(plan: &Plan) -> Result<String> {
     ))
 }
 
+/// One line per enabled flag, read from the flag set rather than from a list
+/// kept here. The list that used to live here named `herdr`, which the
+/// repository no longer ships, and nothing noticed.
 fn flags(plan: &Plan) -> String {
-    [
-        (
-            plan.flags.contains("exedev"),
-            "  workenv.exedev.enable = true;\n",
-        ),
-        (
-            plan.flags.contains("herdr"),
-            "  workenv.herdr.enable = true;\n",
-        ),
-        (
-            plan.flags.contains("identity"),
-            "  workenv.identity.enable = true;\n",
-        ),
-        (plan.flags.contains("ssh"), "  workenv.ssh.enable = true;\n"),
-    ]
-    .into_iter()
-    .filter_map(|(enabled, line)| enabled.then_some(line))
-    .collect()
+    plan.flags
+        .names()
+        .map(|name| format!("  workenv.{name}.enable = true;\n"))
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 fn json_nix(value: &impl Serialize) -> Result<String> {

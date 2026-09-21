@@ -15,6 +15,7 @@ mod legacy;
 mod profiles;
 mod receipt;
 mod render;
+mod shipped;
 
 #[derive(Deserialize, incurs::Options)]
 struct Options {
@@ -40,7 +41,10 @@ pub(crate) fn command() -> CommandDef {
 
 fn run(globals: &Value, options: Options) -> Result<Value> {
     let root = context::root(globals)?;
-    let plan = legacy::Plan::load(&root)?;
+    let mut plan = legacy::Plan::load(&root)?;
+    if let Some(available) = shipped::extensions(&root)? {
+        shipped::prune(&mut plan, &available);
+    }
     let proposed_nix = render::module(&plan)?;
     let base = base_report(&root, &plan, &proposed_nix);
     if let Some(output) = options.output {

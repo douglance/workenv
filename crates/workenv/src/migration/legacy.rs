@@ -42,6 +42,13 @@ impl Plan {
         Ok(plan)
     }
 
+    /// An empty plan, so the pruning tests can state exactly the shape they are
+    /// about instead of building a fleet file to reach it.
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self::new(Vec::new())
+    }
+
     fn new(profiles: Vec<Value>) -> Self {
         Self {
             hosts: BTreeMap::new(),
