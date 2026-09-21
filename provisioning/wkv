@@ -3,7 +3,7 @@
 # an agent in it.
 #
 #   wkv            [repo-dir]     claim a slot, seed, clone, attach
-#   wkv --down     <slot>         wipe the identity and destroy the guest
+#   wkv --down     <slot> [--force]  wipe and destroy; refuses unsaved work without --force
 #   wkv --verify   <slot>         prove the guest holds one identity and no other
 #   wkv --list                    every live workenv, then free counts
 #   wkv --jump     [slot]         ssh into a taken guest (picks if omitted)
@@ -41,6 +41,8 @@ FLEETS_CONF="${WKV_FLEETS:-$HOME/.config/workenv/fleets.conf}"
 CHECK="${WKV_IDENTITY_CHECK:-$here/workenv-identity-check}"
 GUEST="${WKV_GUEST:-$here/workenv-guest}"
 HERDR_ENSURE="${WKV_HERDR_ENSURE:-$here/workenv-herdr-ensure}"
+HERDR_REGISTER="${WKV_HERDR_REGISTER:-$here/workenv-herdr-register}"
+WIPE="${WKV_WIPE:-$here/workenv-identity-wipe}"
 SEED="${WKV_SEED:-$here/workenv-seed}"
 PARKED="${WKV_PARKED:-$here/workenv-parked}"
 # One value, quoted for the guest's shell. Both backends deliver a command
@@ -218,6 +220,43 @@ attach() { # $1 = backend, $2 = slot, $3 = checkout, $4 = agent command
   esac
 }
 
+# What a runner's checkout holds that exists nowhere else: uncommitted changes,
+# commits on no remote, and stashes. AX gives an agent a grace period to flush
+# before its sandbox stops; the equivalent here is not destroying work that would
+# go with the guest. Prints "WORK <dirty> <unpushed> <stashed>", "WORK_NONE" when
+# there is no checkout, or nothing at all when the guest could not be asked --
+# and "could not ask" is not "nothing to lose".
+unsaved_work() { # $1 = backend, $2 = slot, $3 = checkout
+  local script
+  script="cd $(sq "$3") 2>/dev/null || { echo WORK_NONE; exit 0; }
+devenv shell --from path:/opt/workenv/shells/default -- bash -c '
+  printf \"WORK %s %s %s\\n\" \"\$(git status --porcelain | wc -l)\" \\
+    \"\$(git log --branches --not --remotes --oneline | wc -l)\" \"\$(git stash list | wc -l)\"
+'"
+  "$GUEST" "$1" "$2" "$script" 2>/dev/null | awk '$1 == "WORK" || $1 == "WORK_NONE"' || true
+}
+
+# Refuse to destroy a runner whose checkout holds work that exists nowhere else,
+# unless told to. A runner that cannot be asked is destroyed with a warning, as
+# before: an unreachable guest is exactly what `--down` is for.
+guard_unsaved_work() { # $1 = backend, $2 = slot, $3 = checkout
+  local found dirty unpushed stashed
+  found="$(unsaved_work "$1" "$2" "$3")"
+  case "$found" in
+    WORK_NONE*) printf '  no checkout; nothing to lose\n'; return 0 ;;
+    WORK\ *) ;;
+    *) printf 'wkv: could not inspect %s; destroying without knowing what it held\n' "$2" >&2; return 0 ;;
+  esac
+  read -r _ dirty unpushed stashed <<<"$found"
+  if [ "$dirty" -eq 0 ] && [ "$unpushed" -eq 0 ] && [ "$stashed" -eq 0 ]; then
+    printf '  nothing unsaved\n'
+    return 0
+  fi
+  die "runner $2 holds work that exists nowhere else: $dirty uncommitted change(s), $unpushed unpushed commit(s), $stashed stash(es).
+  Push it, or keep the runner:  wkv --park $2
+  To destroy it anyway:         wkv --down $2 --force"
+}
+
 # Keep a runner exactly as it is. Neither backend can stop a guest and start it
 # again -- Orchard treats "stopped" as terminal -- so a parked runner keeps
 # running: its disk, checkout, toolchain, login and background processes stay
@@ -300,7 +339,7 @@ case "${1:-}" in
     exec "$here/workenv-identity-check" --via "$backend" "$slot" --identity "$profile"
     ;;
   --down)
-    slot="${2:?usage: wkv --down <slot>}"
+    slot="${2:?usage: wkv --down <slot> [--force]}"
     root="$(fleet_root_for_slot "$slot")" || die "no fleet claims slot $slot"
     [ -n "$root" ] || die "no fleet claims slot $slot"
     # Wipe before destroy, though destroy removes the VM outright. Two reasons:
@@ -308,10 +347,14 @@ case "${1:-}" in
     # the wipe on every teardown is what keeps it exercised -- a release path
     # that only runs in the case nobody tests is a release path that does not
     # work.
+    { read -r backend; read -r _identity; read -r workdir; } < <(slot_facts "$root" "$slot")
+    if [ "${3:-}" != --force ] && [ -n "$backend" ] && [ -n "$workdir" ]; then
+      step "check for unsaved work"
+      guard_unsaved_work "$backend" "$slot" "$workdir"
+    fi
     step "wipe identity"
-    read -r backend < <(slot_facts "$root" "$slot")
     if [ -n "$backend" ]; then
-      "$here/workenv-identity-wipe" --via "$backend" "$slot" \
+      "$WIPE" --via "$backend" "$slot" \
         || printf 'wkv: guest unreachable; destroying anyway\n' >&2
     else
       printf 'wkv: cannot resolve a backend for %s; destroying without a wipe\n' "$slot" >&2
@@ -320,7 +363,7 @@ case "${1:-}" in
     # A fresh key every time. A mutation replays its previous answer for a
     # reused key, so a recycled one would report a teardown that never ran.
     wk "$root" environment destroy "$slot" --idempotency-key "wkv-down-$slot-$(date +%s)"
-    "$here/workenv-herdr-register" --remove "$slot" >/dev/null 2>&1 || true
+    "$HERDR_REGISTER" --remove "$slot" >/dev/null 2>&1 || true
     "$PARKED" --unpark "$slot" 2>/dev/null || true
     exit 0
     ;;

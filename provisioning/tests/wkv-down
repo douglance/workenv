@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# `wkv --down` does not destroy work that exists nowhere else.
+#
+# AX gives an agent a grace period to flush before its sandbox stops. A runner's
+# checkout is the equivalent of what gets flushed: destroying a runner that holds
+# uncommitted changes, commits on no remote, or a stash throws that work away with
+# the guest. The guest here is a real git checkout in a directory, the check's
+# command string runs against it in a real shell, and `workenv destroy` is a stub
+# that records whether it was asked.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WKV="$here/../wkv"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+mkdir -p "$tmp/bin" "$tmp/guestbin"
+printf 'personal\t%s\twkv-r\t*\n' "$tmp" > "$tmp/fleets.conf"
+cat > "$tmp/bin/workenv" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"environment plan"*) echo '{"directory":"$tmp/work","provider":{"extension":"workenv.orchard","config":{}},"integrations":[{"extension":"workenv.identity","config":{"profile":{"name":"personal"}}}]}' ;;
+  *"environment destroy"*) echo destroyed >> "$tmp/destroyed" ;;
+esac
+exit 0
+STUB
+printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/ok"
+cat > "$tmp/bin/guest" <<STUB
+#!/usr/bin/env bash
+[ "\${GUEST_UNREACHABLE:-0}" = 1 ] && exit 0
+shift 2
+PATH="$tmp/guestbin:\$PATH" bash -c "\$*"
+STUB
+cat > "$tmp/guestbin/devenv" <<'STUB'
+#!/usr/bin/env bash
+while [ "$1" != "--" ]; do shift; done; shift; exec "$@"
+STUB
+chmod +x "$tmp/bin/"* "$tmp/guestbin/"*
+
+# A checkout with a remote it is in step with: the clean baseline.
+fresh_checkout() {
+  rm -rf "$tmp/work" "$tmp/origin.git"
+  git init -q --bare "$tmp/origin.git"
+  git init -q -b main "$tmp/work"
+  git -C "$tmp/work" -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m base
+  git -C "$tmp/work" remote add origin "$tmp/origin.git"
+  git -C "$tmp/work" push -q origin main
+}
+down() {
+  rm -f "$tmp/destroyed"
+  env PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" WORKENV_BIN="$tmp/bin/workenv" \
+    WKV_GUEST="$tmp/bin/guest" WKV_WIPE="$tmp/bin/ok" WKV_HERDR_REGISTER="$tmp/bin/ok" \
+    WORKENV_PARKED_DIR="$tmp/parked" "$WKV" --down wkv-r03 "$@" >"$tmp/out" 2>&1 || true
+}
+destroyed() { [ -f "$tmp/destroyed" ] && echo yes || echo no; }
+gitc() { git -C "$tmp/work" -c user.email=t@example.invalid -c user.name=t "$@"; }
+
+printf '\nwkv down\n'
+fresh_checkout; down
+check "a runner with nothing unsaved is destroyed" yes "$(destroyed)"
+
+fresh_checkout; echo change > "$tmp/work/file"; down
+check "an uncommitted change stops the teardown" no "$(destroyed)"
+check "and says how to keep it" yes "$(grep -q 'wkv --park wkv-r03' "$tmp/out" && echo yes || echo no)"
+
+fresh_checkout; gitc commit -q --allow-empty -m local; down
+check "a commit on no remote stops the teardown" no "$(destroyed)"
+
+fresh_checkout; echo change > "$tmp/work/file"; gitc add file; gitc stash -q; down
+check "a stash stops the teardown" no "$(destroyed)"
+
+fresh_checkout; gitc commit -q --allow-empty -m local; down --force
+check "--force destroys it anyway" yes "$(destroyed)"
+
+fresh_checkout; gitc commit -q --allow-empty -m local; GUEST_UNREACHABLE=1 down
+check "a runner that cannot be asked is destroyed, as before" yes "$(destroyed)"
+check "with a warning that nobody knows what it held" yes "$(grep -q 'could not inspect' "$tmp/out" && echo yes || echo no)"
+
+rm -rf "$tmp/work"; down
+check "a runner with no checkout is destroyed" yes "$(destroyed)"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
