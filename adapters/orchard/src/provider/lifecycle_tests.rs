@@ -254,3 +254,25 @@ fn a_running_guest_whose_setup_never_finishes_is_pending_and_still_tearable() {
         response.data
     );
 }
+
+#[test]
+fn a_fenced_runner_is_created_behind_softnet() {
+    let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
+    let mut req = request("create");
+    req.config = json!({"network": {"isolated": true}});
+    let response = handle_now(&req, &cluster);
+    assert_eq!(response.status, ResponseStatus::Changed);
+    assert_eq!(cluster.created.borrow()[0]["netSoftnet"], json!(true));
+}
+
+#[test]
+fn a_malformed_fence_creates_nothing() {
+    // The alternative is a guest created unfenced while its manifest says it is
+    // fenced -- the one outcome this must never produce.
+    let cluster = FakeCluster::new().guests(vec![None, Some(running("env"))]);
+    let mut req = request("create");
+    req.config = json!({"network": {"isolate": true}});
+    let response = handle_now(&req, &cluster);
+    assert_eq!(response.status, ResponseStatus::Failed);
+    assert!(cluster.created.borrow().is_empty());
+}

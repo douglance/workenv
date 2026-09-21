@@ -23,6 +23,73 @@ let
     additionalProperties = true;
     description = "Resource readings as the controller reports them.";
   };
+  # A Softnet fence, enforced on the worker Mac rather than inside the guest,
+  # where the agent has root and could remove it. Addresses only: the filter sees
+  # packets, so a hostname cannot be expressed. The adapter
+  # (adapters/orchard/src/provider/network.rs) refuses the same shapes this does,
+  # so input that slips past one is still stopped by the other.
+  cidrPattern = "([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])";
+  cidr = {
+    type = "string";
+    pattern = "^${cidrPattern}$";
+  };
+  fence = {
+    type = "object";
+    additionalProperties = false;
+    required = [ ];
+    properties = {
+      isolated.type = "boolean";
+      allow = {
+        type = "array";
+        items = cidr;
+      };
+      block = {
+        type = "array";
+        items = cidr;
+      };
+    };
+  };
+  fenceKeys = [
+    "isolated"
+    "allow"
+    "block"
+  ];
+
+  # Every host whose provider is this adapter. Orchard is only ever a provider,
+  # so hosts are the one place a binding of it can appear.
+  orchardProviders = lib.filter (entry: entry.binding.extension == cfg.extensionId) (
+    lib.mapAttrsToList (name: host: {
+      inherit name;
+      binding = host.provider;
+    }) (lib.filterAttrs (_: host: host.provider != null) config.workenv.hosts)
+  );
+
+  # Checked at evaluation for the same reason the adapter checks it at create: a
+  # fence that is quietly misread leaves a guest unfenced while its manifest says
+  # otherwise, and the manifest is what a reader trusts.
+  fenceAssertions =
+    entry:
+    let
+      fence = entry.binding.config.network or null;
+      unknown = if builtins.isAttrs fence then lib.subtractLists fenceKeys (lib.attrNames fence) else [ ];
+      cidrs = key: if builtins.isAttrs fence then fence.${key} or [ ] else [ ];
+      validCidr = value: builtins.isString value && builtins.match cidrPattern value != null;
+      badCidrs = lib.filter (value: !validCidr value) (cidrs "allow" ++ cidrs "block");
+    in
+    lib.optionals (fence != null) [
+      {
+        assertion = builtins.isAttrs fence && unknown == [ ];
+        message = "workenv.orchard provider on host ${entry.name} sets network key(s) ${lib.concatStringsSep ", " unknown}; a fence reads only ${lib.concatStringsSep ", " fenceKeys}.";
+      }
+      {
+        assertion = !(builtins.isAttrs fence) || builtins.isBool (fence.isolated or false);
+        message = "workenv.orchard provider on host ${entry.name} needs network.isolated as a boolean.";
+      }
+      {
+        assertion = builtins.isList (cidrs "allow") && builtins.isList (cidrs "block") && badCidrs == [ ];
+        message = "workenv.orchard provider on host ${entry.name} lists network entries that are not IPv4 CIDRs: ${builtins.toJSON badCidrs}. Softnet filters addresses, not hostnames.";
+      }
+    ];
   workerEntry = {
     type = "object";
     additionalProperties = true;
@@ -54,6 +121,8 @@ let
       image.type = "string";
       created_at.type = "string";
       resources = resourceMap;
+      # The fence the controller reports the guest running behind.
+      network = fence;
     };
   };
   count = {
@@ -130,6 +199,7 @@ let
         type = "object";
         additionalProperties = true;
       };
+      network = fence;
     };
   };
   destroyInput = {
@@ -378,7 +448,8 @@ in
         assertion = cfg.controllerUrl != "";
         message = "workenv.orchard.controllerUrl must not be empty.";
       }
-    ];
+    ]
+    ++ lib.concatMap fenceAssertions orchardProviders;
 
     workenv.extensions = {
       ${cfg.extensionId} = {

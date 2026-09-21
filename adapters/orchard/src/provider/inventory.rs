@@ -30,6 +30,9 @@ pub(super) fn guest(record: &Value) -> Value {
         // returns empty, which is indistinguishable from a guest with no age.
         "created_at": text(record, "createdAt"),
         "resources": record.get("resources").cloned().unwrap_or_else(|| json!({})),
+        // Read from the controller's record, so a receipt or an inventory says
+        // what fence the guest actually runs behind rather than what was asked.
+        "network": super::network::observed(record),
     })
 }
 

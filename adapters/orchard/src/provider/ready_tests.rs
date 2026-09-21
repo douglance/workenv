@@ -14,6 +14,7 @@ fn scripted_spec() -> create::Spec {
         &json!({"startup_script": "install things"}),
         &json!({}),
     )
+    .expect("a spec without a fence always builds")
 }
 
 fn running() -> Created {
@@ -64,7 +65,8 @@ fn a_guest_whose_marker_never_appears_is_pending_within_the_budget() {
 #[test]
 fn a_guest_with_no_setup_script_is_never_probed() {
     let clock = FakeClock::default();
-    let spec = create::spec("env", "aarch64-linux", &json!({}), &json!({}));
+    let spec = create::spec("env", "aarch64-linux", &json!({}), &json!({}))
+        .expect("a spec without a fence always builds");
     let outcome = await_provisioned(running(), &spec, &clock, &|_| {
         panic!("nothing writes the marker when there is no script")
     });

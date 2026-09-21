@@ -70,6 +70,12 @@ let
   hosts = fleet.workenv.hosts;
   expectedNames = map (n: "${prefix}${lib.fixedWidthNumber 2 n}") (lib.range 1 expectedSlots);
   transports = lib.unique (map (name: hosts.${environments.${name}.host}.transport) slots);
+  providerOf = name: hosts.${environments.${name}.host}.provider;
+  # Mac runners: the ones Orchard schedules, which Softnet can fence.
+  macSlots = lib.filter (
+    name: providerOf name != null && (providerOf name).extension == "workenv.orchard"
+  ) slots;
+  fenced = name: ((providerOf name).config.network.isolated or false) == true;
   binders = lib.filter (name: identityOf environments.${name} != null) names;
 
   strayKeys = lib.concatMap (
@@ -156,6 +162,35 @@ let
   );
   poolRefused = args: lib.length (failures (pool args)) > poolBaseline;
 
+  # The fence, tried in the direction that should fail. One Orchard host with a
+  # well-formed fence is the baseline, so each probe varies only the fence.
+  fenceProbe =
+    network:
+    evaluate [
+      ../default.nix
+      {
+        workenv = {
+          orchard.enable = true;
+          hosts.probe = {
+            address = null;
+            transport = null;
+            provider = {
+              extension = "workenv.orchard";
+              config = { inherit network; };
+            };
+            system = pkgs.stdenv.hostPlatform.system;
+          };
+        };
+      }
+    ];
+  fenceBaseline = lib.length (
+    failures (fenceProbe {
+      isolated = true;
+      allow = [ "192.168.0.0/24" ];
+    })
+  );
+  fenceRefused = network: lib.length (failures (fenceProbe network)) > fenceBaseline;
+
   # What the shipped fleet is allowed to fail. Not a hardcoded count and not a
   # message match: the same module set, with a pool known to be well-formed,
   # evaluated independently. Both carry `rust.enable`'s toolchain assertion,
@@ -205,6 +240,10 @@ assert lib.all (name: hosts.${environments.${name}.host}.transport != null) slot
 assert lib.length transports > 1;
 # Nothing the fleet declares breaks a module assertion.
 assert lib.length (failures fleet) <= allowedFailures;
+# Every Mac runner is fenced from the host side. Counted non-empty first, so a
+# pool that lost its Orchard segment cannot pass this by having nothing to check.
+assert macSlots != [ ];
+assert lib.all fenced macSlots;
 # --- the guard ------------------------------------------------------------
 # A configless binding: the shape every environment in this fleet had, which
 # evaluated cleanly and left the adapter inert.
@@ -253,8 +292,23 @@ assert poolRefused {
   macFirst = 5;
   macLast = 8;
 };
+# A misspelled key, which the adapter would refuse only at create time.
+assert fenceRefused { isolate = true; };
+# A hostname, which Softnet cannot express: it filters addresses.
+assert fenceRefused {
+  isolated = true;
+  allow = [ "github.com" ];
+};
+# A prefix longer than an IPv4 address.
+assert fenceRefused {
+  isolated = true;
+  block = [ "10.0.0.0/33" ];
+};
 {
   slotsCarryTheirProfile = true;
+  macRunnersFenced = true;
+  fenceRefusesEachDefect = true;
+  macRunners = lib.length macSlots;
   noBindingWithoutAProfile = true;
   guardRefusesEachDefect = true;
   poolIsContiguous = true;

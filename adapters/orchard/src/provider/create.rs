@@ -2,6 +2,7 @@
 use serde_json::{Map, Value, json};
 
 use super::client::Cluster;
+use super::network;
 use super::ready::{self, Clock};
 
 /// The slot every Tart guest occupies on a worker.
@@ -22,7 +23,15 @@ pub(super) struct Spec {
 /// The guest is named for the environment, not for where it lands. Placement is
 /// the scheduler's business; an identity that changed with the worker would make
 /// the receipt unable to find its own guest after a reschedule.
-pub(super) fn spec(environment: &str, system: &str, config: &Value, input: &Value) -> Spec {
+///
+/// # Errors
+/// Refuses a malformed network fence rather than creating the guest without it.
+pub(super) fn spec(
+    environment: &str,
+    system: &str,
+    config: &Value,
+    input: &Value,
+) -> Result<Spec, String> {
     let read = |field: &str| setting(config, input, field);
     let mut body = Map::new();
     body.insert("name".into(), json!(environment));
@@ -64,13 +73,16 @@ pub(super) fn spec(environment: &str, system: &str, config: &Value, input: &Valu
     if let Some(labels) = read("labels") {
         body.insert("labels".into(), labels);
     }
+    if let Some(fence) = read("network") {
+        body.extend(network::softnet_fields(&fence)?);
+    }
     // The lease needs no label. The guest is named for its environment and the
     // controller records created_at, so `reap` has everything it needs from
     // live cluster state plus the lease declared on the binding.
-    Spec {
+    Ok(Spec {
         name: environment.to_owned(),
         body: Value::Object(body),
-    }
+    })
 }
 
 /// Split a Nix system string into the arch and os names Orchard expects.

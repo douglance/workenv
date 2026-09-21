@@ -41,10 +41,46 @@ decide from what the command *printed*. An empty inventory therefore reads as
 DIRTY, not as a guest that happens to hold nothing --
 `provisioning/tests/identity-isolation` covers exactly that case.
 
+## The network fence
+
+Identity isolation says what a runner *holds*. The fence says what it can
+*reach*, and it exists because of who runs inside: the agent has passwordless
+sudo, is a Nix trusted user, and is started with permission prompts off. A
+firewall configured inside the guest is therefore one `nft flush ruleset` away
+from gone.
+
+So the fence is not inside the guest. Mac runners are created with Softnet
+isolation (`network.isolated` on the Orchard binding in `presets/pool.nix`),
+which Tart enforces as a packet filter on the worker Mac.
+
+| An isolated runner can reach | It cannot reach |
+|---|---|
+| Globally routable IPv4 addresses: GitHub, package caches, model APIs | The LAN |
+| Its host Mac's bridge address, which is where its DNS comes from | Other runners, on any Mac |
+| | Non-routable ranges, including a tailnet's `100.64.0.0/10` |
+
+What it does **not** give, stated so nobody reads more into it:
+
+- **No hostname allowlist.** Softnet filters addresses, so "only GitHub and the
+  model APIs" cannot be expressed. `allow` and `block` take IPv4 CIDRs; the
+  longest prefix wins, and a prefix both allowed and blocked is blocked.
+- **Not the host Mac's own services.** The bridge address is allowed so DNS
+  works, which means anything on the hosting Mac that listens on all interfaces
+  is reachable from its runners. Bind host services to loopback.
+- **Nothing on cloud runners.** exe.dev offers no host-side filter this repository
+  knows of, so cloud runners are unfenced. `environment status` reports that
+  rather than implying otherwise.
+
+Both the adapter and module evaluation refuse a malformed fence -- an unknown
+key, a hostname, an IPv6 range -- instead of creating the guest without it,
+because the failure worth preventing is a runner whose manifest says fenced and
+which is not. The Orchard inventory reports each guest's fence as the controller
+holds it, not as it was requested.
+
 ## Tests
 
-- `modules/tests/fleet-slots.nix` -- the pool's shape, plus five probes that
-  build configurations the guards must refuse.
+- `modules/tests/fleet-slots.nix` -- the pool's shape, that every Mac runner is
+  fenced, and probes that build configurations the guards must refuse.
 - `provisioning/tests/identity-isolation` -- fifteen cases, most of which must
   fail rather than pass.
 - `provisioning/tests/wkv-routing` -- a repository reaches the fleet whose

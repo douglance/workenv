@@ -36,6 +36,7 @@ mod inventory;
 #[cfg(test)]
 #[path = "provider/lifecycle_tests.rs"]
 mod lifecycle_tests;
+mod network;
 mod ready;
 mod reap;
 #[cfg(test)]
@@ -116,12 +117,15 @@ fn provision<C: Cluster>(
     clock: &dyn ready::Clock,
     provisioned: &dyn Fn(&str) -> bool,
 ) -> AdapterResponse {
-    let spec = create::spec(
+    let spec = match create::spec(
         &request.target.environment,
         &request.target.system,
         &request.config,
         &request.input,
-    );
+    ) {
+        Ok(spec) => spec,
+        Err(error) => return failed(request, &error),
+    };
     match create::run(cluster, &spec, clock, provisioned) {
         // Already running is Ready, not Changed: re-running create must not
         // report a change it did not make, or every apply looks like a rebuild.

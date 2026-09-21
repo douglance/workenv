@@ -110,6 +110,14 @@ let
   # every worker. `lease_seconds` is deliberately absent -- it is accepted by
   # create's schema and discarded by its code, so declaring one would read as an
   # expiry policy that does not exist. Expiry lives in `reap`.
+  #
+  # `network.isolated` fences every Mac runner from the host side. The agent in a
+  # runner has passwordless sudo and runs with permission prompts off, so a rule
+  # inside the guest is a rule it can delete; Softnet runs on the worker Mac and
+  # it cannot. Isolated, a runner reaches the public internet and its host's
+  # bridge address -- which is where DNS comes from -- and nothing else: not the
+  # LAN, not the other runners, not the tailnet. What it does NOT stop is written
+  # down in docs/identity-isolation.md.
   orchardBinding = {
     extension = "workenv.orchard";
     config = {
@@ -117,6 +125,7 @@ let
       cpu = 4;
       memory = 8192;
       startup_script = setupScript;
+      network.isolated = true;
     };
   };
 
