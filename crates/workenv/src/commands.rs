@@ -54,14 +54,26 @@ const NEXT_WHEN_MISSING: &str = concat!(
 /// unchanged; what changes is that it says something.
 fn diagnose(globals: &Value) -> Result<Value> {
     let prerequisites = prerequisites::report();
+    let configuration = configuration(globals);
     if !prerequisites::satisfied(&prerequisites) {
         return Ok(json!({
             "ok": false,
+            "configuration": configuration,
             "prerequisites": prerequisites,
             "next": NEXT_WHEN_MISSING,
         }));
     }
     let mut diagnosis = context::controller(globals)?.doctor()?;
+    diagnosis["configuration"] = configuration;
     diagnosis["prerequisites"] = prerequisites;
     Ok(diagnosis)
+}
+
+/// Which configuration root this command would use, and why. Answered without
+/// devenv, so it is there even when nothing else can be.
+fn configuration(globals: &Value) -> Value {
+    match context::resolve(globals) {
+        Ok((root, chosen_by)) => json!({ "root": root, "chosen_by": chosen_by }),
+        Err(error) => json!({ "root": null, "error": format!("{error:#}") }),
+    }
 }
