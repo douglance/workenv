@@ -61,7 +61,9 @@ fn run(input: &TypedContext<Args, Options, ()>) -> Result<Value> {
     })
 }
 
-/// Read until ready or out of time, and say which it was.
+/// Read until ready or out of time, and say which it was -- and what changed on
+/// the way, which is AX's `ax watch`: a wait that goes silent for minutes and
+/// then answers says nothing about which part took the time.
 ///
 /// Time is passed in so the loop can be tested without waiting.
 fn wait_until_ready(
@@ -71,17 +73,66 @@ fn wait_until_ready(
     pause: &dyn Fn(),
 ) -> Result<Value> {
     let mut report = read()?;
+    let mut transitions = Vec::new();
     while !is_ready(&report) && elapsed() < timeout {
         pause();
-        report = read()?;
+        let next = read()?;
+        for change in changes(&report, &next, elapsed()) {
+            announce(&change);
+            transitions.push(change);
+        }
+        report = next;
     }
     let ready = is_ready(&report);
     report["waited"] = json!({
         "ready": ready,
         "seconds": elapsed(),
         "timeout_seconds": timeout,
+        "transitions": transitions,
     });
     Ok(report)
+}
+
+/// Every condition whose status differs between two reports.
+fn changes(before: &Value, after: &Value, at: u64) -> Vec<Value> {
+    let status_in = |report: &Value, kind: &Value| {
+        report["conditions"]
+            .as_array()
+            .and_then(|all| all.iter().find(|c| &c["type"] == kind))
+            .map_or(Value::Null, |c| c["status"].clone())
+    };
+    after["conditions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|condition| status_in(before, &condition["type"]) != condition["status"])
+        .map(|condition| {
+            json!({
+                "type": condition["type"],
+                "from": status_in(before, &condition["type"]),
+                "to": condition["status"],
+                "reason": condition["reason"],
+                "at_seconds": at,
+            })
+        })
+        .collect()
+}
+
+/// Show a change as it happens, to a person watching and to nobody else: the
+/// report is the record, and stderr is not part of it.
+fn announce(change: &Value) {
+    use std::io::IsTerminal as _;
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "  {}s  {} {} -> {}  ({})",
+            change["at_seconds"],
+            change["type"].as_str().unwrap_or("?"),
+            change["from"].as_str().unwrap_or("?"),
+            change["to"].as_str().unwrap_or("?"),
+            change["reason"].as_str().unwrap_or("")
+        );
+    }
 }
 
 /// Whether the report's `Ready` condition is true.

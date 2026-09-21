@@ -84,7 +84,9 @@ than inside the first step's data:
 
 `workenv environment status dev --wait-ready true --timeout 300` re-reads status
 until `Ready` is true or the timeout passes, then returns the last report with
-a `waited` summary. It only reads: it never creates or applies, so it does not
+a `waited` summary. The summary lists every condition that changed on the way
+and when, and in a terminal each change is also shown as it happens, so a slow
+wait says which part took the time. It only reads: it never creates or applies, so it does not
 replace a second `up` after a pending one.
 
 Apply prepares the target directory and declared project checkout, realizes its selected devenv shell and
