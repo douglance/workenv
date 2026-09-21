@@ -123,7 +123,7 @@ impl Executor for ApocExecutor {
     fn execute(&self, spec: ExecutionSpec) -> Result<ExecutionOutput> {
         let staged = stage_if_needed(&self.root, &spec)?;
         let mut command = staged.command_spec();
-        command.executable = resolve_executable(&command.executable)?;
+        command.executable = crate::execution_path::resolve_executable(&command.executable)?;
         let mut output = run_execution(&self.root, &command)?;
         if output.execution_id.is_empty() {
             bail!("APoC execution returned no durable ID");
@@ -239,60 +239,6 @@ fn private_new_file(path: &Path) -> std::io::Result<fs::File> {
         options.mode(0o600);
     }
     options.open(path)
-}
-
-/// Used when the process has no `PATH`, which is how `APoC` launches workenv.
-const DEFAULT_UNIX_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin";
-
-/// Where an executable would be found, or nothing when it is absent. A caller
-/// reporting on the host wants the absence as a value, not as an error message
-/// it has to parse.
-#[must_use]
-pub fn locate_executable(executable: &str) -> Option<String> {
-    resolve_executable(executable).ok()
-}
-
-pub(crate) fn resolve_executable(executable: &str) -> Result<String> {
-    resolve_on_path(
-        executable,
-        std::env::var_os("PATH").filter(|value| !value.is_empty()),
-    )
-}
-
-fn default_search_path() -> std::ffi::OsString {
-    default_search_path_for(std::env::var_os("HOME"))
-}
-
-/// The home directory is a parameter so the fallback can be exercised against a
-/// directory the test builds. Reading `HOME` inside the rule left the only test
-/// of it asking the host for a real `apoc` and skipping the assertion when the
-/// host had none -- green on this developer's Mac, red on a runner, and proof of
-/// nothing either way.
-fn default_search_path_for(home: Option<std::ffi::OsString>) -> std::ffi::OsString {
-    let mut path = DEFAULT_UNIX_PATH.to_owned();
-    if let Some(home) = home {
-        path.push(':');
-        path.push_str(&Path::new(&home).join(".local/bin").to_string_lossy());
-    }
-    path.into()
-}
-
-pub(crate) fn resolve_on_path(
-    executable: &str,
-    path_var: Option<std::ffi::OsString>,
-) -> Result<String> {
-    let path = Path::new(executable);
-    if path.is_absolute() || executable.contains(std::path::MAIN_SEPARATOR) {
-        return Ok(executable.to_owned());
-    }
-    let path_var = path_var.unwrap_or_else(default_search_path);
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(executable);
-        if candidate.is_file() {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
-    }
-    bail!("executable {executable} was not found in PATH");
 }
 
 #[cfg(test)]

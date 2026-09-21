@@ -27,7 +27,7 @@ pub(super) fn observe_execution(
 }
 
 fn run_code(root: &Path, argv: &[String]) -> Result<Value> {
-    let apoc = crate::execution::resolve_executable("apoc")?;
+    let apoc = crate::execution_path::resolve_executable("apoc")?;
     let output = Command::new(apoc)
         .args(argv)
         .current_dir(root)
