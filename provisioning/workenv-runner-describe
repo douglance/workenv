@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Print the description a runner carries of itself, as JSON.
+#
+#   workenv-runner-describe --environment <name> --profile <name> [--describe <json>]
+#
+# The seed installs this at ~/.workenv/runner.json so the agent inside can read
+# its own limits -- which identity it holds, which repository it was given,
+# whether the host fences it, whether it was started unattended -- instead of
+# discovering them by failing. It is AX's metadata endpoint without a server: a
+# runner is disposable, so a file written at seed time is as current as it needs
+# to be.
+#
+# It must never carry a secret, because it is meant to be read. Two guards, not
+# one: the fields are a fixed list, so nothing arrives by accident, and before
+# printing, every long value in the profile's credential files is searched for in
+# the output, so something that arrived on purpose is refused too.
+set -euo pipefail
+
+PROFILES_DIR="${WORKENV_PROFILES_DIR:-$HOME/.config/workenv/profiles}"
+ENVIRONMENT=""
+PROFILE=""
+DESCRIBE="{}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --environment) ENVIRONMENT="${2:?--environment needs a name}"; shift 2 ;;
+    --profile)     PROFILE="${2:?--profile needs a name}"; shift 2 ;;
+    --describe)    DESCRIBE="${2:?--describe needs a JSON object}"; shift 2 ;;
+    *) echo "workenv-runner-describe: unknown option $1" >&2; exit 1 ;;
+  esac
+done
+[ -n "$ENVIRONMENT" ] && [ -n "$PROFILE" ] \
+  || { echo "usage: workenv-runner-describe --environment <name> --profile <name> [--describe <json>]" >&2; exit 1; }
+
+exec python3 - "$ENVIRONMENT" "$PROFILE" "$DESCRIBE" "$PROFILES_DIR/$PROFILE" <<'PY'
+import datetime, json, os, re, sys
+
+environment, profile, provided_text, profile_dir = sys.argv[1:5]
+
+# What a caller may state about a runner. Everything else is refused rather than
+# dropped, so a misspelled field is a loud error and not a silently missing fact.
+ALLOWED = {"repository", "branch", "backend", "directory", "fence", "agent"}
+try:
+    provided = json.loads(provided_text)
+except ValueError as error:
+    sys.exit(f"workenv-runner-describe: --describe is not JSON: {error}")
+if not isinstance(provided, dict):
+    sys.exit("workenv-runner-describe: --describe must be a JSON object")
+unknown = sorted(set(provided) - ALLOWED)
+if unknown:
+    print(f"workenv-runner-describe: refusing unknown field(s) {unknown}; allowed: {sorted(ALLOWED)}", file=sys.stderr)
+    sys.exit(2)
+
+doc = {key: provided[key] for key in sorted(ALLOWED & set(provided))}
+doc["environment"] = environment
+doc["profile"] = profile
+doc["seeded_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+text = json.dumps(doc, indent=2, sort_keys=True)
+
+# The credential files the seed installs, profile-relative. Not .gitconfig: it
+# holds URLs and an email that a repository or branch may legitimately share.
+CREDENTIALS = [".claude/.credentials.json", ".codex/auth.json", ".grok/auth.json", ".gh/hosts.yml"]
+
+def secret_values(path):
+    """Every long scalar in a credential file: tokens, keys, refresh tokens."""
+    try:
+        raw = open(path, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return []
+    try:
+        values = []
+        def walk(node):
+            if isinstance(node, dict):
+                for item in node.values():
+                    walk(item)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+            elif isinstance(node, str):
+                values.append(node)
+        walk(json.loads(raw))
+    except ValueError:
+        # hosts.yml is YAML; its secrets are the values after "key: ".
+        values = re.findall(r":\s*(\S+)\s*$", raw, flags=re.M)
+    return [value for value in values if len(value) >= 16]
+
+for relative in CREDENTIALS:
+    for value in secret_values(os.path.join(profile_dir, relative)):
+        if value in text:
+            print(f"workenv-runner-describe: refusing: the description contains a value from {relative}", file=sys.stderr)
+            sys.exit(3)
+
+print(text)
+PY

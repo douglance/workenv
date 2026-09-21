@@ -135,6 +135,8 @@ print(profile)
 print(directory)
 print(agent.get("command", ""))
 print("true" if agent.get("unattended") is True else "false")
+network = ((doc.get("provider") or {}).get("config") or {}).get("network") or {}
+print("host-isolated" if network.get("isolated") is True else "none")
 '
 }
 
@@ -253,6 +255,7 @@ SLOT="$(comm -23 <(echo "$SLOTS" | cut -f1) <(taken "$PREFIX") | head -1)"
   read -r WORKDIR
   read -r DECLARED_AGENT
   read -r UNATTENDED
+  read -r FENCE
 } < <(slot_facts "$ROOT" "$SLOT")
 [ -n "$IDENTITY" ] || die "runner $SLOT declares no identity profile; the fleet's manifest is the place to fix that, not this script"
 [ -n "$BACKEND" ] || die "runner $SLOT names no provider this script can reach"
@@ -280,7 +283,18 @@ guest() { "$here/workenv-guest" "$BACKEND" "$SLOT" "$@"; }
 # private, and a clone attempted before the guest holds any credential fails on
 # authentication -- which reads as a broken remote rather than an unseeded guest.
 step "seed as $IDENTITY"
-"$here/workenv-seed" --via "$BACKEND" "$SLOT" --identity "$IDENTITY"
+# What the runner will tell its agent about itself. Built with python so every
+# value is JSON-quoted, whatever a branch name or remote contains.
+DESCRIPTION="$(python3 -c '
+import json, sys
+repository, branch, backend, directory, fence, command, unattended = sys.argv[1:8]
+print(json.dumps({
+    "repository": repository, "branch": branch, "backend": backend,
+    "directory": directory, "fence": fence,
+    "agent": {"command": command, "unattended": unattended == "true"},
+}))
+' "$CLONE_URL" "$BRANCH" "$BACKEND" "$WORKDIR" "$FENCE" "$AGENT_CMD" "$UNATTENDED")"
+"$here/workenv-seed" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" --describe "$DESCRIPTION"
 
 step "herdr server"
 "$here/workenv-herdr-ensure" --via "$BACKEND" "$SLOT" \

@@ -41,6 +41,25 @@ decide from what the command *printed*. An empty inventory therefore reads as
 DIRTY, not as a guest that happens to hold nothing --
 `provisioning/tests/identity-isolation` covers exactly that case.
 
+## A runner describes itself
+
+The seed installs `~/.workenv/runner.json`, so the agent inside can read its own
+limits rather than discover them by failing: the environment, the identity
+profile, the repository and branch, whether the host fences it, and the agent it
+was started as and whether that agent runs unattended.
+
+It is meant to be read, so it must never carry a secret, and two things keep it
+that way. The fields are a fixed list (`provisioning/workenv-runner-describe`),
+so nothing arrives by accident. And before it is written, every long value in the
+profile's credential files is searched for in it, so something passed in on
+purpose is refused and the seed stops.
+
+The wipe removes it with everything else. The identity check reads it back: a
+runner whose description names another profile or another runner is DIRTY,
+because it would be telling its agent something false about the one thing the
+check establishes. A runner with no description is judged on its identity alone,
+since the proof does not rest on it.
+
 ## The network fence
 
 Identity isolation says what a runner *holds*. The fence says what it can

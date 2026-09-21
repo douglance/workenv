@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# A runner's self-description says who and what it is, and carries no secret.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DESCRIBE="$here/../workenv-runner-describe"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+# A profile holding the shapes real credential files have: nested JSON with
+# long tokens, and gh's YAML.
+profile="$tmp/profiles/personal"
+mkdir -p "$profile/.claude" "$profile/.codex" "$profile/.gh"
+printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-AAAAAAAAAAAAAAAAAAAA","refreshToken":"sk-ant-ort01-BBBBBBBBBBBBBBBBBBBB"}}' \
+  > "$profile/.claude/.credentials.json"
+printf '{"tokens":{"access_token":"eyJhbGciOiJSUzI1NiJ9.CCCCCCCCCCCCCCCC"}}' > "$profile/.codex/auth.json"
+printf 'github.com:\n    oauth_token: gho_DDDDDDDDDDDDDDDDDDDDDDDD\n    user: someone\n' > "$profile/.gh/hosts.yml"
+
+run() { WORKENV_PROFILES_DIR="$tmp/profiles" "$DESCRIBE" --environment wkv-r09 --profile personal "$@"; }
+field() { python3 -c 'import json,sys;d=json.load(sys.stdin);print(json.dumps(d.get(sys.argv[1])))' "$1"; }
+
+printf '\nrunner describe\n'
+out="$(run --describe '{"repository":"https://github.com/org/repo.git","branch":"main","fence":"host-isolated","agent":{"command":"claude","unattended":true}}')"
+check "names the runner it describes" '"wkv-r09"' "$(printf '%s' "$out" | field environment)"
+check "names the identity it holds"   '"personal"' "$(printf '%s' "$out" | field profile)"
+check "carries what it was told"      '"https://github.com/org/repo.git"' "$(printf '%s' "$out" | field repository)"
+check "carries the declared agent"    'true' "$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["agent"]["unattended"]))')"
+
+# The secrets are found here independently -- every long scalar in the fixture
+# files, read by this test -- rather than by asking the script what it thinks a
+# secret is. A check whose two sides came from one source would pass on a
+# script that looked for nothing.
+leaked="$(python3 - "$profile" "$out" <<'PY'
+import json, os, re, sys
+root, out = sys.argv[1], sys.argv[2]
+found = []
+for rel in [".claude/.credentials.json", ".codex/auth.json", ".gh/hosts.yml"]:
+    raw = open(os.path.join(root, rel)).read()
+    for value in re.findall(r"[A-Za-z0-9_.\-]{16,}", raw):
+        if value in out:
+            found.append(value)
+print(len(found))
+PY
+)"
+check "carries none of the profile's credential values" 0 "$leaked"
+
+set +e
+run --describe '{"repository":"x","token":"y"}' >/dev/null 2>&1; unknown=$?
+run --describe '{"repository":"https://x.invalid/?t=gho_DDDDDDDDDDDDDDDDDDDDDDDD"}' >/dev/null 2>&1; smuggled=$?
+run --describe '{"agent":{"command":"claude --api-key sk-ant-oat01-AAAAAAAAAAAAAAAAAAAA"}}' >/dev/null 2>&1; nested=$?
+run --describe '["not","an","object"]' >/dev/null 2>&1; shape=$?
+set -e
+check "an unknown field is refused, not dropped"            2 "$unknown"
+check "a credential value passed in on purpose is refused"  3 "$smuggled"
+check "a credential value buried in the agent is refused"   3 "$nested"
+check "a description that is not an object is refused"      1 "$shape"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

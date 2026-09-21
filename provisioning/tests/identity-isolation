@@ -90,7 +90,14 @@ seed() { # $1 = guest dir, $2 = profile -- what workenv-seed installs
   for rc in .bashrc .profile; do
     printf '# >>> workenv identity >>>\nset -a; . "$HOME/.workenv-identity"; set +a\n# <<< workenv identity <<<\n' > "$1/$rc"
   done
+  describe "$1" slot "$2"
   true
+}
+
+describe() { # $1 = guest dir, $2 = runner, $3 = profile -- the real description script
+  mkdir -p "$1/.workenv"
+  WORKENV_PROFILES_DIR="$profiles" "$here/../workenv-runner-describe" \
+    --environment "$2" --profile "$3" > "$1/.workenv/runner.json"
 }
 
 verdict() { # $1 = guest dir, $2 = identity, $3 = backend (default exedev)
@@ -141,10 +148,25 @@ seed "$guest" work
 for rc in .bashrc .profile; do : > "$guest/$rc"; done
 check "a selection nothing sources is caught" DIRTY "$(verdict "$guest" work)"
 
+# The description the agent reads must match what the guest actually is. A
+# runner that tells its agent "you are personal" while holding work's login is
+# misleading the agent about exactly what this check exists to establish.
+seed "$guest" work
+describe "$guest" slot personal
+check "a description naming the other identity is caught" DIRTY "$(verdict "$guest" work)"
+seed "$guest" work
+describe "$guest" wkv-r99 work
+check "a description naming another runner is caught" DIRTY "$(verdict "$guest" work)"
+# Absent is not a failure: the identity proof does not rest on it, and a guest
+# seeded before descriptions existed is no less isolated.
+seed "$guest" work
+rm -f "$guest/.workenv/runner.json"
+check "a guest with no description is judged on its identity" CLEAN "$(verdict "$guest" work)"
+
 # And the wipe actually removes what the checker looks for.
 seed "$guest" personal
 GUEST="$guest" PATH="$tmp/bin:$PATH" "$WIPE" --exedev slot --quiet
-remaining="$(find "$guest" -type f \( -name '.credentials.json' -o -name 'auth.json' -o -name 'hosts.yml' -o -name '.gitconfig' -o -name '.workenv-identity' \) | wc -l | tr -d ' ')"
+remaining="$(find "$guest" -type f \( -name '.credentials.json' -o -name 'auth.json' -o -name 'hosts.yml' -o -name '.gitconfig' -o -name '.workenv-identity' -o -name 'runner.json' \) | wc -l | tr -d ' ')"
 check "wipe leaves no credential path behind" 0 "$remaining"
 check "wipe removes the sourcing block too"   0 "$(grep -l 'workenv identity' "$guest"/.bashrc "$guest"/.profile 2>/dev/null | wc -l | tr -d ' ')"
 # A wiped guest holds nothing, so it belongs to nobody -- which must read as

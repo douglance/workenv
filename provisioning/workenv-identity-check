@@ -76,6 +76,9 @@ observed="$(remote '
   for rc in .bashrc .profile; do
     grep -q "workenv identity" "$HOME/$rc" 2>/dev/null && printf "SOURCED %s\n" "$rc"
   done
+  # The runner description is secret-free by construction, so it may cross in
+  # full; base64 keeps it on one line through the relay.
+  [ -f "$HOME/.workenv/runner.json" ] && printf "DESCRIPTION %s\n" "$(base64 < "$HOME/.workenv/runner.json" | tr -d "\n")"
   true
 ')"
 
@@ -164,6 +167,35 @@ if [ -n "$declared_anthropic" ]; then
     printf '  %-30s MISMATCH -- %s expects %s\n' "anthropic account" "$IDENTITY" "$declared_anthropic"
     fail=1
   fi
+fi
+# What the runner tells its agent about itself. Absent is noted, not failed: the
+# identity proof above does not depend on it, and a guest seeded before it
+# existed is no less isolated. Present and wrong is a failure, because an agent
+# that reads "you are personal on wkv-r09" and is not is being misled about the
+# one thing this check exists to establish.
+description="$(printf '%s\n' "$observed" | awk '$1=="DESCRIPTION" {print $2}')"
+if [ -n "$description" ]; then
+  described="$(python3 -c '
+import base64, json, sys
+try:
+    d = json.loads(base64.b64decode(sys.argv[1]))
+    print(d.get("profile", "-"), d.get("environment", "-"))
+except Exception:
+    print("- -")
+' "$description")"
+  described_profile="${described%% *}"
+  described_env="${described#* }"
+  printf '  %-30s %s on %s\n' "runner description" "$described_profile" "$described_env"
+  if [ "$described_profile" != "$IDENTITY" ]; then
+    printf '  %-30s MISMATCH -- describes itself as %s\n' "runner description" "$described_profile"
+    fail=1
+  fi
+  if [ -n "$SLOT" ] && [ "$described_env" != "$SLOT" ]; then
+    printf '  %-30s MISMATCH -- describes itself as runner %s\n' "runner description" "$described_env"
+    fail=1
+  fi
+else
+  printf '  %-30s absent\n' "runner description"
 fi
 # A guest holding nothing is unseeded, not clean. Without this, a profile tree
 # that exists but was never logged in produced a guest with no credential at all

@@ -34,7 +34,7 @@ done
 
 # One list, used by the wipe and by the check that follows it, so a path added
 # to one cannot be forgotten by the other.
-PATHS='.claude/.credentials.json .codex/auth.json .grok/auth.json .gitconfig .git-credentials .netrc .config/gh/hosts.yml .config/gh/config.yml .workenv-identity'
+PATHS='.claude/.credentials.json .codex/auth.json .grok/auth.json .gitconfig .git-credentials .netrc .config/gh/hosts.yml .config/gh/config.yml .workenv-identity .workenv/runner.json'
 
 # `rm -f` on each named path, then report anything still standing. The report is
 # the point: a wipe that silently removed nothing looks identical to one that

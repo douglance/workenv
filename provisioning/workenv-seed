@@ -2,8 +2,8 @@
 # Seed a provisioned guest with one identity, plus the operator's tooling.
 # Runs on the CONTROLLER. Secrets stream over ssh and are never printed.
 #
-#   workenv-seed --via <exedev|orchard> <vm> --identity <profile>
-#   workenv-seed <ssh-target>               --identity <profile>
+#   workenv-seed --via <exedev|orchard> <vm> --identity <profile> [--describe <json>]
+#   workenv-seed <ssh-target>               --identity <profile> [--describe <json>]
 #
 # Two kinds of material, and the difference is the whole point of the script:
 #
@@ -35,9 +35,11 @@ BACKEND=""
 SLOT=""
 TARGET=""
 IDENTITY=""
+DESCRIBE="{}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --describe) DESCRIBE="${2:?--describe needs a JSON object}"; shift 2 ;;
     --via)      BACKEND="${2:?--via needs exedev or orchard}"; SLOT="${3:?--via needs a vm name}"; shift 3 ;;
     --exedev)   BACKEND=exedev; SLOT="${2:?--exedev needs a vm name}"; shift 2 ;;
     --identity) IDENTITY="${2:?--identity needs a profile name}"; shift 2 ;;
@@ -74,6 +76,15 @@ identity_marker() {
   anthropic="$(spec_field anthropic_profile)"
   [ -n "$anthropic" ] && printf 'ANTHROPIC_PROFILE=%s\n' "$anthropic"
   return 0
+}
+
+# The runner's description of itself, for the agent inside to read. Built by
+# its own script so the no-secrets rule is tested where it is enforced; a refusal
+# there stops the seed, because a description that would carry a credential is
+# a caller passing one in, and the guest must not receive it.
+describe_runner() { # $1 = environment name
+  "$here/workenv-runner-describe" --environment "$1" --profile "$IDENTITY" --describe "$DESCRIBE" \
+    || die "refusing to seed: the runner description was rejected (see above)"
 }
 
 # Sourced from both, because a relay exec gets .bashrc and a login shell gets
@@ -153,6 +164,8 @@ if [ -n "$BACKEND" ]; then
   done < <(identity_files)
 
   identity_marker | put_bytes ".workenv-identity"
+  description="$(describe_runner "$SLOT")"
+  printf '%s\n' "$description" | put_bytes ".workenv/runner.json"
   # Idempotent: the block is removed before it is added, so reseeding a slot
   # cannot leave two of them, the second naming the previous tenant.
   guest 'for rc in .bashrc .profile; do
@@ -278,6 +291,9 @@ identity_marker | "${SSH[@]}" "$TARGET" 'cat > ~/.workenv-identity && chmod 600 
   done'
 printf '%s\n' "$MARKER_BLOCK" | "${SSH[@]}" "$TARGET" 'tee -a ~/.bashrc >> ~/.profile'
 printf '  %-28s installed\n' ".workenv-identity"
+description="$(describe_runner "$TARGET")"
+printf '%s\n' "$description" | "${SSH[@]}" "$TARGET" 'install -d -m 700 ~/.workenv && cat > ~/.workenv/runner.json && chmod 600 ~/.workenv/runner.json'
+printf '  %-28s installed\n' ".workenv/runner.json"
 
 log "seed summary"
 "${SSH[@]}" "$TARGET" 'for p in .claude/skills .claude/commands .codex/skills .agents/skills; do
