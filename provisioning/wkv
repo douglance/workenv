@@ -7,6 +7,8 @@
 #   wkv --verify   <slot>         prove the guest holds one identity and no other
 #   wkv --list                    every live workenv, then free counts
 #   wkv --jump     [slot]         ssh into a taken guest (picks if omitted)
+#   wkv --park     <slot> [hours] keep a runner exactly as it is, spared by the sweep
+#   wkv --resume   <slot>         re-prove its identity and attach its agent again
 #
 # Lives here rather than as a `workenv` subcommand: AGENTS.md forbids adding
 # command workflows to the CLI, and this is exactly that -- an opinionated
@@ -34,6 +36,11 @@ done
 here="$(cd "$(dirname "$src")" && pwd)"
 WORKENV="${WORKENV_BIN:-workenv}"
 FLEETS_CONF="${WKV_FLEETS:-$HOME/.config/workenv/fleets.conf}"
+# Overridable so the park and resume paths can be tested against stubs; every
+# default is the script beside this one.
+CHECK="${WKV_IDENTITY_CHECK:-$here/workenv-identity-check}"
+SEED="${WKV_SEED:-$here/workenv-seed}"
+PARKED="${WKV_PARKED:-$here/workenv-parked}"
 step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
 die() { printf 'wkv: %s\n' "$*" >&2; exit 1; }
 
@@ -62,6 +69,16 @@ fleet_root_for_slot() {
   while IFS=$'\t' read -r _name root prefix _glob; do
     case "$slot" in
       "$prefix"*) (cd "$root" && pwd); return 0 ;;
+    esac
+  done < <(fleet_lines)
+  return 1
+}
+
+prefix_for_slot() {
+  local slot="$1" _name _root prefix _glob
+  while IFS=$'\t' read -r _name _root prefix _glob; do
+    case "$slot" in
+      "$prefix"*) printf '%s\n' "$prefix"; return 0 ;;
     esac
   done < <(fleet_lines)
   return 1
@@ -137,6 +154,7 @@ print(agent.get("command", ""))
 print("true" if agent.get("unattended") is True else "false")
 network = ((doc.get("provider") or {}).get("config") or {}).get("network") or {}
 print("host-isolated" if network.get("isolated") is True else "none")
+print(agent.get("resume", ""))
 '
 }
 
@@ -177,9 +195,79 @@ taken() { # $1 = prefix
   } | sort -u
 }
 
+# A tty for the agent, which is why this is not `workenv-guest`: that helper
+# exists for scripted commands and passes no -t. WKV_NO_ATTACH=1 stops here so a
+# claim or a resume can be verified without starting the agent.
+attach() { # $1 = backend, $2 = slot, $3 = checkout, $4 = agent command
+  if [ "${WKV_NO_ATTACH:-}" = 1 ]; then exit 0; fi
+  case "$1" in
+    exedev)  exec ssh -t -o BatchMode=yes exe.dev ssh "$2" \
+               "cd '$3' && devenv shell --from path:/opt/workenv/shells/default -- $4" ;;
+    orchard) exec "${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" ssh vm "$2" -- \
+               "cd '$3' && devenv shell --from path:/opt/workenv/shells/default -- $4" ;;
+  esac
+}
+
+# Keep a runner exactly as it is. Neither backend can stop a guest and start it
+# again -- Orchard treats "stopped" as terminal -- so a parked runner keeps
+# running: its disk, checkout, toolchain, login and background processes stay
+# put. What parking changes is the lease sweep, which would otherwise remove it
+# on the same schedule as an abandoned runner. The agent's own process ends when
+# its terminal disconnects; resuming starts it again on its saved conversation.
+park() { # $1 = slot, $2 = hours (optional)
+  local slot="$1" prefix record
+  prefix="$(prefix_for_slot "$slot")" || die "no fleet claims slot $slot"
+  taken "$prefix" | grep -qx "$slot" || die "runner $slot has no guest; there is nothing to park"
+  record="$("$PARKED" --park "$slot" ${2:+--hours "$2"})" || exit 1
+  printf 'parked %s until %s\n  resume:  wkv --resume %s\n  release: wkv --down %s\n' \
+    "$slot" "$(date -r "${record##*$'\t'}" 2>/dev/null || date -d "@${record##*$'\t'}")" "$slot" "$slot"
+}
+
+# Hand a parked runner back. Its identity is re-proved rather than assumed: it
+# kept its credentials while parked, and the profile may have been rotated or
+# replaced since. The check is non-destructive, so a runner that still matches is
+# attached untouched; one that does not is re-seeded and must then pass.
+resume() { # $1 = slot
+  local slot="$1" root prefix
+  root="$(fleet_root_for_slot "$slot")" || die "no fleet claims slot $slot"
+  prefix="$(prefix_for_slot "$slot")"
+  taken "$prefix" | grep -qx "$slot" || die "runner $slot has no guest left to resume"
+  {
+    read -r BACKEND; read -r IDENTITY; read -r WORKDIR
+    read -r DECLARED_AGENT; read -r UNATTENDED; read -r FENCE; read -r DECLARED_RESUME
+  } < <(slot_facts "$root" "$slot")
+  [ -n "$IDENTITY" ] || die "runner $slot declares no identity profile"
+  [ -n "$BACKEND" ] || die "runner $slot names no provider this script can reach"
+  AGENT_CMD="$(resolve_agent "$slot" "${DECLARED_RESUME:-$DECLARED_AGENT}" "$UNATTENDED")" || exit 1
+  echo "  $slot  resumed  as $IDENTITY  via $BACKEND"
+  echo "  agent  $AGENT_CMD"
+  step "verify isolation"
+  if ! "$CHECK" --via "$BACKEND" "$slot" --identity "$IDENTITY"; then
+    step "re-seed as $IDENTITY"
+    "$SEED" --via "$BACKEND" "$slot" --identity "$IDENTITY" --describe "$(python3 -c '
+import json, sys
+backend, directory, fence, command, unattended = sys.argv[1:6]
+print(json.dumps({"backend": backend, "directory": directory, "fence": fence,
+                  "agent": {"command": command, "unattended": unattended == "true"}}))
+' "$BACKEND" "$WORKDIR" "$FENCE" "$AGENT_CMD" "$UNATTENDED")"
+    "$CHECK" --via "$BACKEND" "$slot" --identity "$IDENTITY" \
+      || die "refusing to hand back a runner that holds another identity's credentials"
+  fi
+  "$PARKED" --unpark "$slot"
+  attach "$BACKEND" "$slot" "$WORKDIR" "$AGENT_CMD"
+}
+
 ensure_fleets_conf
 
 case "${1:-}" in
+  --park)
+    park "${2:?usage: wkv --park <slot> [hours]}" "${3:-}"
+    exit 0
+    ;;
+  --resume)
+    resume "${2:?usage: wkv --resume <slot>}"
+    exit 0
+    ;;
   --list)
     exec "$here/wkv-inventory" --list
     ;;
@@ -223,6 +311,7 @@ case "${1:-}" in
     # reused key, so a recycled one would report a teardown that never ran.
     wk "$root" environment destroy "$slot" --idempotency-key "wkv-down-$slot-$(date +%s)"
     "$here/workenv-herdr-register" --remove "$slot" >/dev/null 2>&1 || true
+    "$PARKED" --unpark "$slot" 2>/dev/null || true
     exit 0
     ;;
 esac
@@ -294,7 +383,7 @@ print(json.dumps({
     "agent": {"command": command, "unattended": unattended == "true"},
 }))
 ' "$CLONE_URL" "$BRANCH" "$BACKEND" "$WORKDIR" "$FENCE" "$AGENT_CMD" "$UNATTENDED")"
-"$here/workenv-seed" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" --describe "$DESCRIPTION"
+"$SEED" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" --describe "$DESCRIPTION"
 
 step "herdr server"
 "$here/workenv-herdr-ensure" --via "$BACKEND" "$SLOT" \
@@ -304,7 +393,7 @@ step "herdr server"
 # claim, and a claim checked only in a dedicated test run is a claim about the
 # test run.
 step "verify isolation"
-"$here/workenv-identity-check" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" \
+"$CHECK" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" \
   || die "refusing to hand over a guest that holds another identity's credentials"
 
 step "clone $NAME"
@@ -332,14 +421,6 @@ cat <<NOTE
   shell     devenv shell --from path:/opt/workenv/shells/default
 
   when finished:  wkv --down $SLOT
+  to keep it:     wkv --park $SLOT   (then: wkv --resume $SLOT)
 NOTE
-# A tty for the agent, which is why this is not `workenv-guest`: that helper
-# exists for scripted commands and passes no -t. WKV_NO_ATTACH=1 stops after
-# the NOTE so a claim can be verified without starting the agent.
-if [ "${WKV_NO_ATTACH:-}" = 1 ]; then exit 0; fi
-case "$BACKEND" in
-  exedev)  exec ssh -t -o BatchMode=yes exe.dev ssh "$SLOT" \
-             "cd '$WORKDIR' && devenv shell --from path:/opt/workenv/shells/default -- $AGENT_CMD" ;;
-  orchard) exec "${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" ssh vm "$SLOT" -- \
-             "cd '$WORKDIR' && devenv shell --from path:/opt/workenv/shells/default -- $AGENT_CMD" ;;
-esac
+attach "$BACKEND" "$SLOT" "$WORKDIR" "$AGENT_CMD"

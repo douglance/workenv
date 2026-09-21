@@ -263,6 +263,13 @@ let
         minLength = 1;
       };
       dry_run.type = "boolean";
+      # Runners parked in place, spared whatever their age. The lease measures age
+      # from creation, so a parked runner would otherwise go on the same schedule
+      # as an abandoned one.
+      keep = {
+        type = "array";
+        items.type = "string";
+      };
     };
   };
   reapOutput = {

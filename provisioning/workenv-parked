@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Which runners are parked in place, and until when.
+#
+#   workenv-parked --park <slot> [--hours N]   keep it running, spared by the sweep
+#   workenv-parked --unpark <slot>             hand it back to the lease clock
+#   workenv-parked --is-parked <slot>          exit 0 while its park is current
+#   workenv-parked --list                      "slot<TAB>until-epoch", current parks only
+#
+# A parked runner is not stopped -- neither Orchard nor exe.dev can stop a guest
+# and start it again (Orchard treats "stopped" as terminal) -- it is kept
+# running exactly as it is: its disk, its checkout, its toolchain, its login and
+# whatever it left running in the background. What parking changes is the lease
+# sweep, which measures age from creation and would otherwise remove a runner
+# kept on purpose on the same schedule as an abandoned one.
+#
+# One record per runner in one directory on the controller, read by the sweep,
+# `wkv` and the inventory alike, so "is this runner parked" has one answer.
+# A park always ends: an expired record is ignored, and the runner returns to
+# the lease clock, so a forgotten park cannot hold capacity forever.
+set -euo pipefail
+
+DIR="${WORKENV_PARKED_DIR:-$HOME/.config/workenv/parked}"
+DEFAULT_HOURS=72
+MAX_HOURS=168
+now="$(date -u +%s)"
+die() { printf 'workenv-parked: %s\n' "$*" >&2; exit 2; }
+
+# A slot names a file, so it is held to the pool's own naming: letters, digits
+# and dashes. Anything else could escape the directory.
+valid_slot() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "not a runner name: $1"; }
+
+until_of() { # $1 = slot -> epoch, or empty
+  local record="$DIR/$1"
+  [ -f "$record" ] || return 0
+  sed -n 's/^until=\([0-9][0-9]*\)$/\1/p' "$record" | head -1
+}
+
+current() { # $1 = slot -> exit 0 while parked
+  local until
+  until="$(until_of "$1")"
+  [ -n "$until" ] && [ "$until" -gt "$now" ]
+}
+
+case "${1:-}" in
+  --park)
+    slot="${2:?--park needs a runner name}"; valid_slot "$slot"; shift 2
+    hours="$DEFAULT_HOURS"
+    if [ "${1:-}" = --hours ]; then hours="${2:?--hours needs a number}"; fi
+    case "$hours" in ''|*[!0-9]*) die "--hours must be a whole number" ;; esac
+    [ "$hours" -ge 1 ] && [ "$hours" -le "$MAX_HOURS" ] \
+      || die "--hours must be between 1 and $MAX_HOURS; a park that never ends holds capacity forever"
+    install -d -m 700 "$DIR"
+    until=$((now + hours * 3600))
+    printf 'until=%s\n' "$until" > "$DIR/$slot"
+    printf '%s\t%s\n' "$slot" "$until"
+    ;;
+  --unpark)
+    slot="${2:?--unpark needs a runner name}"; valid_slot "$slot"
+    rm -f "$DIR/$slot"
+    ;;
+  --is-parked)
+    slot="${2:?--is-parked needs a runner name}"; valid_slot "$slot"
+    current "$slot"
+    ;;
+  --list)
+    [ -d "$DIR" ] || exit 0
+    for record in "$DIR"/*; do
+      [ -f "$record" ] || continue
+      slot="$(basename "$record")"
+      # An `if`, not `current && printf`: with the `&&` form, an expired last
+      # record left the loop -- and so the command -- exiting non-zero, and the
+      # sweep, which runs with pipefail, died before sweeping anything.
+      if current "$slot"; then printf '%s\t%s\n' "$slot" "$(until_of "$slot")"; fi
+    done
+    ;;
+  *) die "usage: workenv-parked --park <slot> [--hours N] | --unpark <slot> | --is-parked <slot> | --list" ;;
+esac

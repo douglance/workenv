@@ -36,6 +36,9 @@ import ./pool.nix {
   # `provisioning/wkv`, where nobody reviewing the fleet would see it.
   agent = {
     command = "claude --dangerously-skip-permissions";
+    # What `wkv --resume` starts on a parked runner: the same agent, continuing
+    # the conversation it saved to the runner's disk.
+    resume = "claude --dangerously-skip-permissions --continue";
     unattended = true;
   };
 }

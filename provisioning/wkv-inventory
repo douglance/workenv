@@ -97,8 +97,12 @@ list_all() {
       via=exedev
       if printf '%s\n' "$macs" | grep -qx "$slot"; then via=orchard; fi
       ident="$(printf '%s\n' "$table" | awk -F'\t' -v s="$slot" '$1==s {print $2; exit}')"
+      # A parked runner holds capacity on purpose; listing it as merely taken is
+      # how a park gets forgotten until its lease runs out.
+      state=taken
+      if "$here/workenv-parked" --is-parked "$slot" 2>/dev/null; then state=parked; fi
       printf '%-12s %-10s %-10s %-8s %s\n' \
-        "$slot" "$name" "${ident:-?}" "$via" taken
+        "$slot" "$name" "${ident:-?}" "$via" "$state"
       if [ "$via" = exedev ]; then
         "$here/workenv-herdr-register" "$slot" >/dev/null 2>&1 || true
       fi

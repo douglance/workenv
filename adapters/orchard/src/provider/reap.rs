@@ -24,18 +24,32 @@ pub(super) struct Swept {
     pub(super) skipped: Vec<Value>,
 }
 
+/// What one sweep is allowed to remove.
+pub(super) struct Policy<'a> {
+    pub(super) prefix: &'a str,
+    pub(super) lease_seconds: i64,
+    pub(super) now: DateTime<Utc>,
+    pub(super) dry_run: bool,
+    /// Guests to spare whatever their age: runners an operator parked in place.
+    /// The lease clock measures age from creation, so without this a parked
+    /// runner -- kept on purpose, holding someone's unfinished work -- is removed
+    /// on the same schedule as an abandoned one.
+    pub(super) keep: &'a [String],
+}
+
 /// Remove guests older than the lease whose name carries the prefix.
 ///
 /// A guest whose age cannot be read is skipped and reported, never reaped. An
 /// unreadable timestamp must not be treated as infinitely old, or one malformed
 /// record takes the fleet with it.
-pub(super) fn run<C: Cluster>(
-    cluster: &C,
-    prefix: &str,
-    lease_seconds: i64,
-    now: DateTime<Utc>,
-    dry_run: bool,
-) -> Result<Swept, String> {
+pub(super) fn run<C: Cluster>(cluster: &C, policy: &Policy) -> Result<Swept, String> {
+    let Policy {
+        prefix,
+        lease_seconds,
+        now,
+        dry_run,
+        keep,
+    } = *policy;
     let guests = cluster
         .collection("vms")
         .map_err(|error| format!("{error:#}"))?;
@@ -52,6 +66,10 @@ pub(super) fn run<C: Cluster>(
             continue;
         };
         if !name.starts_with(prefix) {
+            continue;
+        }
+        if keep.iter().any(|kept| kept == name) {
+            swept.kept.push(name.to_owned());
             continue;
         }
         let Some(candidate) = candidate(name, guest, now) else {
@@ -111,7 +129,20 @@ pub(super) fn answer<C: Cluster>(request: &AdapterRequest, cluster: &C) -> Adapt
     let dry_run = read("dry_run")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    match run(cluster, &prefix, lease, chrono::Utc::now(), dry_run) {
+    let keep: Vec<String> = read("keep")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| name.as_str().map(ToOwned::to_owned))
+        .collect();
+    let policy = Policy {
+        prefix: &prefix,
+        lease_seconds: lease,
+        now: chrono::Utc::now(),
+        dry_run,
+        keep: &keep,
+    };
+    match run(cluster, &policy) {
         Ok(swept) => {
             let data = json!({
                 "reaped": swept.reaped,

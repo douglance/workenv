@@ -129,9 +129,42 @@ What bounds it.
 - The image stays clean. `workenv-bake`'s audit treats these same files as
   contamination and is left exactly as it is: a Tart image is cloned and can be
   pushed to a registry, so a credential baked into one escapes every boundary
-  above. Credentials arrive at spawn, into a guest that is about to be destroyed.
+  above. Credentials arrive at spawn, into a guest that is destroyed when its
+  work is done -- or, if parked, kept running and proved again before it is
+  handed back (see below).
 - Shared credentials are named as shared. Anthropic auth is one store holding
   several accounts, so two profiles legitimately carry identical bytes and
   `ANTHROPIC_PROFILE` decides which account acts. That selection is installed as
   the guest's `~/.workenv-identity` and read back by the check, because a shared
   credential with the wrong selection is a guest working as the other account.
+
+## Recorded exception: parking a runner in place
+
+A runner is normally destroyed when its work is done. `wkv --park <slot>` keeps
+one instead, exactly as it is, so work can be picked up where it stopped. This is
+the one place the pool holds a runner for someone, which the charter otherwise
+rules out as a reservation; it is allowed on these terms and no wider.
+
+What parking is, precisely. Neither backend can stop a guest and start it again
+-- Orchard treats a stopped VM as terminal, and exe.dev has no stop -- so a parked
+runner is not stopped. It keeps running: its disk, checkout, toolchain, login and
+background processes stay exactly where they were. The agent's own process ends
+when its terminal disconnects; `wkv --resume` starts it again with the declared
+resume command, which continues the conversation it saved to disk.
+
+What bounds it.
+
+- **It holds its credentials, so it is proved again before it is used.**
+  `wkv --resume` runs `workenv-identity-check` first. A runner that still holds
+  exactly its declared identity is attached untouched. One that does not -- the
+  profile was rotated while it was parked, say -- is re-seeded and must then pass,
+  or it is refused and stays parked rather than returning to the pool.
+- **It always ends.** A park lasts 72 hours by default and at most 168, recorded
+  in one place (`provisioning/workenv-parked`). The lease sweep spares a runner
+  only while its park is current; once it expires the runner is swept like any
+  other, so a forgotten park cannot hold capacity or credentials indefinitely.
+- **It is visible.** `wkv --list` shows a parked runner as `parked`, not `taken`.
+- **It is owned, not claimed.** Parking needs a runner that exists; there is no
+  queue, no waiting list, and nothing that assigns a runner to a person. The pool
+  still hands out whichever runner is free, and a parked one is simply not free.
+

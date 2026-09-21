@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# `wkv --park` keeps a runner as it is; `wkv --resume` hands it back only once
+# its identity is proved again.
+#
+# The cluster, the identity check and the seed are stubs; the park records are
+# the real script's, in a temporary directory. What is under test is the order:
+# nothing is handed back before the check passes, a failed check is answered by
+# a re-seed and a second check, and a runner that fails both stays parked.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WKV="$here/../wkv"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+mkdir -p "$tmp/bin" "$tmp/fleet"
+printf 'personal\t%s\twkv-r\t*\n' "$tmp/fleet" > "$tmp/fleets.conf"
+agent='{"command":"claude --dangerously-skip-permissions","resume":"claude --dangerously-skip-permissions --continue","unattended":true}'
+printf '%s\n' "$agent" > "$tmp/agent.json"
+
+cat > "$tmp/bin/workenv" <<STUB
+#!/usr/bin/env bash
+# environment plan <slot>: a Mac runner holding the personal identity.
+python3 -c '
+import json, sys
+print(json.dumps({"ok": True, "directory": "/home/admin/work",
+  "provider": {"extension": "workenv.orchard", "config": {"network": {"isolated": True}}},
+  "integrations": [{"extension": "workenv.identity", "config": {"profile": {"name": "personal"}}}],
+  "agent": json.load(open(sys.argv[1]))}))
+' "$tmp/agent.json"
+STUB
+cat > "$tmp/bin/orchard" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = list ] && printf 'Name\tStatus\nwkv-r03\trunning\n'
+exit 0
+STUB
+cat > "$tmp/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+echo '{"vms":[]}'
+STUB
+# The check answers from a queue of exit codes, one per call, and logs each call.
+cat > "$tmp/bin/check" <<STUB
+#!/usr/bin/env bash
+echo check >> "$tmp/calls"
+code="\$(head -1 "$tmp/verdicts")"; sed -i.bak 1d "$tmp/verdicts"
+exit "\${code:-0}"
+STUB
+cat > "$tmp/bin/seed" <<STUB
+#!/usr/bin/env bash
+echo seed >> "$tmp/calls"
+STUB
+chmod +x "$tmp/bin/"*
+
+wkv() {
+  : > "$tmp/calls"
+  env PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" WORKENV_BIN="$tmp/bin/workenv" \
+    WORKENV_ORCHARD_BIN="$tmp/bin/orchard" WORKENV_PARKED_DIR="$tmp/parked" \
+    WKV_IDENTITY_CHECK="$tmp/bin/check" WKV_SEED="$tmp/bin/seed" WKV_NO_ATTACH=1 \
+    "$WKV" "$@" 2>&1
+}
+parked() { WORKENV_PARKED_DIR="$tmp/parked" "$here/../workenv-parked" --is-parked "$1" && echo yes || echo no; }
+calls() { tr '\n' ' ' < "$tmp/calls" | xargs; }
+
+printf '\nwkv park and resume\n'
+out="$(wkv --park wkv-r03 24)"
+case "$out" in *"parked wkv-r03 until"*) check "a running runner can be parked" yes yes ;;
+  *) check "a running runner can be parked" yes "no: $out" ;; esac
+check "and the park is recorded" yes "$(parked wkv-r03)"
+
+out="$(wkv --park wkv-r05 || true)"
+case "$out" in *"nothing to park"*) check "a runner with no guest cannot be parked" yes yes ;;
+  *) check "a runner with no guest cannot be parked" yes "no: $out" ;; esac
+check "and nothing is recorded for it" no "$(parked wkv-r05)"
+
+printf '0\n' > "$tmp/verdicts"
+out="$(wkv --resume wkv-r03)"
+check "a clean runner is resumed with the declared resume command" \
+  "claude --dangerously-skip-permissions --continue" \
+  "$(printf '%s\n' "$out" | awk '$1 == "agent" { $1 = ""; sub(/^ /, ""); print; exit }')"
+check "a clean runner is checked and not re-seeded" "check" "$(calls)"
+check "and is no longer parked" no "$(parked wkv-r03)"
+
+wkv --park wkv-r03 >/dev/null
+printf '1\n0\n' > "$tmp/verdicts"
+wkv --resume wkv-r03 >/dev/null
+check "a runner that fails the check is re-seeded, then checked again" "check seed check" "$(calls)"
+check "and handed back once it passes" no "$(parked wkv-r03)"
+
+wkv --park wkv-r03 >/dev/null
+printf '1\n1\n' > "$tmp/verdicts"
+out="$(wkv --resume wkv-r03 || true)"
+case "$out" in *"refusing to hand back"*) check "a runner that fails twice is refused" yes yes ;;
+  *) check "a runner that fails twice is refused" yes "no: $out" ;; esac
+check "and stays parked rather than returning to the pool" yes "$(parked wkv-r03)"
+
+# The unattended rule applies to the resume command as much as to the claim.
+printf '%s\n' '{"command":"claude","resume":"claude --dangerously-skip-permissions --continue","unattended":false}' \
+  > "$tmp/agent.json"
+printf '0\n' > "$tmp/verdicts"
+out="$(wkv --resume wkv-r03 || true)"
+case "$out" in *"not declared unattended"*) check "an attended runner will not resume an agent that bypasses prompts" yes yes ;;
+  *) check "an attended runner will not resume an agent that bypasses prompts" yes "no: $out" ;; esac
+check "and it refuses before touching the runner" "" "$(calls)"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

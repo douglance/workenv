@@ -140,3 +140,17 @@ fn one_second_short_of_the_lease_is_still_kept() {
     assert_eq!(data["kept"], json!(["wkv-nearly-due"]));
     assert!(removed.is_empty(), "reaped a guest still inside its lease");
 }
+
+#[test]
+fn a_parked_guest_is_kept_past_its_lease() {
+    // Parked on purpose, with someone's unfinished work in it: age alone must
+    // not take it. The unparked guest of the same age is the control.
+    let (status, data, removed) = reap(
+        json!({"lease_seconds": 3600, "name_prefix": "wkv-", "keep": ["wkv-parked"]}),
+        vec![aged("wkv-parked", 7200), aged("wkv-abandoned", 7200)],
+    );
+    assert_eq!(status, ResponseStatus::Changed);
+    assert_eq!(data["reaped"], json!(["wkv-abandoned"]));
+    assert_eq!(data["kept"], json!(["wkv-parked"]));
+    assert_eq!(removed, vec!["wkv-abandoned"]);
+}

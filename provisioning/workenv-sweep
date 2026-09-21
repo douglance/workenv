@@ -30,6 +30,10 @@ ORCHARD_ENV="${WORKENV_SWEEP_ORCHARD_ENV:-}"
 TAG="${WORKENV_SWEEP_TAG:-workenv}"
 
 die() { printf 'workenv-sweep: %s\n' "$*" >&2; exit 2; }
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Parked runners are kept on purpose and spared until their park ends. Asked of
+# the one place parks are recorded, for both backends.
+PARKED="${WORKENV_PARKED_BIN:-$here/workenv-parked}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -99,10 +103,18 @@ sweep_orchard() {
   fi
   mode=true
   [ "$APPLY" -eq 1 ] && mode=false
+  local keep input
+  keep="$("$PARKED" --list | cut -f1)"
+  input="$(python3 -c '
+import json, sys
+prefix, lease, dry_run, keep = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true", sys.argv[4]
+print(json.dumps({"name_prefix": prefix, "lease_seconds": lease, "dry_run": dry_run,
+                  "keep": [name for name in keep.split() if name]}))
+' "$PREFIX" "$LEASE" "$mode" "$keep")"
   "$WORKENV_CMD" --root "$ROOT" extension call workenv.orchard reap \
     --environment "$env_name" \
     --idempotency-key "sweep-$PREFIX-$(date -u +%Y%m%d%H%M%S)-$$" \
-    --input "{\"name_prefix\":\"$PREFIX\",\"lease_seconds\":$LEASE,\"dry_run\":$mode}" \
+    --input "$input" \
     2>&1 | sed 's/^/orchard /' \
     || printf 'failed  orchard  reap refused\n'
 }
@@ -139,6 +151,11 @@ while IFS=$'\t' read -r name created; do
     continue
   fi
   age=$((now - born))
+  if "$PARKED" --is-parked "$name"; then
+    printf 'parked  %s  age=%ss, spared until its park ends\n' "$name" "$age"
+    kept=$((kept + 1))
+    continue
+  fi
   if [ "$age" -lt "$LEASE" ]; then
     printf 'keep    %s  age=%ss lease=%ss\n' "$name" "$age" "$LEASE"
     kept=$((kept + 1))

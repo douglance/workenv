@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# The lease sweep spares a parked runner, and only while its park lasts.
+#
+# A parked runner is kept on purpose with unfinished work in it, and the lease
+# measures age from creation -- so without this the sweep removes it on exactly
+# the schedule it removes an abandoned one. `ssh` (exe.dev) and `workenv`
+# (Orchard's reap) are stubbed; what matters is what the sweep asks them to do.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SWEEP="$here/../workenv-sweep"
+PARKED="$here/../workenv-parked"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+old="$(date -u -r $(( $(date -u +%s) - 7200 )) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  || date -u -d "@$(( $(date -u +%s) - 7200 ))" +%Y-%m-%dT%H:%M:%SZ)"
+mkdir -p "$tmp/bin"
+cat > "$tmp/bin/ssh" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    ls) printf '{"vms":[{"vm_name":"wkv-r01","tags":["workenv"],"created_at":"$old"},{"vm_name":"wkv-r02","tags":["workenv"],"created_at":"$old"}]}\n'; exit 0 ;;
+    rm) shift_seen=1 ;;
+  esac
+done
+# rm <name> --json: record which runner the sweep removed.
+for i in \$(seq 1 \$#); do
+  if [ "\${!i}" = rm ]; then j=\$((i + 1)); echo "\${!j}" >> "$tmp/removed"; fi
+done
+STUB
+cat > "$tmp/bin/workenv" <<STUB
+#!/usr/bin/env bash
+# Record the reap input the sweep hands Orchard.
+while [ \$# -gt 0 ]; do
+  if [ "\$1" = --input ]; then printf '%s\n' "\$2" > "$tmp/reap-input"; fi
+  shift
+done
+echo '{"ok":true}'
+STUB
+chmod +x "$tmp/bin/ssh" "$tmp/bin/workenv"
+
+sweep() {
+  : > "$tmp/removed"
+  PATH="$tmp/bin:$PATH" WORKENV_PARKED_DIR="$tmp/parked" WORKENV_BIN="$tmp/bin/workenv" \
+    "$SWEEP" --prefix wkv-r --lease-seconds 3600 --apply --orchard-environment wkv-r09 2>&1
+}
+park() { WORKENV_PARKED_DIR="$tmp/parked" "$PARKED" "$@" >/dev/null; }
+
+printf '\nsweep and parked runners\n'
+park --park wkv-r01 --hours 2
+out="$(sweep)"
+check "a parked runner past its lease is not removed" "wkv-r02" "$(tr '\n' ' ' < "$tmp/removed" | xargs)"
+case "$out" in
+  *"parked  wkv-r01"*) check "the sweep says why it kept it" yes yes ;;
+  *) check "the sweep says why it kept it" yes "no: $out" ;;
+esac
+check "Orchard's reap is told which runners are parked" '["wkv-r01"]' \
+  "$(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1]))["keep"]))' "$tmp/reap-input")"
+
+# A park always ends. An expired record returns the runner to the lease clock.
+printf 'until=%s\n' "$(( $(date -u +%s) - 60 ))" > "$tmp/parked/wkv-r01"
+sweep >/dev/null
+check "once the park ends, the runner is swept like any other" "wkv-r01 wkv-r02" \
+  "$(sort "$tmp/removed" | tr '\n' ' ' | xargs)"
+check "and Orchard is no longer told to keep it" '[]' \
+  "$(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1]))["keep"]))' "$tmp/reap-input")"
+
+# The record itself.
+set +e
+park --park wkv-r05 --hours 0 2>/dev/null;     zero=$?
+park --park wkv-r05 --hours 9999 2>/dev/null;  forever=$?
+park --park '../escape' --hours 1 2>/dev/null; escape=$?
+set -e
+check "a park of no length is refused"            2 "$zero"
+check "a park longer than the cap is refused"     2 "$forever"
+check "a name that could leave the directory is refused" 2 "$escape"
+park --park wkv-r06 --hours 1
+park --unpark wkv-r06
+set +e; WORKENV_PARKED_DIR="$tmp/parked" "$PARKED" --is-parked wkv-r06; unparked=$?; set -e
+check "an unparked runner is no longer parked" 1 "$unparked"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
