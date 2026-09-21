@@ -198,13 +198,32 @@ resolve_agent() { # $1 = slot, $2 = declared command, $3 = declared unattended
 # be wrong exactly when a second terminal claimed one a moment ago. Both are
 # asked every time because the pool spans both and a name taken on either is
 # taken.
+#
+# Fails when either backend cannot answer, rather than answering "nothing". Both
+# lookups used to swallow their errors, so an unreachable exe.dev made every cloud
+# runner look free -- including ones someone was working in -- which is the same
+# trap as an empty inventory reading clean in the identity check. Bounded as well:
+# with no connect timeout, a hung relay hung the claim with it.
 taken() { # $1 = prefix
+  local cloud macs
+  cloud="$(ssh -o BatchMode=yes -o ConnectTimeout=15 exe.dev ls --json 2>/dev/null)" \
+    || { printf 'wkv: exe.dev did not answer which runners are taken\n' >&2; return 1; }
+  macs="$("${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" list vms 2>/dev/null)" \
+    || { printf 'wkv: Orchard did not answer which runners are taken\n' >&2; return 1; }
   {
-    ssh -o BatchMode=yes exe.dev ls --json 2>/dev/null \
-      | tr ',' '\n' | sed -n "s/.*\"vm_name\":\"\($1[0-9][0-9]*\)\".*/\1/p"
-    "${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" list vms 2>/dev/null \
-      | awk 'NR>1 {print $1}' | grep -E "^$1[0-9]+$" || true
+    # '%s\n', not '%s': capturing the answer dropped its trailing newline, so the
+    # last cloud runner's name ran straight into the first Mac runner's and
+    # neither counted as taken.
+    printf '%s\n' "$cloud" | tr ',' '\n' | sed -n "s/.*\"vm_name\":\"\($1[0-9][0-9]*\)\".*/\1/p"
+    printf '%s\n' "$macs" | awk 'NR>1 {print $1}' | grep -E "^$1[0-9]+$" || true
   } | sort -u
+}
+
+# Whether one runner has a guest, failing rather than guessing when it cannot tell.
+has_guest() { # $1 = prefix, $2 = slot
+  local live
+  live="$(taken "$1")" || die "cannot tell whether $2 has a guest; refusing to guess"
+  printf '%s\n' "$live" | grep -qx "$2"
 }
 
 # A tty for the agent, which is why this is not `workenv-guest`: that helper
@@ -266,7 +285,7 @@ guard_unsaved_work() { # $1 = backend, $2 = slot, $3 = checkout
 park() { # $1 = slot, $2 = hours (optional)
   local slot="$1" prefix record
   prefix="$(prefix_for_slot "$slot")" || die "no fleet claims slot $slot"
-  taken "$prefix" | grep -qx "$slot" || die "runner $slot has no guest; there is nothing to park"
+  has_guest "$prefix" "$slot" || die "runner $slot has no guest; there is nothing to park"
   record="$("$PARKED" --park "$slot" ${2:+--hours "$2"})" || exit 1
   printf 'parked %s until %s\n  resume:  wkv --resume %s\n  release: wkv --down %s\n' \
     "$slot" "$(date -r "${record##*$'\t'}" 2>/dev/null || date -d "@${record##*$'\t'}")" "$slot" "$slot"
@@ -280,7 +299,7 @@ resume() { # $1 = slot
   local slot="$1" root prefix
   root="$(fleet_root_for_slot "$slot")" || die "no fleet claims slot $slot"
   prefix="$(prefix_for_slot "$slot")"
-  taken "$prefix" | grep -qx "$slot" || die "runner $slot has no guest left to resume"
+  has_guest "$prefix" "$slot" || die "runner $slot has no guest left to resume"
   {
     read -r BACKEND; read -r IDENTITY; read -r WORKDIR
     read -r DECLARED_AGENT; read -r UNATTENDED; read -r FENCE; read -r DECLARED_RESUME
@@ -389,7 +408,11 @@ IFS=$'\t' read -r FLEET ROOT PREFIX < <(route "$REPO_DIR")
 step "claim a slot in the $FLEET fleet"
 SLOTS="$(fleet_slots "$ROOT" "$PREFIX")"
 [ -n "$SLOTS" ] || die "fleet $FLEET declares no slots matching $PREFIX"
-SLOT="$(comm -23 <(echo "$SLOTS" | cut -f1) <(taken "$PREFIX") | head -1)"
+# Asked here, in this shell: inside the process substitution below, a failed
+# lookup would just come back empty and the first runner would be claimed.
+TAKEN="$(taken "$PREFIX")" \
+  || die "refusing to claim: cannot tell which runners are free, and guessing could hand out one somebody is working in"
+SLOT="$(comm -23 <(echo "$SLOTS" | cut -f1) <(printf '%s\n' "$TAKEN") | head -1)"
 [ -n "$SLOT" ] || die "every $FLEET slot is in use; free one with 'wkv --down <slot>'"
 {
   read -r BACKEND

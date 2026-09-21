@@ -76,6 +76,7 @@ STUB
 # Slot 01 of each fleet is already taken, so a correct claim lands on 02.
 cat > "$tmp/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
+[ "${SSH_DOWN:-0}" = 1 ] && exit 255
 printf '{"vms":[{"vm_name":"wkv-r01"},{"vm_name":"work-r01"}]}\n'
 STUB
 # Both backends are asked what is taken, because a name taken on either is taken.
@@ -83,6 +84,7 @@ STUB
 # script that only asked exe.dev would hand out while it was in use.
 cat > "$tmp/bin/orchard" <<'STUB'
 #!/usr/bin/env bash
+[ "${ORCHARD_DOWN:-0}" = 1 ] && exit 1
 if [ "${1:-}" = list ] && [ "${2:-}" = vms ]; then
   printf 'Name\tStatus\n'
   printf 'wkv-r02\trunning\n'
@@ -197,6 +199,20 @@ case "$out" in
   *) check "a runner that declares no agent is refused" yes "no: $out" ;;
 esac
 set_agent '{"command": "claude --dangerously-skip-permissions", "unattended": True}'
+
+# A backend that cannot say which runners are taken must stop the claim. If it
+# read as "nothing taken", the claim would hand out a runner somebody is using.
+for down in SSH_DOWN ORCHARD_DOWN; do
+  out="$(claim "$down=1")"
+  case "$out" in
+    *"refusing to claim"*) check "a claim stops when $down" yes yes ;;
+    *) check "a claim stops when $down" yes "no: $out" ;;
+  esac
+  case "$out" in
+    *"environment up"*) check "and nothing is created when $down" yes "no: $out" ;;
+    *) check "and nothing is created when $down" yes yes ;;
+  esac
+done
 
 # A slot with no declared profile must stop the run rather than seed a guest
 # with whatever the machine holds.
