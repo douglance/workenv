@@ -39,8 +39,18 @@ FLEETS_CONF="${WKV_FLEETS:-$HOME/.config/workenv/fleets.conf}"
 # Overridable so the park and resume paths can be tested against stubs; every
 # default is the script beside this one.
 CHECK="${WKV_IDENTITY_CHECK:-$here/workenv-identity-check}"
+GUEST="${WKV_GUEST:-$here/workenv-guest}"
+HERDR_ENSURE="${WKV_HERDR_ENSURE:-$here/workenv-herdr-ensure}"
 SEED="${WKV_SEED:-$here/workenv-seed}"
 PARKED="${WKV_PARKED:-$here/workenv-parked}"
+# One value, quoted for the guest's shell. Both backends deliver a command
+# *string* to a shell, so a value cannot travel as a plain argument the way AX
+# hands one straight to git. Wrapping it in quotes by hand is not the same thing:
+# a branch named  x';touch-pwned;'  is a valid git ref, and pasted inside '...'
+# it closed the quote and ran a command in a guest already holding credentials.
+# Here each embedded quote is closed, escaped and reopened, so the shell can only
+# ever see the value as one word.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 step() { printf '\n\033[36m### %s\033[0m\n' "$*"; }
 die() { printf 'wkv: %s\n' "$*" >&2; exit 1; }
 
@@ -202,9 +212,9 @@ attach() { # $1 = backend, $2 = slot, $3 = checkout, $4 = agent command
   if [ "${WKV_NO_ATTACH:-}" = 1 ]; then exit 0; fi
   case "$1" in
     exedev)  exec ssh -t -o BatchMode=yes exe.dev ssh "$2" \
-               "cd '$3' && devenv shell --from path:/opt/workenv/shells/default -- $4" ;;
+               "cd $(sq "$3") && devenv shell --from path:/opt/workenv/shells/default -- $4" ;;
     orchard) exec "${WORKENV_ORCHARD_BIN:-$HOME/.local/bin/orchard}" ssh vm "$2" -- \
-               "cd '$3' && devenv shell --from path:/opt/workenv/shells/default -- $4" ;;
+               "cd $(sq "$3") && devenv shell --from path:/opt/workenv/shells/default -- $4" ;;
   esac
 }
 
@@ -366,7 +376,7 @@ step "up"
 wk "$ROOT" environment up "$SLOT" --idempotency-key "wkv-up-$SLOT-$(date +%s)" \
   || wk "$ROOT" environment up "$SLOT" --idempotency-key "wkv-up-$SLOT-$(date +%s)"
 
-guest() { "$here/workenv-guest" "$BACKEND" "$SLOT" "$@"; }
+guest() { "$GUEST" "$BACKEND" "$SLOT" "$@"; }
 
 # Seeding comes before the clone, not after. Most of these repositories are
 # private, and a clone attempted before the guest holds any credential fails on
@@ -386,7 +396,7 @@ print(json.dumps({
 "$SEED" --via "$BACKEND" "$SLOT" --identity "$IDENTITY" --describe "$DESCRIPTION"
 
 step "herdr server"
-"$here/workenv-herdr-ensure" --via "$BACKEND" "$SLOT" \
+"$HERDR_ENSURE" --via "$BACKEND" "$SLOT" \
   || die "refusing to hand over a guest with no Herdr server"
 
 # Every time, not only when someone remembers. This is the fleet's security
@@ -399,7 +409,7 @@ step "verify isolation"
 step "clone $NAME"
 # Exit codes from the relay are not trustworthy; CLONE_DONE is. devenv puts
 # git and gh on PATH, which the seeded credential helper needs.
-clone_out="$(guest "rm -rf '$WORKDIR' && devenv shell --from path:/opt/workenv/shells/default -- env GIT_TERMINAL_PROMPT=0 git clone --depth 50 --branch '$BRANCH' '$CLONE_URL' '$WORKDIR' && test -d '$WORKDIR/.git' && echo CLONE_DONE" || true)"
+clone_out="$(guest "rm -rf $(sq "$WORKDIR") && devenv shell --from path:/opt/workenv/shells/default -- env GIT_TERMINAL_PROMPT=0 git clone --depth 50 --branch $(sq "$BRANCH") $(sq "$CLONE_URL") $(sq "$WORKDIR") && test -d $(sq "$WORKDIR/.git") && echo CLONE_DONE" || true)"
 printf '%s\n' "$clone_out"
 case "$clone_out" in
   *CLONE_DONE*) ;;

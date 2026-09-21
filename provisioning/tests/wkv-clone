@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# The clone in a claim passes the branch and remote to git as themselves.
+#
+# Both backends hand the guest a command *string*, so the values have to be
+# quoted for its shell. Wrapping them in '...' by hand was not quoting: git
+# accepts  x';touch-pwned;'  as a branch name, and that closed the quote and ran
+# a command inside a guest that already held the seeded credentials. Here the
+# guest is a directory, the command string runs in a real shell against it, and
+# git is a stub that records the argv it was given.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WKV="$here/../wkv"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+pass=0
+fail=0
+check() {
+  if [ "$2" = "$3" ]; then pass=$((pass + 1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail + 1)); printf '  FAIL  %s\n         expected %s\n         actual   %s\n' "$1" "$2" "$3"; fi
+}
+
+guestdir="$tmp/guest"
+mkdir -p "$tmp/bin" "$tmp/guestbin" "$guestdir"
+printf 'personal\t%s\twkv-r\t*\n' "$tmp" > "$tmp/fleets.conf"
+
+cat > "$tmp/bin/workenv" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"environment list"*) echo '{"environments":{"wkv-r01":{"integrations":[{"extension":"workenv.identity","config":{"profile":{"name":"personal"}}}]}}}' ;;
+  *"environment plan"*) printf '%s\n' '{"directory":"$guestdir/work","provider":{"extension":"workenv.orchard","config":{}},"integrations":[{"extension":"workenv.identity","config":{"profile":{"name":"personal"}}}],"agent":{"command":"true","unattended":false}}' ;;
+esac
+exit 0
+STUB
+printf '#!/usr/bin/env bash\necho "{\\"vms\\":[]}"\n' > "$tmp/bin/ssh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/orchard"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/ok"
+# The guest: run the command string in a real shell, with the guest's tools.
+cat > "$tmp/bin/guest" <<STUB
+#!/usr/bin/env bash
+shift 2
+cd "$guestdir" && PATH="$tmp/guestbin:\$PATH" bash -c "\$*"
+STUB
+# devenv shell --from X -- cmd...  ->  cmd...
+cat > "$tmp/guestbin/devenv" <<'STUB'
+#!/usr/bin/env bash
+while [ "$1" != "--" ]; do shift; done; shift; exec "$@"
+STUB
+# git clone ... <url> <dir>: record argv one per line, and make the checkout.
+cat > "$tmp/guestbin/git" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$tmp/git-argv"
+mkdir -p "\${@: -1}/.git"
+STUB
+chmod +x "$tmp/bin/"* "$tmp/guestbin/"*
+
+claim_on() { # $1 = branch name
+  local repo="$tmp/repo"
+  rm -rf "$repo" "$tmp/git-argv"; mkdir -p "$repo"
+  git -C "$repo" init -q -b "$1"
+  git -C "$repo" remote add origin "https://example.invalid/o/r.git"
+  env PATH="$tmp/bin:$PATH" WKV_FLEETS="$tmp/fleets.conf" WORKENV_BIN="$tmp/bin/workenv" \
+    WORKENV_ORCHARD_BIN="$tmp/bin/orchard" WKV_SEED="$tmp/bin/ok" WKV_IDENTITY_CHECK="$tmp/bin/ok" \
+    WKV_HERDR_ENSURE="$tmp/bin/ok" WKV_GUEST="$tmp/bin/guest" WKV_NO_ATTACH=1 \
+    "$WKV" "$repo" >"$tmp/out" 2>&1 || true
+}
+arg_after() { awk -v flag="$1" 'found { print; exit } $0 == flag { found = 1 }' "$tmp/git-argv"; }
+
+printf '\nwkv clone\n'
+claim_on main
+check "an ordinary branch reaches git unchanged" "main" "$(arg_after --branch)"
+check "and the claim completes" yes "$(grep -q CLONE_DONE "$tmp/out" && echo yes || echo no)"
+
+claim_on "it's-a-fix"
+check "a branch with a quote reaches git as one argument" "it's-a-fix" "$(arg_after --branch)"
+
+# A valid branch name, with the shell's field separator standing in for the
+# space a ref cannot contain -- so if the quoting breaks, this really runs.
+attack='x'"'"';touch${IFS}pwned;'"'"''
+claim_on "$attack"
+check "a branch built to break the quoting reaches git intact" "$attack" "$(arg_after --branch)"
+check "and runs nothing in the guest" no "$([ -e "$guestdir/pwned" ] && echo yes || echo no)"
+
+printf '\n%s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
