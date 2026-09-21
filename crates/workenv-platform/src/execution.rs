@@ -252,8 +252,17 @@ pub(crate) fn resolve_executable(executable: &str) -> Result<String> {
 }
 
 fn default_search_path() -> std::ffi::OsString {
+    default_search_path_for(std::env::var_os("HOME"))
+}
+
+/// The home directory is a parameter so the fallback can be exercised against a
+/// directory the test builds. Reading `HOME` inside the rule left the only test
+/// of it asking the host for a real `apoc` and skipping the assertion when the
+/// host had none -- green on this developer's Mac, red on a runner, and proof of
+/// nothing either way.
+fn default_search_path_for(home: Option<std::ffi::OsString>) -> std::ffi::OsString {
     let mut path = DEFAULT_UNIX_PATH.to_owned();
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         path.push(':');
         path.push_str(&Path::new(&home).join(".local/bin").to_string_lossy());
     }

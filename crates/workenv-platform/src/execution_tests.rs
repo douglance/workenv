@@ -43,11 +43,30 @@ fn missing_path_still_resolves_sh_from_unix_defaults() -> Result<()> {
 
 #[test]
 fn missing_path_resolves_apoc_from_home_local_bin() -> Result<()> {
-    let home = std::env::var("HOME")?;
-    let apoc = Path::new(&home).join(".local/bin/apoc");
-    anyhow::ensure!(apoc.is_file(), "need a real apoc at {}", apoc.display());
-    let resolved = resolve_on_path("apoc", None)?;
+    // A home this test builds, not the host's. The executable is a file the test
+    // created, so resolving to it proves the rule rather than proving apoc is
+    // installed.
+    let home = tempfile::tempdir()?;
+    let bin = home.path().join(".local/bin");
+    fs::create_dir_all(&bin)?;
+    let apoc = bin.join("apoc");
+    fs::write(&apoc, b"#!/bin/sh\nexit 0\n")?;
+
+    let search = default_search_path_for(Some(home.path().as_os_str().to_owned()));
+    let resolved = resolve_on_path("apoc", Some(search))?;
+
     assert_eq!(Path::new(&resolved), apoc.as_path());
+    Ok(())
+}
+
+#[test]
+fn a_home_that_holds_no_local_bin_leaves_apoc_unresolved() -> Result<()> {
+    // The other half of the rule, and the reason the search path is built rather
+    // than fixed: nothing in the system defaults carries apoc, so a home without
+    // it must fail rather than find some other apoc on the machine.
+    let home = tempfile::tempdir()?;
+    let search = default_search_path_for(Some(home.path().as_os_str().to_owned()));
+    assert!(resolve_on_path("apoc", Some(search)).is_err());
     Ok(())
 }
 
